@@ -1,5 +1,7 @@
-"""试运行双账户测试（spec-01 §2.8 #63）：创建/角色映射/下单资格/迁移升级。"""
+"""试运行双账户测试（spec-01 §2.8 #63）：创建/角色映射/下单资格/迁移升级/验收归档。"""
 from __future__ import annotations
+
+import json
 
 from core import accountstore, db, orderstore
 from core.db import state_conn
@@ -93,3 +95,92 @@ def test_upgrade_from_v5_db_backfills_roles_and_keeps_data(tmp_path):
         "SELECT cash FROM accounts WHERE id='agent-demo-001'").fetchone()["cash"]
     assert cash == 100000.0
     conn.close()
+
+
+def _mk_trial_with_order(authed_client, name, *, order=True):
+    """经 API 建试运行 Agent + 选配一笔 trial 挂单，返回 (agent_id, trial_id, main_id)。"""
+    r = authed_client.post("/api/agents", json={"name": name},
+                           headers=csrf_headers(authed_client))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    by_role = {a["role"]: a for a in body["accounts"]}
+    trial_id, main_id = by_role["trial"]["id"], by_role["main"]["id"]
+    if order:
+        ok = orderstore.place_order(authed_client.app.state, account_id=trial_id,
+                                    creator=body["agent"]["id"], symbol="600000",
+                                    qty=100, price_type="market", reason="归档用例挂单")
+        assert ok["status"] == "active"
+    return body["agent"]["id"], trial_id, main_id
+
+
+def _archive_row(st, archive_id):
+    conn = state_conn(st)
+    row = conn.execute(
+        "SELECT * FROM trial_archives WHERE id=?", (archive_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def test_finish_trial_launch_archives_evidence_keeps_main_clean(authed_client):
+    st = authed_client.app.state
+    agent_id, trial_id, main_id = _mk_trial_with_order(authed_client, "归档留证用例")
+    r = authed_client.post(
+        f"/api/agents/{agent_id}/trial/finish",
+        json={"decision": "launch", "verdict": "试运行回放通过，验收合格"},
+        headers=csrf_headers(authed_client))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["agent"]["status"] == "running"
+    assert body["archive_id"].endswith(".ta")
+    # trial 账户整体归档、主账户零污染
+    trial = accountstore.get_account(st, trial_id)
+    main = accountstore.get_account(st, main_id)
+    assert trial["status"] == "archived"
+    assert main["status"] == "normal" and main["cash"] == "100000.00"
+    # 留证快照：挂单计数与决策入库、一次写入
+    row = _archive_row(st, body["archive_id"])
+    assert row["decision"] == "launch" and "验收合格" in row["verdict"]
+    snap = json.loads(row["snapshot"])
+    assert snap["account"]["id"] == trial_id and snap["decision"] == "launch"
+    assert snap["counts"]["orders"] == 1
+    conn = state_conn(st)
+    now = conn.execute("SELECT COUNT(*) FROM trial_archives").fetchone()[0]
+    assert now == 1
+
+
+def test_finish_trial_reject_archives_agent(authed_client):
+    st = authed_client.app.state
+    agent_id, trial_id, _ = _mk_trial_with_order(authed_client, "否决用例", order=False)
+    r = authed_client.post(
+        f"/api/agents/{agent_id}/trial/finish",
+        json={"decision": "reject", "verdict": "夏普不足，策略回炉"},
+        headers=csrf_headers(authed_client))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["agent"]["status"] == "archived"
+    assert accountstore.get_account(st, trial_id)["status"] == "archived"
+    row = _archive_row(st, body["archive_id"])
+    assert row["decision"] == "reject"
+
+
+def test_finish_trial_idempotency_conflict(authed_client):
+    """重复归档/二次决策 → 409（留证不可变更改）。"""
+    st = authed_client.app.state
+    agent_id, _, _ = _mk_trial_with_order(authed_client, "幂等冲突用例", order=False)
+    h = csrf_headers(authed_client)
+    first = authed_client.post(f"/api/agents/{agent_id}/trial/finish",
+                               json={"decision": "launch"}, headers=h)
+    assert first.status_code == 200
+    second = authed_client.post(f"/api/agents/{agent_id}/trial/finish",
+                                json={"decision": "reject"}, headers=h)
+    assert second.status_code == 409
+    assert ("不在试运行期" in second.json()["detail"]
+            or "已归档" in second.json()["detail"])
+    conn = state_conn(st)
+    assert conn.execute("SELECT COUNT(*) FROM trial_archives").fetchone()[0] == 1
+
+
+def test_finish_trial_bad_decision_rejected(authed_client):
+    agent_id, _, _ = _mk_trial_with_order(authed_client, "非法决策用例", order=False)
+    r = authed_client.post(f"/api/agents/{agent_id}/trial/finish",
+                           json={"decision": "maybe"}, headers=csrf_headers(authed_client))
+    assert r.status_code == 422

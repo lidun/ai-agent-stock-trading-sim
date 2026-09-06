@@ -443,6 +443,25 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE accounts ADD COLUMN single_stock_cap REAL NOT NULL DEFAULT 1.0;
         """,
     ),
+    (
+        12,
+        """
+        -- spec-05 §6.2/#63 试运行验收归档留证：launch/reject 决策后 trial 账户整体归档为
+        -- 验收证据（快照 JSON 不可变留底：账户终态 + 结算/订单/成交/持仓量），账户转
+        -- archived；主账户零污染不动。字段以 REAL/TEXT 存，snapshot 一次写入不再修改。
+        CREATE TABLE IF NOT EXISTS trial_archives (
+            id            TEXT PRIMARY KEY,
+            agent_id      TEXT NOT NULL REFERENCES agents(id),
+            account_id    TEXT NOT NULL,
+            decision      TEXT NOT NULL CHECK (decision IN ('launch', 'reject')),
+            verdict       TEXT NOT NULL DEFAULT '',
+            snapshot      TEXT NOT NULL,
+            archived_ts   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_trial_archives_agent
+            ON trial_archives(agent_id, archived_ts);
+        """,
+    ),
 ]
 
 

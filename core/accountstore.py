@@ -144,3 +144,79 @@ def create_trial_agent(state, *, agent_id: str, name: str) -> dict:
         "agent": {"id": agent_id, "name": name, "role": "strategy", "status": "trial"},
         "accounts": accounts_for_agent(state, agent_id),
     }
+
+
+def finish_trial(state, *, agent_id: str, decision: str,
+                 verdict: str = "") -> dict:
+    """试运行验收归档留证（spec-05 §6.2/#63）：launch 通过 / reject 否决。
+
+    决策后 trial 账户整体归档为不可变证据：settlement_log 结算日 + 订单/成交/持仓/底仓
+    计数快照写入 trial_archives（一次写入，不再变更），trial 账户转 archived 停止参与
+    结算；主账户零污染不动（launch→agent running，reject→agent archived）。整体单事务。
+    """
+    if decision not in ("launch", "reject"):
+        raise LookupError(f"未知验收决策: {decision}（仅 launch/reject）")
+    conn = state_conn(state)
+    archive_id = agent_id + ".ta"
+    ts = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+    with write_txn(conn) as c:
+        agent = c.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None:
+            raise LookupError(f"Agent {agent_id} 不存在")
+        if agent["status"] != "trial":
+            raise LookupError(f"Agent {agent_id} 不在试运行期（status={agent['status']}）")
+        trial = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='trial'", (agent_id,)
+        ).fetchone()
+        if trial is None or trial["status"] != "trial":
+            raise LookupError(f"Agent {agent_id} 无试运行 trial 账户或已归档")
+        main = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='main'", (agent_id,)
+        ).fetchone()
+
+        def _n(sql: str) -> int:
+            return c.execute(sql, (trial["id"],)).fetchone()[0]
+
+        settle_dates = [
+            r[0] for r in c.execute(
+                "SELECT trade_date FROM settlement_log WHERE account_id=?"
+                " ORDER BY trade_date", (trial["id"],)).fetchall()
+        ]
+        snapshot = {
+            "decision": decision,
+            "verdict": verdict.strip(),
+            "account": {
+                "id": trial["id"], "agent_id": agent_id, "role": "trial",
+                "initial_capital": trial["initial_capital"],
+                "cash": trial["cash"], "nav": trial["nav"],
+                "shares": trial["shares"], "total_pnl": trial["total_pnl"],
+                "status": trial["status"],
+            },
+            "counts": {
+                "settle_days": len(settle_dates),
+                "orders": _n("SELECT COUNT(*) FROM condition_orders WHERE account_id=?"),
+                "trades": _n("SELECT COUNT(*) FROM trades WHERE account_id=?"),
+                "holdings": _n("SELECT COUNT(*) FROM holdings WHERE account_id=?"),
+                "lots": _n("SELECT COUNT(*) FROM lots WHERE account_id=?"),
+            },
+            "settle_dates": settle_dates,
+        }
+        import json as _json
+        snapshot_json = _json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        next_status = "running" if decision == "launch" else "archived"
+        c.execute("UPDATE agents SET status=? WHERE id=?", (next_status, agent_id))
+        c.execute(
+            "UPDATE accounts SET status='archived', "
+            f"updated_ts={ts} WHERE id=?", (trial["id"],))
+        c.execute(
+            "INSERT INTO trial_archives (id, agent_id, account_id, decision, verdict,"
+            " snapshot, archived_ts) VALUES (?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            (archive_id, agent_id, trial["id"], decision, verdict.strip(), snapshot_json),
+        )
+    return {
+        "archive_id": archive_id,
+        "agent": {"id": agent_id, "name": agent["name"], "role": "strategy",
+                  "status": next_status},
+        "trial_account_id": trial["id"],
+        "snapshot": snapshot,
+    }

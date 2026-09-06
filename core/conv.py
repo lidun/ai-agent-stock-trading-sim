@@ -33,6 +33,11 @@ class AgentCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=40)
 
 
+class TrialFinishIn(BaseModel):
+    decision: str = Field(pattern="^(launch|reject)$")
+    verdict: str = Field(default="", max_length=500)
+
+
 class MessageSendIn(BaseModel):
     body: str = Field(min_length=1, max_length=20000)
 
@@ -61,6 +66,24 @@ def create_trial_agent(payload: AgentCreateIn, request: Request, session: Sessio
           detail=f"开通试运行子 Agent {payload.name}（main+trial 双账户）",
           ctx=get_request_context(request))
     return created
+
+
+@router.post("/agents/{agent_id}/trial/finish")
+def finish_trial(agent_id: str, payload: TrialFinishIn,
+                 request: Request, session: SessionDep):
+    """试运行验收（spec-05 §6.2）：launch 通过/reject 否决 → trial 归档留证、主账户零污染。"""
+    try:
+        archived = accountstore.finish_trial(
+            request.app.state, agent_id=agent_id, decision=payload.decision,
+            verdict=payload.verdict)
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          "account.trial_finish", result="ok",
+          object_type="trial_archive", object_id=archived["archive_id"],
+          detail=f"试运行验收 {payload.decision}：trial 账户归档留证",
+          ctx=get_request_context(request))
+    return archived
 
 
 # ---------- Conversations ----------
