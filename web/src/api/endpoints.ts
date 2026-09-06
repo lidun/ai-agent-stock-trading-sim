@@ -149,3 +149,33 @@ export function markConversationRead(convId: string): Promise<{ updated: number 
 export function sendMessage(convId: string, body: string): Promise<{ message: MessageInfo }> {
   return apiPost(`/api/conversations/${encodeURIComponent(convId)}/messages`, { body });
 }
+
+// ---------- 账户域（spec-01 §2.1 accounts，金额为精度字符串） ----------
+
+export interface AccountInfo {
+  id: string;
+  agent_id: string;
+  agent_name: string;
+  agent_role: string;
+  agent_status: string;
+  initial_capital: string;
+  cash: string;
+  nav: string;
+  shares: string;
+  total_pnl: string;
+  today_pnl: string;
+  granularity: "eod_replay" | "intraday_5m" | "intraday_1m";
+  settle_key: string;
+  status: string;
+  active_version_no: string;
+  created_ts: string;
+  updated_ts: string;
+}
+
+export function listAccounts(): Promise<{ accounts: AccountInfo[] }> {
+  return apiGet("/api/accounts");
+}
+
+export function getAccount(agentId: string): Promise<AccountInfo> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}`);
+}

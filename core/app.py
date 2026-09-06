@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core import __version__
 from core.api import CsrfMiddleware, SecurityHeadersMiddleware, api
+from core.account_routes import router as account_router
 from core.auth import router as auth_router
 from core.conv import router as conv_router
 from core.config import Settings, settings_from_override
@@ -88,6 +89,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(api)
     app.include_router(auth_router)
     app.include_router(conv_router)
+    app.include_router(account_router)
 
     @app.get("/")
     def root():

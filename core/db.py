@@ -164,6 +164,49 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
         """,
     ),
+    (
+        3,
+        """
+        -- 模拟账户（spec-01 §2.1 accounts，1:1 绑定子 Agent）
+        -- 金额字段以 REAL 存储便于 SQL 聚合；接口层负责 Decimal 精度格式化。
+        -- status 与 agents.status 同源映射（总纲 §3.5）：trial/normal/paused_buy/halted/archived
+        CREATE TABLE IF NOT EXISTS accounts (
+            id                  TEXT PRIMARY KEY REFERENCES agents(id),
+            initial_capital     REAL NOT NULL DEFAULT 100000.0,
+            cash                REAL NOT NULL DEFAULT 100000.0,
+            nav                 REAL NOT NULL DEFAULT 1.0,
+            shares              REAL NOT NULL DEFAULT 100000.0,
+            total_pnl           REAL NOT NULL DEFAULT 0.0,
+            today_pnl           REAL NOT NULL DEFAULT 0.0,
+            granularity         TEXT NOT NULL DEFAULT 'eod_replay'
+                                CHECK (granularity IN ('eod_replay', 'intraday_5m', 'intraday_1m')),
+            granularity_history TEXT NOT NULL DEFAULT '[]',
+            settle_key          TEXT NOT NULL DEFAULT '',
+            status              TEXT NOT NULL DEFAULT 'normal'
+                                CHECK (status IN ('trial', 'normal', 'paused_buy', 'halted', 'archived')),
+            active_version_no   TEXT NOT NULL DEFAULT '',
+            created_ts          TEXT NOT NULL,
+            updated_ts          TEXT NOT NULL
+        );
+
+        -- 为既有 strategy Agent 种子账户：初始 10 万现金、份额法口径（spec-01 §6.1：shares=注资额，nav=1）
+        INSERT OR IGNORE INTO accounts
+            (id, initial_capital, cash, nav, shares, total_pnl, today_pnl,
+             granularity, granularity_history, settle_key, status, active_version_no,
+             created_ts, updated_ts)
+        SELECT id, 100000.0, 100000.0, 1.0, 100000.0, 0.0, 0.0,
+               'eod_replay', '[]', '',
+               CASE status
+                   WHEN 'trial' THEN 'trial'
+                   WHEN 'paused' THEN 'paused_buy'
+                   WHEN 'halted' THEN 'halted'
+                   WHEN 'archived' THEN 'archived'
+                   ELSE 'normal' END,
+               '', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+               strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          FROM agents WHERE role = 'strategy';
+        """,
+    ),
 ]
 
 
