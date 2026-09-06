@@ -48,3 +48,30 @@ body {
 .page { padding: 16px; min-height: 100%; }
 .muted { color: rgba(0, 0, 0, 0.45); }
 [data-theme="dark"] .muted { color: rgba(255, 255, 255, 0.45); }
+
+/* 消息 Markdown 正文（回执卡片/日报摘要，spec-06 §6.1） */
+.md-body p { margin: 0 0 8px; }
+.md-body p:last-child { margin-bottom: 0; }
+.md-body blockquote {
+  margin: 0 0 8px;
+  padding: 4px 10px;
+  border-left: 3px solid #1677ff;
+  background: rgba(22, 119, 255, 0.06);
+  border-radius: 4px;
+  color: inherit;
+}
+.md-body ul, .md-body ol { padding-left: 20px; margin: 0 0 8px; }
+.md-body li { margin: 2px 0; }
+.md-body table { border-collapse: collapse; margin: 6px 0; }
+.md-body th, .md-body td {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  padding: 2px 8px;
+  font-size: 13px;
+}
+.md-body code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+

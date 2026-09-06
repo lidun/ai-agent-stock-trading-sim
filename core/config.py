@@ -47,6 +47,11 @@ class Settings:
     single_instance_lock: bool = True
     instance_lock_file: str = "core.lock"
 
+    # 对话引擎（P1 桩；真实执行层 spec-04 §3 后续替换）
+    engine_stub_enabled: bool = True      # 桩引擎开关（演示回执链/任务态用）
+    engine_stub_delay_ms: int = 300       # 桩处理推进间隔（UI 观察用；测试置 0）
+    notifications_via_ws: bool = True     # 站内通知（web）默认开启（spec-06 §6.13 推送组）
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -81,6 +86,9 @@ def load_settings() -> Settings:
         login_rate_window_s=_as_int("CORE_LOGIN_RATE_WINDOW_S", 900),
         login_lock_seconds=_as_int("CORE_LOGIN_LOCK_S", 900),
         single_instance_lock=_as_bool("CORE_SINGLE_INSTANCE_LOCK", True),
+        engine_stub_enabled=_as_bool("CORE_ENGINE_STUB", True),
+        engine_stub_delay_ms=_as_int("CORE_ENGINE_STUB_DELAY_MS", 300),
+        notifications_via_ws=_as_bool("CORE_NOTIFICATIONS_WS", True),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )

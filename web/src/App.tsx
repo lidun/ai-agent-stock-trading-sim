@@ -5,6 +5,7 @@ import zhCN from "antd/locale/zh_CN";
 import AuthGate from "./components/AuthGate";
 import MainLayout from "./layouts/MainLayout";
 import LoginPage from "./pages/Login";
+import { ConnectionProvider } from "./connection";
 import { protectedChildren } from "./router/routes";
 
 const router = createBrowserRouter([
@@ -36,7 +37,9 @@ export default function App() {
       }}
     >
       <AntApp>
-        <RouterProvider router={router} />
+        <ConnectionProvider>
+          <RouterProvider router={router} />
+        </ConnectionProvider>
       </AntApp>
     </ConfigProvider>
   );

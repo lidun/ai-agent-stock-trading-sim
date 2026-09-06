@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from core import __version__
 from core.auth import get_session, hash_token
 from core.db import state_conn
 from core.config import Settings
+from core import ws as ws_channel
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +92,7 @@ def _credential_file_exists(settings: Settings) -> bool:
     return settings.resolved_credentials_path().exists()
 
 
-# ---------- WebSocket：登录连接 + 心跳 ----------
+# ---------- WebSocket：登录连接 + 心跳 + 站内通知通道 ----------
 
 async def _ws_cookie(websocket: WebSocket, name: str) -> str | None:
     raw_cookie = websocket.headers.get("cookie", "")
@@ -110,14 +112,20 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=4401)
         return
     await websocket.accept()
+    ws_channel.register(websocket.app.state, websocket)
     log.info("ws connected: user=%s", session["username"])
     try:
         while True:
             message = await websocket.receive_text()
             if message == "ping":
                 await websocket.send_text("pong")
-            else:
-                await websocket.send_text(f"echo:{message}")
+                continue
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
         log.info("ws disconnected")
     except Exception as e:  # noqa: BLE001
@@ -126,3 +134,5 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        ws_channel.unregister(websocket.app.state, websocket)

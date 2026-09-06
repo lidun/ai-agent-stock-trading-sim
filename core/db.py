@@ -110,6 +110,60 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);
         """,
     ),
+    (
+        2,
+        """
+        -- 会话/消息存储（spec-02 §6.2）+ Agent 注册表（生命周期状态机，总纲 §3.5）
+        CREATE TABLE IF NOT EXISTS agents (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            role        TEXT NOT NULL CHECK (role IN ('manager', 'strategy')),
+            status      TEXT NOT NULL DEFAULT 'running'
+                        CHECK (status IN ('trial', 'running', 'paused', 'halted', 'archived')),
+            created_ts  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS conversations (
+            id          TEXT PRIMARY KEY,
+            agent_id    TEXT NOT NULL REFERENCES agents(id),
+            conv_type   TEXT NOT NULL CHECK (conv_type IN ('user_chat', 'report_direct', 'sync')),
+            created_ts  TEXT NOT NULL,
+            UNIQUE (agent_id, conv_type)
+        );
+
+        -- messages.status 语义（spec-02 §6.2）：delivered/pending_review/failed 为送达态；
+        -- queued/processing 为 P1 回执链展示扩展（spec-06 §6.1 已发送→排队→处理中→已回复），非终态。
+        CREATE TABLE IF NOT EXISTS messages (
+            id                TEXT PRIMARY KEY,
+            conv_id           TEXT NOT NULL REFERENCES conversations(id),
+            agent_id          TEXT NOT NULL,
+            direction         TEXT NOT NULL CHECK (direction IN ('user', 'agent')),
+            msg_type          TEXT NOT NULL,
+            body              TEXT NOT NULL DEFAULT '',
+            payload_ref       TEXT NOT NULL DEFAULT '',
+            delivered_via     TEXT NOT NULL DEFAULT '',
+            sync_to_manager   INTEGER NOT NULL DEFAULT 0,
+            status            TEXT NOT NULL DEFAULT 'delivered'
+                              CHECK (status IN ('queued', 'processing', 'delivered',
+                                                'pending_review', 'failed')),
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_error        TEXT NOT NULL DEFAULT '',
+            read_ts           TEXT NOT NULL DEFAULT '',
+            ts                TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_conv_ts ON messages(conv_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_conv_unread
+            ON messages(conv_id, status, read_ts);
+
+        -- 种子：管理 Agent + P1 单子 Agent（演示）。生命周期数据行由注册流程管理，这里仅确保存在。
+        INSERT OR IGNORE INTO agents (id, name, role, status, created_ts)
+            VALUES ('agent-manager', '管理 Agent', 'manager', 'running',
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+        INSERT OR IGNORE INTO agents (id, name, role, status, created_ts)
+            VALUES ('agent-demo-001', '低波红利 · 演示子 Agent', 'strategy', 'running',
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+        """,
+    ),
 ]
 
 

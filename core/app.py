@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from core import __version__
 from core.api import CsrfMiddleware, SecurityHeadersMiddleware, api
 from core.auth import router as auth_router
+from core.conv import router as conv_router
 from core.config import Settings, settings_from_override
 from core.db import Connections, migrate
 from core.security import InstanceLock
@@ -48,6 +49,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.db = Connections(settings.resolved_db_path())
     app.state.started_at = time.time()
+    app.state.ws_clients = set()   # 站内通知（web）在线连接
 
     # #41 单实例锁（systemd 单实例运行，锁失败即拒绝启动并告警）
     app.state.instance_acquired = False
@@ -85,6 +87,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
 
     app.include_router(api)
     app.include_router(auth_router)
+    app.include_router(conv_router)
 
     @app.get("/")
     def root():

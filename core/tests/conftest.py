@@ -28,7 +28,11 @@ TEST_PASSWORD = "test-password-1"
 def client():
     """每测试独立数据目录 + 独立 app 实例（互相隔离）。"""
     data_dir = Path(tempfile.mkdtemp(prefix="aat-core-case-"))
-    app = create_app({"data_dir": data_dir, "single_instance_lock": False})
+    app = create_app({
+        "data_dir": data_dir,
+        "single_instance_lock": False,
+        "engine_stub_delay_ms": 0,      # 对话测试即时推进回执链
+    })
     with TestClient(app, base_url="http://testserver") as c:
         yield c
 
