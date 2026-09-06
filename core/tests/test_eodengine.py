@@ -1267,3 +1267,76 @@ def test_eod_long_sell_t1_insufficient_keeps_active_then_recheck_next_day(authed
     assert len(tr) == 1 and tr[0]["side"] == "sell"
     o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-t1s-s'")[0]
     assert o["status"] == "filled" and o["insufficient_events"] >= 1
+
+
+def _set_cap(st, cap) -> None:
+    conn = state_conn(st)
+    with conn:
+        conn.execute("UPDATE accounts SET single_stock_cap=? WHERE id=?", (cap, DEMO))
+
+
+def test_eod_default_cap_100pct_full_cash_buy_fills(authed_client):
+    """§7 硬红线默认上限 1.00（满仓策略）：全现金单票买入恒通过，不误伤满仓成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-cap-100", order_type="buy", direction="buy", qty=9900,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    assert r["already_settled"] is False
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-cap-100'")
+    assert len(tr) == 1 and tr[0]["qty"] == 9900 and tr[0]["price"] == 10.0
+    o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-cap-100'")[0]
+    assert o["status"] == "filled" and o["insufficient_events"] == 0
+
+
+def test_eod_single_stock_cap_blocks_overlimit_buy(authed_client):
+    """§7 事故性单票上限（cap<1 可配）：成交后单票市值将超红线 → 拒采样点、记事件、
+    today 单到期 expired 且零成交、现金分毫不动。"""
+    st = authed_client.app.state
+    _set_cap(st, 0.2)
+    _insert_order(st, order_id="co-cap-lo", order_type="buy", direction="buy", qty=9900,
+                  trigger={"op": "le", "price": 10.5}, created="2026-09-07T09:00:00")
+    cash_before = _cash(st)
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [
+            ("2026-09-07T09:31:00", 10.20), ("2026-09-07T09:40:00", 10.00),
+        ]},
+        close_map={"600000": 10.00},
+    )
+    assert r["already_settled"] is False
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-cap-lo'") == []
+    o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-cap-lo'")[0]
+    assert o["status"] == "expired" and o["insufficient_events"] == 2
+    assert _cash(st) == cash_before
+
+
+def test_eod_single_stock_cap_preholding_relative(authed_client):
+    """cap 相对既有持仓计：期初已持 6000 股（60% 权益），再买使单票市值超 50% 红线 → 拒；
+    上限调回 1.00 后同条件可成交。"""
+    st = authed_client.app.state
+    _set_cap(st, 0.5)
+    conn = state_conn(st)
+    with conn:
+        conn.execute(
+            "INSERT INTO holdings(id, account_id, symbol, quantity, avg_cost, updated_ts)"
+            " VALUES ('cap-h', ?, '600000', 6000, 9.9, '2026-09-07T09:00:00')",
+            (DEMO,),
+        )
+        conn.execute(
+            "UPDATE accounts SET cash=40000 WHERE id=?", (DEMO,),
+        )
+    _insert_order(st, order_id="co-cap-pre", order_type="buy", direction="buy", qty=4000,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.0)]},
+        close_map={"600000": 10.0},
+        prev_close_map={"600000": 9.9},
+    )
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-cap-pre'") == []
+    o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-cap-pre'")[0]
+    assert o["status"] == "expired" and o["insufficient_events"] == 1

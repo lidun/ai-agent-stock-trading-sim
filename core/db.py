@@ -430,7 +430,17 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         -- spec-01 §7 D5 熔断日买入冻结：熔断触发的账户当日买入类单不成交、不推进（保持
         -- active），每冻结交易日标一次 circuit_break 事件（audit 留痕 + 本列计数供日报
         -- 数据段，语义同 insufficient_events）；卖出类单照常。解冻后挂单恢复参与。
-        ALTER TABLE condition_orders ADD COLUMN circuit_break_events INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE condition_orders ADD COLUMN circuit_break_events INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
+    (
+        11,
+        """
+        -- spec-01 §7 硬红线单票上限：默认 1.00（v0.6 满仓策略 #62，参数保留仅作事故性
+        -- 防护，账户可配）——买入撮合前校验“成交后单票市值 ≤ 上限 × 账户权益”，越界即
+        -- 拒绝该采样点（记 insufficient 事件保持 active，价格回落可复判），满仓单票在
+        -- 上限 1.00 下恒可通过（单票市值 ≤ 权益恒真），默认值不误伤全现金买入。
+        ALTER TABLE accounts ADD COLUMN single_stock_cap REAL NOT NULL DEFAULT 1.0;
         """,
     ),
 ]

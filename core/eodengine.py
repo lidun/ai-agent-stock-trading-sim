@@ -565,6 +565,16 @@ def settle_account(
             buy_exempt = {str(t) for t in json.loads(raw_exempt or "[]")}
         except ValueError as exc:
             raise EngineError("账户 buy_exempt 配置非法（须 JSON token 数组）") from exc
+        raw_cap = acct["single_stock_cap"] if "single_stock_cap" in acct.keys() else None
+        if raw_cap is None:
+            single_cap = Decimal("1")
+        else:
+            try:
+                single_cap = Decimal(str(raw_cap))
+            except Exception as exc:
+                raise EngineError(f"账户 single_stock_cap 非法: {raw_cap}") from exc
+        if single_cap < 0:
+            raise EngineError("账户 single_stock_cap 须 >= 0")
         restrict_syms: dict[str, set[str]] = {}
         for sym, tok in (restrict_map or {}).items():
             toks = {t.strip().lower() for t in str(tok or "").split(",")}
@@ -789,11 +799,36 @@ def settle_account(
             runtime[oid]["final"] = "filled"
             register_exit(o, tid, qty, p)
 
+        def single_cap_ok(symbol: str, add_qty: int, p: Decimal,
+                          amount: Decimal, fees_total: Decimal) -> bool:
+            """硬红线单票上限（§7）：成交后单票市值 ≤ 上限 × 账户权益，越界拒买。
+
+            权益锚取“现金(扣本次支出前) + 各持仓按官方收盘估值”；本次买入标的的既有
+            部分按本次成交价 p 统一估值（与新增部分同 mark），其余票取官方收盘价——
+            输入确定即结果确定（可复算）。上限 1.00 时单票市值恒 ≤ 权益，默认满仓
+            单票买入不受影响；cap<1 仅作事故性防护。越界与现金不足同语义：记
+            insufficient、保持 active，价格回落/资金充裕后续采样可复判成交。
+            """
+            if single_cap >= Decimal("1") or add_qty <= 0:
+                return True
+            q_pre = held_qty.get(symbol, Decimal("0"))
+            post_q = q_pre + Decimal(add_qty)
+            if post_q <= 0:
+                return True
+            post_mv = post_q * p
+            eq_post = cash - amount - fees_total
+            for sym, qq in held_qty.items():
+                eq_post += qq * (p if sym == symbol else require_close(sym))
+            return post_mv <= single_cap * eq_post
+
         def buy_fill(o: dict, qty: int, p: Decimal, ts: str, *, oid: str) -> None:
             """买入撮合公共路径（L0/定时共用）：资金校验、费用、持仓/lot 落账与摊薄。"""
             nonlocal cash
             amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
             fz = _fees(amount, side="buy", fee=f)
+            if not single_cap_ok(o["symbol"], qty, p, amount, fz["total"]):
+                runtime[oid]["ins"] += 1
+                return                              # 单票超上限：记事件继续（§7 红线）
             if cash < amount + fz["total"]:      # 资金不足：记事件继续（§2.3）
                 runtime[oid]["ins"] += 1
                 return
@@ -1174,6 +1209,9 @@ def settle_account(
                 if o["order_type"] == "buy":
                     amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                     fz = _fees(amount, side="buy", fee=f)
+                    if not single_cap_ok(o["symbol"], qty, p, amount, fz["total"]):
+                        runtime[oid]["ins"] += 1
+                        continue                  # 单票超上限 → 拒本采样点（§7 红线）
                     if cash < amount + fz["total"]:
                         runtime[oid]["ins"] += 1
                         continue                  # 收盘无现金 → 记 insufficient，不再有采样点
