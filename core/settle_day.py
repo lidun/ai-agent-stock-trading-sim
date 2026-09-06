@@ -99,8 +99,14 @@ def _held_symbols(state, account_id: str) -> list[str]:
     ).fetchall()]
 
 
-def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: str):
-    """按票取档：分钟可得→L1，历史日/分钟缺口→L2 日线区间近似；均缺→抛异常。"""
+def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: str,
+                 suspend_val: dict[str, dict] | None = None):
+    """按票取档：分钟可得→L1，历史日/分钟缺口→L2 日线区间近似；均缺→抛异常。
+
+    suspend_val[sym] = {"close": .., "prev": ..}（当日停牌票，参考数据供给的停牌前
+    最后官方收盘/前收）——停牌票不做当日行情拉取，估值收盘/前收直接注入，防虚构。
+    """
+    suspend_val = suspend_val or {}
     l1_map: dict = {}
     l2_map: dict = {}
     close_map: dict = {}
@@ -108,6 +114,8 @@ def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: 
     order_syms = sorted({o["symbol"] for o in orders})
     held_set = set(held_symbols)
     for sym in order_syms:
+        if sym in suspend_val:
+            continue                        # 停牌：不拉当日行情（无当日行是正常态，非缺口）
         try:
             fd = feed.replay_day(sym, trade_date)
         except (quotes_tencent.QuoteGapError, quotes_tencent.QuoteSourceError) as exc:
@@ -124,6 +132,11 @@ def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: 
         close_map[sym] = float(fd["official_close"])
         prev_close_map[sym] = float(fd["prev_close"])
     for sym in sorted(held_set - set(order_syms)):
+        if sym in suspend_val:
+            sv = suspend_val[sym]
+            close_map[sym] = float(sv["close"])
+            prev_close_map[sym] = float(sv.get("prev", sv["close"]))
+            continue
         pair = feed.daily_pair(sym, trade_date)
         close_map[sym] = float(pair["official_close"])
         prev_close_map[sym] = float(pair["prev_close"])
@@ -131,7 +144,11 @@ def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: 
 
 
 def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
-            account_ids: list[str] | None = None) -> dict:
+            account_ids: list[str] | None = None,
+            suspend_map: dict[str, dict] | None = None) -> dict:
+    """逐账户结算；suspend_map[sym]={"close","prev"} 为当日停牌票（参考数据侧供给，
+    见 _build_feeds）。停牌票订单照常进入引擎判定（today 到期/跨日挂起），仅不拉当日行情。"""
+    suspend_map = suspend_map or {}
     accounts = eligible_accounts(state, account_ids=account_ids)
     results: list[dict] = []
     for aid in accounts:
@@ -141,9 +158,11 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
             results.append({"account_id": aid, "skipped": True,
                             "reason": "当日无订单且无持仓"})
             continue
+        relevant = {o["symbol"] for o in orders} | set(held)
+        suspend_val = {s: v for s, v in suspend_map.items() if s in relevant}
         try:
             l1_map, l2_map, close_map, prev_close_map = _build_feeds(
-                feed, orders, held, trade_date
+                feed, orders, held, trade_date, suspend_val=suspend_val
             )
         except (eodengine.EngineError, eodengine.EngineGapError,
                 quotes_tencent.QuoteGapError, quotes_tencent.QuoteSourceError) as exc:
@@ -155,6 +174,7 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
                 state, aid, trade_date,
                 l1_map=l1_map, l2_map=l2_map,
                 close_map=close_map, prev_close_map=prev_close_map,
+                suspend_map={s: v["close"] for s, v in suspend_val.items()},
             )
         except (eodengine.EngineError, eodengine.EngineGapError) as exc:
             results.append({"account_id": aid, "error": True, "reason": str(exc)})

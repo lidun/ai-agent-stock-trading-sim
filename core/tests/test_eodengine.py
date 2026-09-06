@@ -1340,3 +1340,69 @@ def test_eod_single_stock_cap_preholding_relative(authed_client):
     assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-cap-pre'") == []
     o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-cap-pre'")[0]
     assert o["status"] == "expired" and o["insufficient_events"] == 1
+
+
+def test_eod_suspended_today_expires_long_kept_without_series(authed_client):
+    """停牌日（spec-01 §3.3 #54）：无当日序列但有 suspend_map 估值 → 订单不判——
+    today 单到期 expired、long 单保持 active（复牌日恢复判定），零成交零事件，不报 gap。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-susp-t", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    _insert_order(st, order_id="co-susp-l", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00",
+                  validity="long")
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={}, close_map={}, suspend_map={"600000": 9.5},
+    )
+    assert r["already_settled"] is False
+    assert r["suspended_symbols"] == ["600000"]
+    assert _fetch(st, "SELECT * FROM trades WHERE account_id=?", (DEMO,)) == []
+    o = _fetch(st, "SELECT status, insufficient_events, settled_on FROM condition_orders WHERE id='co-susp-t'")[0]
+    assert o["status"] == "expired" and o["insufficient_events"] == 0 and o["settled_on"] == "2026-09-07"
+    o = _fetch(st, "SELECT status, insufficient_events, settled_on FROM condition_orders WHERE id='co-susp-l'")[0]
+    assert o["status"] == "active" and o["insufficient_events"] == 0 and o["settled_on"] == ""
+
+
+def test_eod_suspended_holding_valued_at_last_close(authed_client):
+    """停牌持仓估值：按停牌前最近官方收盘（数据侧真实历史价）估值计入 NAV/对账守恒，
+    不虚构替代价；当日无成交、现金不动。"""
+    st = authed_client.app.state
+    conn = state_conn(st)
+    with conn:
+        conn.execute(
+            "INSERT INTO holdings(id, account_id, symbol, quantity, avg_cost, updated_ts)"
+            " VALUES ('sus-h', ?, '600000', 1000, 9.0, '2026-09-07T09:00:00')",
+            (DEMO,),
+        )
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={}, close_map={},
+        prev_close_map={"600000": 9.4},
+        suspend_map={"600000": 9.5},
+    )
+    assert r["already_settled"] is False and r["suspended_symbols"] == ["600000"]
+    assert r["cash"] == "100000.00" and r["nav"] == "1.0950" and r["today_pnl"] == "100.00"
+    assert abs(float(r["total_pnl"]) - 9500.0) < 0.01
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM trades WHERE account_id=?", (DEMO,)
+    ).fetchone()[0] == 0
+
+
+def test_eod_suspended_symbol_does_not_block_other_fills(authed_client):
+    """票级隔离：同账户停牌票挂起不影响可交易票当日成交，也不把停牌误报为数据缺口。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-susp-b", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    _insert_order(st, order_id="co-ok-b", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, symbol="600519",
+                  created="2026-09-07T09:00:00")
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600519": [("2026-09-07T09:31:00", 10.0)]},
+        close_map={"600519": 10.0}, suspend_map={"600000": 9.5},
+    )
+    assert r["already_settled"] is False and r["suspended_symbols"] == ["600000"]
+    trs = _fetch(st, "SELECT order_id FROM trades WHERE account_id=?", (DEMO,))
+    assert [t["order_id"] for t in trs] == ["co-ok-b"]
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-susp-b'")[0]["status"] == "expired"

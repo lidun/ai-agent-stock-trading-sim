@@ -455,6 +455,7 @@ def settle_account(
     board_map: dict[str, str] | None = None,
     restrict_map: dict[str, str] | None = None,
     circuit_freeze: bool = False,
+    suspend_map: dict[str, float] | None = None,
     fee: dict | None = None,
     exit_market: dict[str, dict] | None = None,
 ) -> dict:
@@ -478,10 +479,18 @@ def settle_account(
     期用；每日跟踪推进由 settle_exits 单独调用（见模块 doc §8.1）。
     circuit_freeze：账户当日熔断开关（spec-01 §7 D5）——True 时买入类单整日冻结（语义见模块
     doc）；卖出类单不受影响；默认 False（无熔断状态，引擎行为与既有版本一致）。
+    suspend_map[symbol] = 当日停牌估值价（= 该票停牌前最近一个交易日官方收盘，数据/参考
+    供给提供，真实历史价，非虚构）。当日停牌票允许无任何当日序列（spec-01 §3.3 停牌挂起/
+    复牌，#54）：其订单不参与判定——today 单到期 expired（当日无成交窗口，公平口径）、
+    long/until 单保持 active 待复牌日恢复判定；持仓按停牌估值价并入 close_map 估值与对账
+    守恒（非虚构替代价）。其余票缺当日序列仍显式 EngineError（数据缺口，不误判停牌）。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
     l2_map = l2_map or {}
+    suspend_map = {str(k): float(v) for k, v in (suspend_map or {}).items()}
+    if suspend_map:
+        close_map = {**close_map, **suspend_map}   # 停牌估值并入收盘映射（估值/守恒共用口径）
     seen = set(series_map) | set(l1_map)
     for sym in l2_map:
         if sym in seen:
@@ -602,7 +611,8 @@ def settle_account(
             if o["scope"] != "single" or o["basis"] != "replay_l0":
                 raise EngineGapError(f"order {o['id']} scope/basis 超出支持范围")
             if o["symbol"] not in series_map and o["symbol"] not in l1_map \
-                    and o["symbol"] not in l2_map:
+                    and o["symbol"] not in l2_map \
+                    and o["symbol"] not in suspend_map:
                 raise EngineError(f"order {o['id']} 标的 {o['symbol']} 缺少当日序列")
             o = dict(o)
             if o["order_type"] == "sell_open_board" and feed_kind(o["symbol"]) != "l0":
@@ -856,7 +866,7 @@ def settle_account(
 
         # ---- L0 逐票回放（§3.2）----
         for symbol in sorted({o["symbol"] for o in active}):
-            if feed_kind(symbol) != "l0":
+            if symbol not in series_map:
                 continue
             ser = series_map[symbol]
             for o in active:
@@ -945,7 +955,7 @@ def settle_account(
 
         # ---- L1 档逐票回放（spec-01 §3.3：相邻分钟确认 + 按条件价 X 成交）----
         for symbol in sorted({o["symbol"] for o in active}):
-            if feed_kind(symbol) != "l1":
+            if symbol not in l1_map:
                 continue
             bars = l1_map[symbol]
             for o in active:
@@ -1139,7 +1149,7 @@ def settle_account(
 
         # ---- L2 档逐票回放（spec-01 §3.3/§4.1：日线区间触达 + 官方收盘价成交；历史日档）----
         for symbol in sorted({o["symbol"] for o in active}):
-            if feed_kind(symbol) != "l2":
+            if symbol not in l2_map:
                 continue
             hi = _D(l2_map[symbol]["high"])
             lo = _D(l2_map[symbol]["low"])
@@ -1391,6 +1401,7 @@ def settle_account(
             "total_pnl": _q(total_pnl),
             "today_pnl": _q(today_pnl),
             "circuit_blocked": len(frozen_buys),
+            "suspended_symbols": sorted(suspend_map),
         }
         log.info("settle %s %s -> %s", trade_date, account_id, summary["today_pnl"])
         return summary

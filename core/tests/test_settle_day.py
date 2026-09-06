@@ -140,3 +140,27 @@ def test_settle_day_empty_account_skipped(authed_client):
     assert state_conn(st).execute(
         "SELECT COUNT(*) FROM settlement_log WHERE account_id=?", (DEMO,)
     ).fetchone()[0] == 0
+
+
+def test_settle_day_suspended_symbol_skips_feed_and_keeps_others(authed_client):
+    """编排层透传 suspend_map：停牌票不做当日行情拉取（源无当日行属正常态），
+    其余票照常成交，停牌 today 单到期、账户不报数据缺口错误。"""
+    st = authed_client.app.state
+    _insert_buy_order(st, order_id="sd-susp", symbol="000001",
+                      trigger={"op": "le", "price": 9.28})
+    _insert_buy_order(st, order_id="sd-ok", symbol="600000",
+                      trigger={"op": "le", "price": 10.5})
+    report = settle_day.run_day(
+        st, DATE, feed=FakeFeed(),
+        suspend_map={"000001": {"close": 9.5, "prev": 9.5}},
+    )
+    acct = [a for a in report["accounts"] if a["account_id"] == DEMO][0]
+    assert acct.get("error") is not True and acct.get("skipped") is not True
+    assert acct["suspended_symbols"] == ["000001"]
+    conn = state_conn(st)
+    assert conn.execute("SELECT * FROM trades WHERE order_id='sd-susp'").fetchone() is None
+    tr = conn.execute("SELECT order_id FROM trades WHERE order_id='sd-ok'").fetchone()
+    assert tr is not None and tr["order_id"] == "sd-ok"
+    assert conn.execute(
+        "SELECT status FROM condition_orders WHERE id='sd-susp'"
+    ).fetchone()["status"] == "expired"
