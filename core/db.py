@@ -281,6 +281,49 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_co_account_created ON condition_orders(account_id, created_at);
         """,
     ),
+    (
+        5,
+        """
+        -- 撮合成交与日终结算（spec-01 §2.5/§3.8）：EOD 结算引擎产出，单事务写入。
+
+        CREATE TABLE IF NOT EXISTS trades (
+            id                  TEXT PRIMARY KEY,
+            account_id          TEXT NOT NULL REFERENCES accounts(id),
+            order_id            TEXT NOT NULL REFERENCES condition_orders(id),
+            symbol              TEXT NOT NULL,
+            side                TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+            qty                 REAL NOT NULL,
+            price               REAL NOT NULL,        -- 真实成交价
+            amount              REAL NOT NULL,        -- 成交额 = qty × price
+            fee_total           REAL NOT NULL DEFAULT 0,
+            commission          REAL NOT NULL DEFAULT 0,
+            stamp_tax           REAL NOT NULL DEFAULT 0,
+            transfer_fee        REAL NOT NULL DEFAULT 0,
+            trade_time          TEXT NOT NULL,        -- 采样点时刻（本地墙钟，见引擎契约）
+            basis_requested     TEXT NOT NULL,
+            basis_used          TEXT NOT NULL,
+            quality             TEXT NOT NULL DEFAULT '',
+            settle_date         TEXT NOT NULL,
+            reason              TEXT NOT NULL DEFAULT '',
+            strategy_version_no TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_account_settle ON trades(account_id, settle_date);
+        CREATE INDEX IF NOT EXISTS idx_trades_order ON trades(order_id);
+
+        -- 结算幂等键：settle_key UNIQUE（trade_date:account_id）→ 崩溃重跑不重复（spec-01 §3.1.5/§3.8）
+        CREATE TABLE IF NOT EXISTS settlement_log (
+            id               TEXT PRIMARY KEY,
+            settle_key       TEXT NOT NULL UNIQUE,
+            trade_date       TEXT NOT NULL,
+            account_id       TEXT NOT NULL REFERENCES accounts(id),
+            granularity_used TEXT NOT NULL,            -- JSON {symbol: 档位}
+            status           TEXT NOT NULL DEFAULT 'done'
+                             CHECK (status IN ('done', 'pending')),
+            created_at       TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_settlelog_account ON settlement_log(account_id, trade_date);
+        """,
+    ),
 ]
 
 
