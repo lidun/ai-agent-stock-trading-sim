@@ -293,7 +293,7 @@ export default function ChatPage() {
   return (
     <div
       style={{
-        height: "calc(100vh - 88px)",
+        height: "calc(100vh - 94px)",
         minHeight: 480,
         display: "flex",
         background: token.colorBgLayout,

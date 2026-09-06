@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { Button, Spin, Typography, theme as antTheme } from "antd";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -79,7 +79,7 @@ function Bubble({ message }: { message: MessageInfo }) {
           style={{
             marginTop: 2,
             fontSize: 11,
-            color: status.color ?? "rgba(0,0,0,0.45)",
+            color: status.color ?? token.colorTextTertiary,
             textAlign: isUser ? "right" : "left",
             paddingInline: 2,
           }}
@@ -127,9 +127,32 @@ export function MessageThread({
   const { token } = antTheme.useToken();
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastId = useRef<string | null>(null);
+  // 加载更早消息前记录滚动位置，补插完成后保持视口不跳动
+  const pinRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
+  const olderLoadingRef = useRef(false);
+
+  useLayoutEffect(() => {
+    if (!olderLoadingRef.current || loading || messages.length === 0) return;
+    olderLoadingRef.current = false;
+    const el = scrollRef.current;
+    const pin = pinRef.current;
+    pinRef.current = null;
+    if (!el || !pin) return;
+    el.scrollTop = pin.scrollTop + (el.scrollHeight - pin.scrollHeight);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, loading]);
+
+  const loadOlderPinned = () => {
+    const el = scrollRef.current;
+    if (el) pinRef.current = { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight };
+    olderLoadingRef.current = true;
+    onLoadOlder();
+  };
 
   useEffect(() => {
     lastId.current = null;
+    pinRef.current = null;
+    olderLoadingRef.current = false;
   }, [convId]);
 
   useEffect(() => {
@@ -192,7 +215,14 @@ export function MessageThread({
       >
         {hasOlder && (
           <div style={{ textAlign: "center", padding: 6 }}>
-            <Button size="small" type="text" icon={<UpOutlined />} onClick={onLoadOlder}>
+            <Button
+              size="small"
+              type="text"
+              icon={<UpOutlined />}
+              loading={loading && messages.length > 0}
+              disabled={loading}
+              onClick={loadOlderPinned}
+            >
               加载更早消息
             </Button>
           </div>

@@ -74,4 +74,20 @@ body {
   border-radius: 3px;
   font-size: 12px;
 }
+[data-theme="dark"] .md-body blockquote {
+  border-color: #1668dc;
+  background: rgba(22, 119, 255, 0.18);
+}
+[data-theme="dark"] .md-body th,
+[data-theme="dark"] .md-body td {
+  border-color: rgba(255, 255, 255, 0.18);
+}
+[data-theme="dark"] .md-body code {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* 会话列表条目悬停（theme-aware） */
+.conv-row { transition: background 0.15s ease; }
+.conv-row:hover { background: rgba(0, 0, 0, 0.04); }
+[data-theme="dark"] .conv-row:hover { background: rgba(255, 255, 255, 0.07); }
 

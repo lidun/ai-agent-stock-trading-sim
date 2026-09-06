@@ -40,7 +40,9 @@ export function Composer({
         value={text}
         onChange={(e) => setText(e.target.value)}
         onPressEnter={(e) => {
-          if (!e.shiftKey) {
+          // 中文等输入法组合态按下 Enter 仅为选词，不触发发送
+          const ne = e.nativeEvent as KeyboardEvent;
+          if (!e.shiftKey && !ne.isComposing) {
             e.preventDefault();
             void submit();
           }

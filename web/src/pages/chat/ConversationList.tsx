@@ -49,6 +49,7 @@ export function ConversationList({
           return (
             <div
               key={agent.id}
+              className="conv-row"
               onClick={() => onSelect(agent.id)}
               style={{
                 display: "flex",
