@@ -179,3 +179,66 @@ export function listAccounts(): Promise<{ accounts: AccountInfo[] }> {
 export function getAccount(agentId: string): Promise<AccountInfo> {
   return apiGet(`/api/accounts/${encodeURIComponent(agentId)}`);
 }
+
+// ---------- 交易存储域（spec-01 §2.2/§2.3 只读；引擎写入后呈现，当前空态） ----------
+
+export interface LotInfo {
+  id: string;
+  buy_trade_id: string;
+  buy_date: string;
+  buy_price: string;
+  quantity: string;
+  remaining: string;
+  strategy_version_no: string;
+}
+
+export interface HoldingInfo {
+  id: string;
+  account_id: string;
+  symbol: string;
+  quantity: string;
+  avg_cost: string;
+  updated_ts: string;
+  lots: LotInfo[];
+}
+
+export interface ConditionOrderInfo {
+  id: string;
+  account_id: string;
+  order_type: string;
+  direction: "buy" | "sell";
+  scope: string;
+  symbol: string;
+  symbols: string[];
+  trigger: string;
+  basis: string;
+  price_ref: string;
+  qty: string;
+  amount: string;
+  budget: string;
+  price_type: string;
+  limit_price: string;
+  validity: string;
+  valid_until: string;
+  priority: number;
+  status: string;
+  insufficient_events: number;
+  invalid_reason: string;
+  strategy_version_no: string;
+  created_at: string;
+  creator: string;
+  reason: string;
+  settled_on: string;
+}
+
+export function listAccountHoldings(
+  agentId: string,
+): Promise<{ account_id: string; holdings: HoldingInfo[] }> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/holdings`);
+}
+
+export function listAccountConditionOrders(
+  agentId: string,
+): Promise<{ account_id: string; condition_orders: ConditionOrderInfo[] }> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/condition-orders`);
+}
