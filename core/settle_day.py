@@ -33,34 +33,61 @@ def _state(settings):
     return SimpleNamespace(db=Connections(settings.resolved_db_path()))
 
 
-def eligible_accounts(state, *, account_ids: list[str] | None = None) -> list[str]:
+def eligible_accounts(state, *, account_ids: list[str] | None = None,
+                      mode: str = "auto") -> list[str]:
+    """可结算账户选择。
+
+    mode='auto'（通用日结/catchup）：试运行期 Agent（ag.status='trial'）整体冻结——主
+    账户零污染（spec-05 v0.5），trial 账户不走通用路径；退役 Agent（ag.status='archived'）
+    同样冻结。
+    mode='replay'（trial 历史回放专责）：仅取窗口未满的 in_progress trial 账户，供
+    EodSettleTrigger.run_trial_backfill 按最近 N 交易日回放（spec-05 §6.2）。
+    """
     conn = state_conn(state)
     params: list = []
     extra = ""
     if account_ids:
         extra = " AND a.id IN (%s)" % ",".join("?" * len(account_ids))
         params.extend(account_ids)
-    sql = (
-        "SELECT a.id FROM accounts a"
-        " WHERE a.granularity='eod_replay'"
-        " AND a.status NOT IN ('halted','archived','paused_buy')"
-        + extra + " ORDER BY a.id"
-    )
+    if mode == "replay":
+        sql = (
+            "SELECT a.id FROM accounts a"
+            " JOIN agents ag ON ag.id = a.agent_id"
+            " JOIN trial_replays tr ON tr.agent_id = a.agent_id"
+            "  AND tr.trial_account_id = a.id"
+            " WHERE a.granularity='eod_replay'"
+            "  AND a.role='trial' AND ag.status='trial' AND tr.status='in_progress'"
+            "  AND (SELECT COUNT(*) FROM replay_sessions s"
+            "        WHERE s.agent_id = a.agent_id) < tr.window_days"
+            + extra + " ORDER BY a.id"
+        )
+    else:
+        sql = (
+            "SELECT a.id FROM accounts a"
+            " JOIN agents ag ON ag.id = a.agent_id"
+            " WHERE a.granularity='eod_replay'"
+            " AND a.status NOT IN ('halted','archived','paused_buy')"
+            " AND ag.status NOT IN ('trial','archived')"
+            + extra + " ORDER BY a.id"
+        )
     rows = conn.execute(sql, params).fetchall()
     return [r["id"] for r in rows]
 
 
 def pending_any(state, trade_date: str) -> bool:
-    """任一 eod_replay 可结算账户在当日存在待结算工作（active 当日条件单或有持仓）。
+    """任一 auto 可结算账户在当日存在待结算工作（active 当日条件单或有持仓）。
 
-    零网络快速门（供自动触发器在进入行情探测前拦截空日）；判定口径与 run_day 一致。
+    零网络快速门（供自动触发器在进入行情探测前拦截空日）；判定口径与 run_day 一致
+    （含 agent 阶段冻结，试运行/退役 Agent 不参与）。
     """
     conn = state_conn(state)
     row = conn.execute(
         """
         SELECT 1 FROM accounts a
+         JOIN agents ag ON ag.id = a.agent_id
          WHERE a.granularity='eod_replay'
            AND a.status NOT IN ('halted','archived','paused_buy')
+           AND ag.status NOT IN ('trial','archived')
            AND (
                EXISTS (
                    SELECT 1 FROM condition_orders co
@@ -145,11 +172,13 @@ def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: 
 
 def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
             account_ids: list[str] | None = None,
-            suspend_map: dict[str, dict] | None = None) -> dict:
+            suspend_map: dict[str, dict] | None = None,
+            mode: str = "auto") -> dict:
     """逐账户结算；suspend_map[sym]={"close","prev"} 为当日停牌票（参考数据侧供给，
-    见 _build_feeds）。停牌票订单照常进入引擎判定（today 到期/跨日挂起），仅不拉当日行情。"""
+    见 _build_feeds）。停牌票订单照常进入引擎判定（today 到期/跨日挂起），仅不拉当日行情。
+    mode='replay' 供 trial 历史回放（trial_replays 台账窗口未满账户）。"""
     suspend_map = suspend_map or {}
-    accounts = eligible_accounts(state, account_ids=account_ids)
+    accounts = eligible_accounts(state, account_ids=account_ids, mode=mode)
     results: list[dict] = []
     for aid in accounts:
         orders = _orders_for(state, aid, trade_date)

@@ -462,6 +462,36 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON trial_archives(agent_id, archived_ts);
         """,
     ),
+    (
+        13,
+        """
+        -- spec-05 §6.2 试运行回放窗口台账（#63）：子 Agent 创建进入试运行时生成
+        -- trial_replays（窗口 5-20 默认 5，与 #18 N≥5 硬门槛对齐）。trial 账户历史回放
+        -- 会话逐日记 replay_sessions（agent+trade_date 唯一 → 幂等，空日也计数），满
+        -- 窗口即 done 停止自动回放，等 finish_trial（launch/reject → 归档留证）。
+        -- 试运行期（agent.status='trial'）主账户由 settle_day 结算门控冻结（零污染），
+        -- trial 账户仅经 EodSettleTrigger.run_trial_backfill 专责回放，不走通用 catchup。
+        CREATE TABLE IF NOT EXISTS trial_replays (
+            agent_id          TEXT PRIMARY KEY REFERENCES agents(id),
+            trial_account_id  TEXT NOT NULL REFERENCES accounts(id),
+            window_days       INTEGER NOT NULL
+                              CHECK (window_days BETWEEN 5 AND 20),
+            status            TEXT NOT NULL DEFAULT 'in_progress'
+                              CHECK (status IN ('in_progress', 'done')),
+            created_ts        TEXT NOT NULL,
+            updated_ts        TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS replay_sessions (
+            agent_id    TEXT NOT NULL REFERENCES agents(id),
+            account_id  TEXT NOT NULL REFERENCES accounts(id),
+            trade_date  TEXT NOT NULL,
+            created_ts  TEXT NOT NULL,
+            UNIQUE (agent_id, trade_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_replay_sessions_agent
+            ON replay_sessions(agent_id, trade_date);
+        """,
+    ),
 ]
 
 

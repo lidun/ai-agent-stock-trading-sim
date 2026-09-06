@@ -20,13 +20,15 @@ import logging
 from datetime import date, datetime, time, timedelta, timezone
 from time import monotonic
 
-from core import eodengine, quotes_tencent, settle_day
+from core import accountstore, eodengine, quotes_tencent, settle_day
 from core.auth import audit
+from core.db import state_conn
 
 log = logging.getLogger(__name__)
 
 DEFAULT_FEED = quotes_tencent
 PROBE_TTL_S = 300
+_TRIAL_LOOKBACK_DAYS = 180
 _BJT = timezone(timedelta(hours=8))
 
 
@@ -233,12 +235,86 @@ class EodSettleTrigger:
                     f"缺口会话 {len(errs)} 个")
         return {**base, "trading_dates": trading, "dates": dates, "errors": errs}
 
+    def run_trial_backfill(self, *, now: datetime | None = None,
+                           start: date | None = None) -> dict:
+        """spec-05 §6.2 试运行历史回放：为窗口未满的 trial 账户补最近 N 个交易日。
+
+        只取交易日轴（600000 日线）上严格早于“今天”的会话——今天留给实时探测，防用
+        不完整档提前结算。逐日推进该 trial 账户（settle_day.run_day mode='replay'，
+        空日也计一个回放会话），add_trial_session 记账（agent+trade_date 唯一，幂等），
+        满窗口自动转 done（验收证据就绪，等 finish_trial）。主账户全程零参与。
+        """
+        now = now or bjt_now()
+        today = now.date()
+        conn = state_conn(self.state)
+        replays = conn.execute(
+            "SELECT tr.agent_id, tr.trial_account_id, tr.window_days"
+            " FROM trial_replays tr JOIN agents ag ON ag.id = tr.agent_id"
+            " WHERE tr.status='in_progress' AND ag.status='trial'"
+            " ORDER BY tr.created_ts, tr.agent_id"
+        ).fetchall()
+        if not replays:
+            return {"replayed": []}
+        processed = {r["agent_id"]: {d[0] for d in conn.execute(
+            "SELECT trade_date FROM replay_sessions WHERE agent_id=?",
+            (r["agent_id"],)).fetchall()} for r in replays}
+        need = {r["agent_id"]: r["window_days"] - len(processed[r["agent_id"]])
+                for r in replays}
+        need = {a: n for a, n in need.items() if n > 0}
+        if not need:
+            return {"replayed": []}
+        start = start or (today - timedelta(days=_TRIAL_LOOKBACK_DAYS))
+        try:
+            rows = self.feed.day_rows("600000", start.isoformat(), today.isoformat())
+        except Exception:  # noqa: BLE001
+            log.exception("试运行回放取交易日轴失败（跳过本轮）")
+            return {"replayed": []}
+        trading = sorted({str(r.get("date")) for r in rows
+                          if str(r.get("date")) < today.isoformat()})
+        if not trading:
+            return {"replayed": []}
+        by_agent = {r["agent_id"]: r for r in replays}
+        out: list[dict] = []
+        for agent_id in sorted(need):
+            rec = by_agent[agent_id]
+            avail = [d for d in trading if d not in processed[agent_id]]
+            picks = avail[-need[agent_id]:]
+            days: list[dict] = []
+            for d in picks:
+                exits = {}
+                if self._tracking_state(d)[0]:
+                    exits = self._advance_exits(d)
+                report = settle_day.run_day(
+                    self.state, d, feed=self.feed,
+                    account_ids=[rec["trial_account_id"]], mode="replay")
+                accts = report.get("accounts", [])
+                errors = [a for a in accts if a.get("error")]
+                accountstore.add_trial_session(self.state, agent_id, d)
+                days.append({"date": d, "exits": exits, "error": bool(errors),
+                             "accounts": accts})
+            replay = accountstore.trial_replay(self.state, agent_id)
+            if replay and replay["status"] == "done":
+                self._audit("trade.trial_replay_complete", "ok",
+                            f"{agent_id} 试运行回放满 {replay['window_days']} 个交易日"
+                            f"（{replay['sessions'][0]}..{replay['sessions'][-1]}），"
+                            f"验收证据就绪")
+            else:
+                self._audit("trade.trial_replay_session", "ok",
+                            f"{agent_id} 回放 {len(days)} 个历史会话"
+                            f"（累计 {replay['sessions_done']}/{replay['window_days']}）")
+            out.append({"agent_id": agent_id,
+                        "trial_account_id": rec["trial_account_id"],
+                        "days": days,
+                        "replay": replay})
+        return {"replayed": out}
+
     async def run_forever(self, tick_s: int) -> None:
         """每分钟 tick 循环（core 常驻内唯一结算触发点；操作全幂等）。"""
         while True:
             try:
                 outcome = self.settle_once()
                 log.info("EOD 结算触发：%s %s", outcome["date"], outcome["status"])
+                self.run_trial_backfill()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001

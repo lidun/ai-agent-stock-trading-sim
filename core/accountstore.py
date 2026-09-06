@@ -106,13 +106,18 @@ def accounts_for_agent(state, agent_id: str) -> list[dict]:
     return [_serialize(dict(r)) for r in rows]
 
 
-def create_trial_agent(state, *, agent_id: str, name: str) -> dict:
+def create_trial_agent(state, *, agent_id: str, name: str,
+                       window_days: int = 5) -> dict:
     """开通策略子 Agent：agent 进入试运行（status=trial），随建主/trial 双账户（#63）。
 
     主账户 role=main parent=自身 status=normal（10 万种子）；trial 账户 role=trial
     status=trial、id=agent_id.trial，parent 指向主 Agent——试运行回放落 trial 账户，
-    主账户零污染（spec-01 §2.8）。整体单事务。
+    主账户零污染（spec-01 §2.8）。试运行回放窗口 5-20 交易日默认 5（spec-05 §6.2，
+    与 #18 N≥5 对齐），随建 trial_replays 台账；回放会话由 EodSettleTrigger
+    run_trial_backfill 逐日计入，满窗口自动 done。整体单事务。
     """
+    if not isinstance(window_days, int) or not (5 <= window_days <= 20):
+        raise LookupError(f"试运行回放窗口须为 5-20 交易日，收到 {window_days!r}")
     conn = state_conn(state)
     with write_txn(conn) as c:
         exists = c.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone()
@@ -140,10 +145,80 @@ def create_trial_agent(state, *, agent_id: str, name: str) -> dict:
                 """,
                 (agent_id + suffix, agent_id, role, agent_id, acct_status),
             )
+        c.execute(
+            f"""
+            INSERT INTO trial_replays
+                (agent_id, trial_account_id, window_days, status, created_ts, updated_ts)
+            VALUES (?,?,?, 'in_progress', {ts}, {ts})
+            """,
+            (agent_id, agent_id + ".trial", window_days),
+        )
     return {
-        "agent": {"id": agent_id, "name": name, "role": "strategy", "status": "trial"},
+        "agent": {"id": agent_id, "name": name, "role": "strategy", "status": "trial",
+                  "trial_window_days": window_days},
         "accounts": accounts_for_agent(state, agent_id),
+        "replay": trial_replay(state, agent_id),
     }
+
+
+def trial_replay(state, agent_id: str) -> dict | None:
+    """试运行回放台账：{window_days, status, sessions: [..], sessions_done}。"""
+    conn = state_conn(state)
+    with read_txn(conn) as c:
+        row = c.execute(
+            "SELECT * FROM trial_replays WHERE agent_id=?", (agent_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        days = [r[0] for r in c.execute(
+            "SELECT trade_date FROM replay_sessions WHERE agent_id=?"
+            " ORDER BY trade_date", (agent_id,)).fetchall()]
+    return {
+        "agent_id": agent_id,
+        "trial_account_id": row["trial_account_id"],
+        "window_days": row["window_days"],
+        "status": row["status"],
+        "sessions": days,
+        "sessions_done": len(days),
+    }
+
+
+def add_trial_session(state, agent_id: str, trade_date: str) -> dict:
+    """回放会话记账：逐历史日计数（agent+trade_date 唯一，重跑幂等）。满窗口转 done。
+
+    返回台账最新状态；done 后由 finish_trial（归档留证）收口。未知 agent / 非试运行
+    期回放一律拒绝（防越权向非试运行账户记会话）。
+    """
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        row = c.execute(
+            "SELECT r.*, ag.status AS agent_status FROM trial_replays r"
+            " JOIN agents ag ON ag.id = r.agent_id WHERE r.agent_id=?",
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Agent {agent_id} 无试运行回放台账")
+        if row["status"] == "done":
+            raise LookupError(f"Agent {agent_id} 回放窗口已完成（等验收归档）")
+        if row["agent_status"] != "trial":
+            raise LookupError(f"Agent {agent_id} 不在试运行期（status={row['agent_status']}）")
+        c.execute(
+            "INSERT INTO replay_sessions (agent_id, account_id, trade_date, created_ts)"
+            " VALUES (?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+            " ON CONFLICT(agent_id, trade_date) DO NOTHING",
+            (agent_id, row["trial_account_id"], trade_date),
+        )
+        cnt = c.execute(
+            "SELECT COUNT(*) AS n FROM replay_sessions WHERE agent_id=?",
+            (agent_id,),
+        ).fetchone()["n"]
+        if cnt >= row["window_days"] and row["status"] == "in_progress":
+            c.execute(
+                "UPDATE trial_replays SET status='done', "
+                f"updated_ts=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE agent_id=?",
+                (agent_id,),
+            )
+    return trial_replay(state, agent_id)
 
 
 def finish_trial(state, *, agent_id: str, decision: str,
@@ -182,6 +257,14 @@ def finish_trial(state, *, agent_id: str, decision: str,
                 "SELECT trade_date FROM settlement_log WHERE account_id=?"
                 " ORDER BY trade_date", (trial["id"],)).fetchall()
         ]
+        replay = c.execute(
+            "SELECT window_days, status FROM trial_replays WHERE agent_id=?",
+            (agent_id,)).fetchone()
+        replay_dates = [
+            r[0] for r in c.execute(
+                "SELECT trade_date FROM replay_sessions WHERE agent_id=?"
+                " ORDER BY trade_date", (agent_id,)).fetchall()
+        ]
         snapshot = {
             "decision": decision,
             "verdict": verdict.strip(),
@@ -191,6 +274,12 @@ def finish_trial(state, *, agent_id: str, decision: str,
                 "cash": trial["cash"], "nav": trial["nav"],
                 "shares": trial["shares"], "total_pnl": trial["total_pnl"],
                 "status": trial["status"],
+            },
+            "replay": {
+                "window_days": replay["window_days"] if replay else 0,
+                "replay_status": replay["status"] if replay else "",
+                "replay_dates": replay_dates,
+                "sessions": len(replay_dates),
             },
             "counts": {
                 "settle_days": len(settle_dates),
@@ -212,6 +301,11 @@ def finish_trial(state, *, agent_id: str, decision: str,
             "INSERT INTO trial_archives (id, agent_id, account_id, decision, verdict,"
             " snapshot, archived_ts) VALUES (?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
             (archive_id, agent_id, trial["id"], decision, verdict.strip(), snapshot_json),
+        )
+        c.execute(
+            "UPDATE trial_replays SET status='done', "
+            f"updated_ts={ts} WHERE agent_id=? AND status='in_progress'",
+            (agent_id,),
         )
     return {
         "archive_id": archive_id,

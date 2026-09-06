@@ -72,3 +72,13 @@ class ReadySessionFeed(FakeFeed):
     def realtime_batch(self, symbols):
         compact = DATE.replace("-", "")
         return {"600000": {"ts": compact + "153500"}}
+
+
+class AxisFeed(FakeFeed):
+    """交易日轴 feed：600000 day_rows 返回 fixture 全部日线（供试运行回放/快进轴）。
+    不供给当日行情——配合“空日回放也计数”的回放语义，run_day 在无订单无持仓时跳过。"""
+
+    def day_rows(self, symbol, start, end):
+        if symbol != SYMBOL:
+            raise q.QuoteGapError(f"{symbol} 无日线轴 fixture")
+        return q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
