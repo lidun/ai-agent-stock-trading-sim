@@ -375,6 +375,44 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE accounts ADD COLUMN buy_exempt TEXT NOT NULL DEFAULT '[]';
         """,
     ),
+    (
+        8,
+        """
+        -- spec-01 §8.1 卖出跟踪（引擎切片）：卖出成交时引擎自动登记 exit_trackings，
+        -- N（默认 10）个交易日后确定性结清（确定性、零 token，阈值引擎常量可调）。
+        -- 列口径：sell_price/qty 为成交实值；fwd/bench/excess 为百分数；period_high/low
+        -- 为跟踪窗口（卖出日次日起）逐结算日累计极值；bench_sell_close 为卖出日基准收盘。
+        CREATE TABLE IF NOT EXISTS exit_trackings (
+            id               TEXT PRIMARY KEY,
+            account_id       TEXT NOT NULL REFERENCES accounts(id),
+            sell_trade_id    TEXT NOT NULL,
+            symbol           TEXT NOT NULL,
+            sell_date        TEXT NOT NULL,
+            sell_price       REAL NOT NULL,
+            qty              REAL NOT NULL,
+            sell_reason      TEXT NOT NULL DEFAULT '主动',
+            status           TEXT NOT NULL DEFAULT 'tracking'
+                             CHECK (status IN ('tracking', 'done')),
+            track_end_date   TEXT NOT NULL DEFAULT '',
+            fwd_return_pct   REAL NOT NULL DEFAULT 0,
+            bench_return_pct REAL NOT NULL DEFAULT 0,
+            excess_pct       REAL NOT NULL DEFAULT 0,
+            period_high      REAL NOT NULL,
+            period_low       REAL NOT NULL,
+            conclusion       TEXT NOT NULL DEFAULT ''
+                             CHECK (conclusion IN ('', '卖对', '卖平', '卖早')),
+            is_loss_case     INTEGER NOT NULL DEFAULT 0,
+            bench_sell_close REAL NOT NULL DEFAULT 0,
+            last_close       REAL NOT NULL DEFAULT 0,
+            last_bench       REAL NOT NULL DEFAULT 0,
+            quality          TEXT NOT NULL DEFAULT '',
+            created_ts       TEXT NOT NULL,
+            done_ts          TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_exit_account_status
+            ON exit_trackings(account_id, status, sell_date);
+        """,
+    ),
 ]
 
 

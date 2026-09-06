@@ -1025,3 +1025,100 @@ def test_eod_time_malformed_trigger_invalid(authed_client):
     )
     row = _fetch(st, "SELECT status, invalid_reason FROM condition_orders WHERE id='co-t4'")[0]
     assert row["status"] == "invalid" and row["invalid_reason"] == "trigger_schema"
+
+
+def _empty_settle(st, day):
+    """无订单的空结算：仅推进 settlement_log 会话日序（卖出跟踪 N 日计数用）。"""
+    eodengine.settle_account(st, DEMO, day, close_map={})
+
+
+def _exit_day(st, day, close=None, *, high=None, low=None, bench=None, track_days=None):
+    _empty_settle(st, day)
+    mkt: dict[str, dict] = {}
+    if close is not None:
+        md = {"close": close}
+        if high is not None:
+            md["high"] = high
+        if low is not None:
+            md["low"] = low
+        mkt["600000"] = md
+    if bench is not None:
+        mkt[eodengine.EXIT_BENCH_SYMBOL] = {"close": bench}
+    eodengine.settle_exits(st, DEMO, day, market=mkt, track_days=track_days)
+
+
+def _sell_all(st, *, day="2026-09-02", px=11.0, reason="主动", bench=3000.0):
+    _insert_order(st, order_id="co-ex-s", order_type="sell_take_profit", direction="sell",
+                  qty=100, trigger={"op": "ge", "price": 5.0}, created=f"{day}T09:00:00",
+                  reason=reason)
+    eodengine.settle_account(
+        st, DEMO, day,
+        series_map={"600000": [(f"{day}T09:31:00", px)]},
+        close_map={"600000": px},
+        prev_close_map={"600000": 10.0},
+        exit_market={eodengine.EXIT_BENCH_SYMBOL: {"close": bench}},
+    )
+
+
+def test_eod_exit_register_track_and_close_early(authed_client):
+    """卖出登记 → 逐结算日推进极值 → 第 10 交易日确定性结清（卖早 + 损失案例标注）。"""
+    st = authed_client.app.state
+    _buy_then(st, day1="2026-09-01")
+    _sell_all(st, day="2026-09-02", px=11.0, reason="止盈", bench=3000.0)
+    rows = _fetch(st, "SELECT * FROM exit_trackings WHERE account_id=?", (DEMO,))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["sell_date"] == "2026-09-02" and r["status"] == "tracking"
+    assert abs(float(r["sell_price"]) - 11.0) < 1e-9
+    assert r["sell_reason"] == "止盈" and r["bench_sell_close"] == 3000.0
+
+    for i in range(3, 13):                       # 09-03..09-12 共 10 个卖后交易日
+        day = f"2026-09-{i:02d}"
+        kw = {"close": 12.0}
+        if i == 4:
+            kw.update(high=13.0, low=11.0)       # 推进期极值：高点冲高、回落
+        if i == 5:
+            kw.update(high=12.0, low=10.2)
+        _exit_day(st, day, bench=3090.0, **kw)
+    rows = _fetch(st, "SELECT * FROM exit_trackings WHERE account_id=?", (DEMO,))
+    assert len(rows) == 1 and rows[0]["status"] == "done"
+    r = rows[0]
+    assert r["conclusion"] == "卖早" and r["is_loss_case"] == 1
+    assert abs(float(r["fwd_return_pct"]) - 9.0909) < 1e-3   # (12-11)/11
+    assert abs(float(r["bench_return_pct"]) - 3.0) < 1e-6
+    assert abs(float(r["excess_pct"]) - 6.0909) < 1e-3
+    assert abs(float(r["period_high"]) - 13.0) < 1e-9
+    assert abs(float(r["period_low"]) - 10.2) < 1e-9
+    assert r["track_end_date"] == "2026-09-12" and r["quality"] == ""
+
+    again = eodengine.settle_exits(
+        st, DEMO, "2026-09-12",
+        market={"600000": {"close": 12.0}, eodengine.EXIT_BENCH_SYMBOL: {"close": 3090.0}},
+    )
+    assert again["closed"] == 0                 # 幂等：不重复结清/推进
+
+
+def test_eod_exit_sell_right_boundary(authed_client):
+    """阈值边界：fwd/excess = −3% 整 → 卖对。"""
+    st = authed_client.app.state
+    _buy_then(st, day1="2026-09-01")
+    _sell_all(st, day="2026-09-02", px=11.0)
+    _exit_day(st, "2026-09-03", close=11.0, bench=3000.0, track_days=2)
+    _exit_day(st, "2026-09-04", close=10.67, bench=3000.0, track_days=2)   # (10.67-11)/11 = -3.0%
+    r = _fetch(st, "SELECT * FROM exit_trackings WHERE account_id=?", (DEMO,))[0]
+    assert r["status"] == "done" and r["conclusion"] == "卖对"
+    assert abs(float(r["fwd_return_pct"]) + 3.0) < 1e-6 and r["is_loss_case"] == 0
+
+
+def test_eod_exit_stale_close_when_price_missing(authed_client):
+    """结清日个股官方价缺失 → 按最近可得价 stale 结清（不虚构价，quality 标注）。"""
+    st = authed_client.app.state
+    _buy_then(st, day1="2026-09-01")
+    _sell_all(st, day="2026-09-02", px=11.0)
+    _exit_day(st, "2026-09-03", close=10.9, bench=3000.0, track_days=3)
+    _exit_day(st, "2026-09-04", close=10.8, bench=3000.0, track_days=3)
+    _exit_day(st, "2026-09-05", bench=3000.0, track_days=3)                 # 当日股票价缺 → stale
+    r = _fetch(st, "SELECT * FROM exit_trackings WHERE account_id=?", (DEMO,))[0]
+    assert r["status"] == "done" and r["quality"] == "stale_close"
+    assert r["conclusion"] == "卖平"                          # -1.82% 区间
+    assert abs(float(r["fwd_return_pct"]) + 1.8182) < 1e-3

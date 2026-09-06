@@ -42,7 +42,12 @@
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
 未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/封板确认事件类（seal_confirm，
-需盘口/封单数据）、volume 量能类、signal_registry/exit_trackings、公司行动。
+需盘口/封单数据）、volume 量能类、signal_registry（候选/买入等信号注册需策略侧供给通道，
+本版未建）、公司行动。
+
+卖出跟踪（§8.1）引擎侧已实现：卖出成交自动登记 exit_trackings；跟踪推进与结清由
+settle_exits 在结算日调用（N=10 交易日结清，确定性/零 token，停牌缺价→最近可得价 stale
+结清标注，不虚构价）。signal_registry 的卖出登记语义在 §8.1 内以 exit_trackings 承载。
 """
 from __future__ import annotations
 
@@ -69,6 +74,14 @@ FEES = {
     "stamp_tax_rate": Decimal("0.0005"),
     "transfer_fee_rate": Decimal("0.00001"),
 }
+
+# spec-01 §8.1 卖出跟踪：默认 N=10 个交易日后确定性结清（卖出当日不计，会计入下一起）；
+# 基准指数 = 沪深300（同期超额）；结清阈值 = fwd/excess 百分数（引擎常量，P1 校准用）。
+EXIT_DEFAULT_DAYS = 10
+EXIT_BENCH_SYMBOL = "000300"
+_EXIT_OK_PCT = Decimal("-3")      # fwd/excess ≤ −3% → 卖对
+_EXIT_EARLY_PCT = Decimal("5")    # fwd/excess ≥ +5% → 卖早
+_EXIT_REASONS = {"止盈", "止损", "调仓", "主动", "强平", "清仓"}
 
 
 class EngineError(Exception):
@@ -301,6 +314,124 @@ def _audit_conservation(c, account_id: str, trade_date: str, *, cash_start: Deci
         )
 
 
+def settle_exits(
+    state,
+    account_id: str,
+    trade_date: str,
+    *,
+    market: dict[str, dict] | None = None,
+    track_days: int | None = None,
+) -> dict:
+    """每日推进卖出跟踪并到期结清（spec-01 §8.1；幂等，单事务，不动撮合账务）。
+
+    market[sym] = {"close": float, "high": float, "low": float}——当日官方收盘及日内
+    高低（缺 high/low 时以 close 记极值）。基准指数以 market["000300"]（EXIT_BENCH_SYMBOL）
+    提供，未提供时 excess 无法计算：结清仍按个股 fwd 判结论，quality 标 no_bench。
+
+    推进规则：跟踪行仅在其卖出日**之后**的结算日被推进（当日卖出行由本函数排除，避免把
+    卖出前盘中极值计入窗口）；每推进一日刷新 period_high/period_low 与最近可得价。自卖出
+    日起第 track_days（默认 EXIT_DEFAULT_DAYS=10）个结算日志日后结清——取当日官方收盘价；
+    当日缺价但此前有最近可得价 → 按最近价 stale 结清并标 quality=stale_close；两源皆缺时
+    保持 tracking 不虚构价。回归安全：settle_log 日序计数（同键幂等）驱动，非墙钟天数。
+    """
+    n = int(track_days or EXIT_DEFAULT_DAYS)
+    md = market or {}
+    conn = state_conn(state)
+    updated = closed = 0
+    with write_txn(conn) as c:
+        rows = c.execute(
+            """
+            SELECT * FROM exit_trackings
+             WHERE account_id=? AND status='tracking' AND sell_date < ?
+             ORDER BY sell_date ASC, id ASC
+            """,
+            (account_id, trade_date),
+        ).fetchall()
+        for r in rows:
+            sym = r["symbol"]
+            day = md.get(sym) or {}
+            close = _D(day["close"]) if "close" in day else None
+            high = _D(day["high"]) if "high" in day else None
+            low = _D(day["low"]) if "low" in day else None
+            if high is None or low is None:
+                high = low = close
+            bd = md.get(EXIT_BENCH_SYMBOL) or {}
+            bclose = _D(bd["close"]) if "close" in bd else None
+            if close is None and bclose is None:
+                continue                     # 本日个股与基准双缺：不推进、不虚构价
+            sessions = c.execute(
+                """
+                SELECT COUNT(DISTINCT trade_date) AS n FROM settlement_log
+                 WHERE account_id=? AND trade_date > ? AND trade_date <= ?
+                """,
+                (account_id, r["sell_date"], trade_date),
+            ).fetchone()["n"]
+            if sessions > 0:                 # 非卖出当日 → 推进极值与最近价
+                ph = _D(r["period_high"])
+                pl = _D(r["period_low"])
+                if close is not None:
+                    np_high = high if high is not None else close
+                    np_low = low if low is not None else close
+                    if np_high > ph:
+                        ph = np_high
+                    if np_low < pl:
+                        pl = np_low
+                    c.execute(
+                        "UPDATE exit_trackings SET period_high=?, period_low=?, last_close=? WHERE id=?",
+                        (_q(ph), _q(pl), _q(close), r["id"]),
+                    )
+                if bclose is not None:
+                    c.execute(
+                        "UPDATE exit_trackings SET last_bench=? WHERE id=?",
+                        (_q(bclose), r["id"]),
+                    )
+                updated += 1
+            if sessions < n:
+                continue                     # 未到结清日：继续 tracking
+            sp = _D(r["sell_price"])
+            if close is not None:
+                ev = close
+                stale = False
+            elif _D(r["last_close"]) > 0:
+                ev = _D(r["last_close"])
+                stale = True
+            else:
+                continue                     # 到期但无任何可得价：保持 tracking（停牌挂起）
+            base_b = _D(r["bench_sell_close"])
+            bnow = bclose if bclose is not None else (_D(r["last_bench"]) if _D(r["last_bench"]) > 0 else None)
+            fwd = ((ev - sp) / sp * Decimal("100")).quantize(_COST, ROUND_HALF_UP)
+            bench = excess = None
+            if base_b > 0 and bnow is not None and bnow > 0:
+                bench = ((bnow - base_b) / base_b * Decimal("100")).quantize(_COST, ROUND_HALF_UP)
+                excess = (fwd - bench).quantize(_COST, ROUND_HALF_UP)
+            ok = fwd <= _EXIT_OK_PCT or (excess is not None and excess <= _EXIT_OK_PCT)
+            early = fwd >= _EXIT_EARLY_PCT or (excess is not None and excess >= _EXIT_EARLY_PCT)
+            conclusion = "卖早" if early else ("卖对" if ok else "卖平")
+            is_loss = int(fwd > 0 or (excess is not None and excess > 0))
+            qual = []
+            if stale:
+                qual.append("stale_close")
+            if excess is None:
+                qual.append("no_bench")
+            c.execute(
+                """
+                UPDATE exit_trackings
+                   SET status='done', track_end_date=?, fwd_return_pct=?, bench_return_pct=?,
+                       excess_pct=?, conclusion=?, is_loss_case=?, quality=?, done_ts=?
+                 WHERE id=?
+                """,
+                (
+                    trade_date, _q(fwd),
+                    _q(bench) if bench is not None else _q(Decimal("0")),
+                    _q(excess) if excess is not None else _q(Decimal("0")),
+                    conclusion, is_loss, "+".join(qual), _now(), r["id"],
+                ),
+            )
+            closed += 1
+    return {"account_id": account_id, "trade_date": trade_date, "updated": updated,
+            "closed": closed}
+
+
 def settle_account(
     state,
     account_id: str,
@@ -315,6 +446,7 @@ def settle_account(
     board_map: dict[str, str] | None = None,
     restrict_map: dict[str, str] | None = None,
     fee: dict | None = None,
+    exit_market: dict[str, dict] | None = None,
 ) -> dict:
     """对单个账户执行一日 EOD 结算（单 SQLite 事务原子写入）。
 
@@ -331,6 +463,9 @@ def settle_account(
     restrict_map[symbol] = 当日风险标记（st=风险警示 ST、ipo=注册制新股上市 5 日内；逗号或空格
     分隔可多标）。命中且账户 accounts.buy_exempt（JSON token 数组，需审批）未豁免 → 买入单开盘前
     invalid（restricted_buy），见模块 doc。
+    exit_market[sym] = {"close": float, "high": float, "low": float}：卖出登记时缓存当日基准
+    指数（key=EXIT_BENCH_SYMBOL "000300"）与个股官方收盘（用于卖出价偏差侧极端计），仅登记
+    期用；每日跟踪推进由 settle_exits 单独调用（见模块 doc §8.1）。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -385,6 +520,7 @@ def settle_account(
     prev = {k: _D(v) for k, v in (prev_close_map or {}).items()}
     hist_high = {k: _D(v) for k, v in (hist_high_map or {}).items()}
     boards = board_map or {}
+    exit_market = exit_market or {}
 
     def lock_limits(symbol: str):
         """涨跌停封死判定专用：board_map 显式含该票且 prev_close 可得才返回 (up, down)。"""
@@ -540,6 +676,31 @@ def settle_account(
         runtime = {o["id"]: {"ins": o["insufficient_events"], "final": "active"} for o in active}
         ever_pinned: dict[str, bool] = {}
 
+        def register_exit(o: dict, tid: str, qty: int, price: Decimal) -> None:
+            """§8.1 卖出成交登记：每笔卖出 trade 一行，卖出日基准指数收盘随行缓存。"""
+            reason = str(o.get("reason") or "").strip()
+            if reason not in _EXIT_REASONS:
+                reason = "主动"
+            bd = exit_market.get(EXIT_BENCH_SYMBOL) or {}
+            bsl = _D(bd["close"]) if "close" in bd else Decimal("0")
+            sp = price.quantize(_MONEY, ROUND_HALF_UP)
+            c.execute(
+                """
+                INSERT INTO exit_trackings(id, account_id, sell_trade_id, symbol, sell_date,
+                    sell_price, qty, sell_reason, status, track_end_date, fwd_return_pct,
+                    bench_return_pct, excess_pct, period_high, period_low, conclusion,
+                    is_loss_case, bench_sell_close, last_close, last_bench, quality,
+                    created_ts, done_ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "x" + secrets.token_hex(10), account_id, tid, o["symbol"], trade_date,
+                    _q(sp), qty, reason, "tracking", "", _q(Decimal("0")), _q(Decimal("0")),
+                    _q(Decimal("0")), _q(sp), _q(sp), "", 0, _q(bsl), _q(sp),
+                    _q(Decimal("0")), "", now, "",
+                ),
+            )
+
         def sell_fill(o: dict, qty: int, p: Decimal, ts: str, *, oid: str) -> None:
             """卖出撮合公共路径（L0/开板共用）：T+1 可卖校验、现金、FIFO 核销、清仓删除。"""
             nonlocal cash
@@ -595,6 +756,7 @@ def settle_account(
                 )
                 del held_qty[o["symbol"]]
             runtime[oid]["final"] = "filled"
+            register_exit(o, tid, qty, p)
 
         def buy_fill(o: dict, qty: int, p: Decimal, ts: str, *, oid: str) -> None:
             """买入撮合公共路径（L0/定时共用）：资金校验、费用、持仓/lot 落账与摊薄。"""
@@ -1064,6 +1226,7 @@ def settle_account(
                         )
                         del held_qty[o["symbol"]]
                     runtime[oid]["final"] = "filled"
+                    register_exit(o, tid, qty, p)
 
         # 写盘条件单运行态 + today 单未成交 → expired（§3.2 步4）
         for o in active:
