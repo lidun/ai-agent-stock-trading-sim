@@ -1,0 +1,50 @@
+/* 全局设计规范基础（spec-06 §5 P1 强制）
+   色彩语义：A 股习惯 红涨绿跌（全局唯一语义，含图表）；主题：暖白默认/深色可切换。 */
+:root {
+  --up-color: #cf1322;   /* 涨/盈 红 */
+  --down-color: #389e0d; /* 跌/亏 绿 */
+  --flat-color: #8c8c8c;
+  --bg-page: #f5f5f5;
+  --bg-layout: #fafafa;
+  --money-font: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+[data-theme="dark"] {
+  --bg-page: #141414;
+  --bg-layout: #000;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-layout);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+/* 涨跌数字/文本语义色：红涨绿跌（A 股） */
+.up { color: var(--up-color); }
+.down { color: var(--down-color); }
+.flat { color: var(--flat-color); }
+
+/* 交易数据统一等宽数字（时间带"京"角标，spec-06 §5.2） */
+.num { font-variant-numeric: tabular-nums; }
+.money { font-family: var(--money-font); font-variant-numeric: tabular-nums; }
+.zone-bj::after {
+  content: "京";
+  font-size: 0.7em;
+  color: var(--flat-color);
+  margin-left: 2px;
+  vertical-align: super;
+}
+
+/* 顶栏/布局通用 */
+.page { padding: 16px; min-height: 100%; }
+.muted { color: rgba(0, 0, 0, 0.45); }
+[data-theme="dark"] .muted { color: rgba(255, 255, 255, 0.45); }

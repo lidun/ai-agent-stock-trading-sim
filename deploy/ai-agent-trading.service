@@ -1,0 +1,25 @@
+# AI Agent Trading core 服务（systemd 保活，spec-06 §2 进程守护）
+# 安装：拷贝到 /etc/systemd/system/ai-agent-trading.service
+#   WorkingDirectory 需包含 venv/bin/uvicorn（或改用系统 python3 -m uvicorn）
+[Unit]
+Description=AI Agent Trading core (FastAPI, loopback only)
+After=network.target
+
+[Service]
+Type=simple
+User=aat
+Group=aat
+WorkingDirectory=/opt/aat/core
+Environment=PYTHONUNBUFFERED=1
+# 生产强口令：首次启动自动生成并写入 data_dir/credentials.json，见 deploy/README.md
+Environment=CORE_ENV=prod
+Environment=CORE_HOST=127.0.0.1
+Environment=CORE_PORT=8001
+ExecStart=/opt/aat/core/venv/bin/uvicorn core.app:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=3
+# 单实例锁（进程级）在 app 内实现；systemd 再兜底防重复拉起
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

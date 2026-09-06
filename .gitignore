@@ -174,3 +174,14 @@
 *.lz
 *.lzma
 *.iso
+
+# AI Agent Trading runtime
+**/node_modules/
+**/dist/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ruff_cache/
+core/data/
+
