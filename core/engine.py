@@ -15,13 +15,39 @@ import json
 import logging
 import textwrap
 
-from core import chatstore, ws as ws_channel
+from core import chatstore, orderstore, ws as ws_channel
 from core.auth import audit
 
 log = logging.getLogger(__name__)
 
-# 桩回复的角色感知正文（演示；真实回复由执行层产出）
-def _stub_reply_body(agent: dict, user_text: str) -> str:
+# 桩演示下单：用户消息含该关键词 → 子 Agent 登记一条确定性市价买入条件单（P1 桩链路）
+DEMO_ORDER_KEYWORD = "演示下单"
+DEMO_ORDER_SYMBOL = "600519"
+DEMO_ORDER_QTY = 100
+DEMO_ORDER_REASON = "P1 桩演示：用户消息触发登记，等待 EOD 引擎撮合"
+
+
+def _maybe_demo_order(state, agent: dict, user_text: str) -> dict | None:
+    """子 Agent 会话识别确定性演示下单意图；失败以 error 键回传（P1 桩契约）。"""
+    if not agent or agent.get("role") != "strategy" or DEMO_ORDER_KEYWORD not in user_text:
+        return None
+    try:
+        order = orderstore.place_order(
+            state,
+            account_id=agent["id"],
+            creator=agent["id"],
+            symbol=DEMO_ORDER_SYMBOL,
+            qty=DEMO_ORDER_QTY,
+            price_type="market",
+            validity="today",
+            reason=DEMO_ORDER_REASON,
+        )
+        return order
+    except orderstore.OrderError as exc:
+        return {"error": str(exc)}
+
+
+def _stub_reply_body(agent: dict, user_text: str, order: dict | None = None) -> str:
     preview = textwrap.shorten(user_text.strip().replace("\n", " "), width=120)
     if agent["role"] == "manager":
         lines = [
@@ -45,6 +71,21 @@ def _stub_reply_body(agent: dict, user_text: str) -> str:
             "- 策略执行的每日闭环（选股 → 条件单 → 结算 → 日报）在 **手动跑通一天** 切片中接入；",
             "- 本会话的历史将永久保存，任务收尾沉淀入记忆（spec-02 §6.2）。",
         ]
+        if order is not None:
+            if "error" in order:
+                lines += [
+                    "",
+                    "**P1 桩 · 演示下单失败**",
+                    f"- 原因：{order['error']}",
+                ]
+            else:
+                lines += [
+                    "",
+                    f"**P1 桩 · 演示下单已登记**（消息含关键词 `{DEMO_ORDER_KEYWORD}`）",
+                    f"- 条件单 id `{order['id']}`；`{order['symbol']}` 买入 {order['qty']} 股（市价，当日有效）",
+                    "- 状态 **active**：等待行情数据源就绪后由 EOD 引擎撮合/结算（spec-01 §3）；",
+                    "- 可在 **交易中心** 查看该条件单（结算前持仓为空态）。",
+                ]
     return "\n".join(lines)
 
 
@@ -80,17 +121,22 @@ async def process_message(state, user_message: dict, conversation: dict) -> None
         await _step(state, settings.engine_stub_delay_ms * 2)
 
         # 2) 产出 Agent 回复（本桩为确定性文本；正式引擎按 spec-02 §6.2 白名单 msg_type）
+        demo_order = _maybe_demo_order(state, agent or {}, user_message["body"])
         reply = chatstore.insert_message(
             state,
             conv_id=conversation["id"],
             agent_id=conversation["agent_id"],
             direction="agent",
             msg_type="reply",
-            body=_stub_reply_body(agent or {}, user_message["body"]),
+            body=_stub_reply_body(agent or {}, user_message["body"], order=demo_order),
             payload_ref=_stub_payload(agent or {}),
             status="delivered",
             delivered_via="web",
         )
+        if demo_order and "error" not in demo_order:
+            audit(state, conversation["agent_id"], "trade.order_place", result="ok",
+                  object_type="condition_order", object_id=demo_order["id"],
+                  detail=f"P1 桩演示下单 {demo_order['symbol']} qty={demo_order['qty']}")
         chatstore.set_message_status(state, user_message["id"], "delivered")
         audit(state, conversation["agent_id"], "chat.message_reply", result="ok",
               object_type="message", object_id=reply["id"],

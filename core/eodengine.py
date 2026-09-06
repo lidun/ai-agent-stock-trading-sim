@@ -90,9 +90,9 @@ def _trigger_price(o: dict):
 
 
 def _qty_ok(symbol: str, qty: int) -> bool:
-    if symbol.startswith("688"):
-        return qty >= 200
-    return qty > 0 and qty % 100 == 0
+    """申报数量规则委托 orderstore（单一事实源，spec-01 §3.7 D6）。"""
+    from core.orderstore import qty_rule_ok  # noqa: PLC0415
+    return qty_rule_ok(symbol, qty)
 
 
 def settle_account(
