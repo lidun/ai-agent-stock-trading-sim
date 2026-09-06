@@ -48,8 +48,17 @@ def qty_rule_ok(symbol: str, qty: int) -> bool:
 
 
 _PRICE_KIND_OP = {"price_le": "le", "price_ge": "ge"}
-_UNIMPL_KINDS = {"pct_chg", "vs_cost", "open_board", "seal_confirm",
-                 "volume", "time", "and", "or"}
+_UNIMPL_KINDS = {"open_board", "seal_confirm", "volume", "time", "and", "or"}
+
+
+def _parse_pct(trig: dict, *, kind: str) -> float:
+    try:
+        pct = float(trig.get("pct"))
+    except (TypeError, ValueError):
+        raise OrderError(f"kind={kind} 需 pct 数值") from None
+    if pct == 0:
+        raise OrderError(f"kind={kind} 的 pct 须非 0")
+    return pct
 
 
 def _canon_trigger(trig: dict, *, order_type: str) -> dict:
@@ -57,6 +66,8 @@ def _canon_trigger(trig: dict, *, order_type: str) -> dict:
 
     - price_le/price_ge 原样返回；legacy {"op":"le"|"ge","price"} 等价映射；
     - kind=trail（移动止盈）仅允许 sell_trail 且 drop_pct>0；
+    - kind=pct_chg（昨收基准涨跌幅）与 kind=vs_cost（持仓成本基准）需 op(le|ge)+pct≠0，
+      pct_chg 可选 not_limit（触发时刻未封板）；vs_cost 为卖出相对成本，先不做 not_limit；
     - 其余 kind 属未实现语义 → 显式 OrderError 拒单（不静默放行）。
     """
     kind = trig.get("kind")
@@ -71,11 +82,31 @@ def _canon_trigger(trig: dict, *, order_type: str) -> dict:
             if not drop > 0:
                 raise OrderError("kind=trail 的 drop_pct 须 > 0")
             return {"kind": "trail", "drop_pct": drop}
+        if kind in _PRICE_KIND_OP:
+            if trig.get("price") is None:
+                raise OrderError("trigger kind 非法或缺少 price")
+            return {"kind": kind, "price": trig["price"]}
+        if kind == "pct_chg":
+            op = trig.get("op")
+            if op not in ("le", "ge"):
+                raise OrderError("kind=pct_chg 需 op(le|ge)")
+            pct = _parse_pct(trig, kind=kind)
+            out: dict = {"kind": kind, "op": op, "pct": pct}
+            nl = trig.get("not_limit", False)
+            if not isinstance(nl, bool):
+                raise OrderError("kind=pct_chg 的 not_limit 须为布尔")
+            if nl:
+                out["not_limit"] = True
+            return out
+        if kind == "vs_cost":
+            op = trig.get("op")
+            if op not in ("le", "ge"):
+                raise OrderError("kind=vs_cost 需 op(le|ge)")
+            pct = _parse_pct(trig, kind=kind)
+            return {"kind": kind, "op": op, "pct": pct}
         if kind in _UNIMPL_KINDS:
             raise OrderError(f"trigger kind={kind} 引擎尚未实现——拒绝下单")
-        if kind not in _PRICE_KIND_OP or trig.get("price") is None:
-            raise OrderError("trigger kind 非法或缺少 price")
-        return {"kind": kind, "price": trig["price"]}
+        raise OrderError("trigger kind 非法或缺少 price")
     op = trig.get("op")
     if op not in ("le", "ge") or trig.get("price") is None:
         raise OrderError("trigger 需含 op(le|ge) 与 price")

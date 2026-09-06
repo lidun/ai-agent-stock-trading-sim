@@ -3,8 +3,10 @@
 范围与边界（本版明确支持；其余拒绝而非静默跳过——宁可报 gap，不可错结）：
 - 账户：granularity=eod_replay 的策略账户；单日结算；settle_key UNIQUE 幂等（§3.1.5/§3.8 单事务）；
 - 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop,
-  sell_trail}、price_type ∈ {market, limit}、单票价格触发（trigger 统一 spec-01 §2.4 kind
-  语义，canonical {"kind":"price_le"|"price_ge","price":X}；legacy {"op","price"} 兼容读取）；
+  sell_trail}、price_type ∈ {market, limit}、单票触发（trigger 统一 spec-01 §2.4 kind
+  语义）——价格类 price_le/price_ge（canonical {"kind","price"}；legacy {"op","price"}
+  兼容读取）、涨跌幅类 pct_chg（昨收折算静态触发价，可选 not_limit 未封板）、相对成本类
+  vs_cost（可卖持仓成本逐点折算动态触发价，spec-01 §2.4）；
 - 涨跌停封死例外（spec-01 §3.5/§3.6，可选启用）：board_map 显式提供板块且 prev_close_map
   含该票时启用——涨跌停价按板块系数与 §0 四舍五入实时计算；涨停封死段买入不成交、跌停封死段
   卖出不成交，盘中开板后恢复；L1/L2 仅整分钟/一字板封死才阻断（无日内粒度的近似口径）；
@@ -28,8 +30,8 @@
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
 未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板事件类、
-pct_chg/vs_cost/volume 组合类、signal_registry/exit_trackings、ST/新股买入拦截（账户豁免
-配置待接入）、公司行动。
+volume 量能类、signal_registry/exit_trackings、ST/新股买入拦截（账户豁免配置待接入）、
+公司行动。
 """
 from __future__ import annotations
 
@@ -107,63 +109,90 @@ def _fees(amount: Decimal, *, side: str, fee: dict) -> dict[str, Decimal]:
 
 
 _PRICE_KINDS = {"price_le": "le", "price_ge": "ge"}
-_UNIMPL_KINDS = ("trail", "pct_chg", "vs_cost", "open_board", "seal_confirm",
-                 "volume", "time", "and", "or")
+_PCT_KINDS = {"pct_chg", "vs_cost"}
+_UNIMPL_KINDS = ("open_board", "seal_confirm", "volume", "time", "and", "or")
 
 
-def _kind_price(kind: str, raw: dict):
-    """spec-01 §2.4 kind 价格触发 → (op, price)；未实现/非法 kind 显式报错不静默。"""
-    op = _PRICE_KINDS.get(kind)
-    if op is None:
-        if kind in _UNIMPL_KINDS:
-            raise EngineGapError(f"trigger kind={kind} 尚未实现（spec-01 §2.4）")
-        raise EngineError("trigger JSON kind 非法")
-    price = raw.get("price")
-    if price is None:
-        raise EngineError("trigger JSON kind 触发缺少 price")
-    return op, _D(price)
+def _kind_price(kind: str, raw: dict, *, prev: Decimal | None = None) -> tuple:
+    """spec-01 §2.4 kind 触发解析 → (mode, op, price, pct, not_limit)。
 
-
-def _trigger_price(o: dict):
-    """limit 单解析触发价；market 单恒触发。返回 (op, price)。
-
-    kind 价格类为 spec-01 §2.4 canonical；op/price 为 legacy 兼容（历史落库单）。
+    - price_le/price_ge：mode=px，price=触发价；
+    - pct_chg（昨收基准）：mode=pct，price=昨收×（1+pct/100）折算静态触发价（spec-01 §2.4
+      示例 le/−5% = 价 ≤ 昨收×0.95）；not_limit 可选（触发时刻未封板，方向随 op）；
+    - vs_cost（持仓成本基准）：mode=cost，触发价按当日可卖持仓成本逐点折算（动态）；
+    - 未实现/非法 kind 显式报错不静默。
     """
-    if o["price_type"] == "market":
-        raw = json.loads(o["trigger"]) if o["trigger"] else None
-        if not raw:
-            return None, None
-        if "kind" in raw:
-            return _kind_price(raw["kind"], raw)
-        return raw.get("op") or None, _D(raw.get("price"))
-    if not o["trigger"]:
-        raise EngineError("limit 单缺少 trigger JSON")
-    raw = json.loads(o["trigger"])
+    if kind in _PRICE_KINDS:
+        price = raw.get("price")
+        if price is None:
+            raise EngineError("trigger JSON kind 触发缺少 price")
+        return "px", _PRICE_KINDS[kind], _D(price), None, False
+    if kind in _PCT_KINDS:
+        op = raw.get("op")
+        if op not in ("le", "ge"):
+            raise EngineError("trigger JSON pct_chg/vs_cost 需 op(le|ge)")
+        try:
+            pct = _D(raw.get("pct"))
+        except Exception as exc:
+            raise EngineError("trigger JSON pct 非法") from exc
+        if pct == 0:
+            raise EngineError("trigger JSON pct 须非 0")
+        not_limit = bool(raw.get("not_limit", False))
+        if kind == "pct_chg":
+            if prev is None:
+                raise EngineGapError(
+                    "kind=pct_chg 缺少昨收基准——数据供给拒绝该账户结算（不落 invalid）"
+                )
+            price = (prev * (_D("100") + pct) / _D("100")).quantize(
+                _MONEY, ROUND_HALF_UP
+            )
+            return "pct", op, price, pct, not_limit
+        return "cost", op, None, pct, False
+    if kind in _UNIMPL_KINDS:
+        raise EngineGapError(f"trigger kind={kind} 尚未实现（spec-01 §2.4）")
+    raise EngineError("trigger JSON kind 非法")
+
+
+def _trigger_price(o: dict, *, prev: Decimal | None = None) -> tuple:
+    """limit 单解析触发规则；market 单恒触发。返回 (mode, op, price, pct, not_limit)。
+
+    kind 价格/涨跌幅/成本类为 spec-01 §2.4 canonical；op/price 为 legacy 兼容（历史落库单）。
+    """
+    raw = json.loads(o["trigger"]) if o["trigger"] else None
+    if raw is None:
+        return "px", None, None, None, False
     if "kind" in raw:
-        return _kind_price(raw["kind"], raw)
+        return _kind_price(raw["kind"], raw, prev=prev)
     op, price = raw.get("op"), raw.get("price")
+    if o["price_type"] == "market":
+        if op not in ("le", "ge") or price is None:
+            return "px", None, None, None, False
     if op not in ("le", "ge") or price is None:
         raise EngineError("trigger JSON 需含 op(le|ge) 与 price")
-    return op, _D(price)
+    return "px", op, _D(price), None, False
 
 
-def _order_rule(o: dict, hist_high: dict[str, Decimal]) -> tuple:
-    """解析单条 order 的触发规则 → (op, trig, drop_pct, ref_high)。
+def _order_rule(o: dict, hist_high: dict[str, Decimal],
+                prev: dict[str, Decimal] | None = None) -> tuple:
+    """解析单条 order 的触发规则 → (mode, op, price, drop_pct, ref_high, pct, not_limit)。
 
-    - 价格类/legacy 走 _trigger_price，drop_pct/ref_high 均为 None；
+    - 价格类/legacy 走 _trigger_price，drop_pct/ref_high/pct 均为 None；
+    - kind=pct_chg 走昨收折算静态价（mode=pct）；kind=vs_cost 走成本动态价（mode=cost）；
     - sell_trail 解析 kind=trail 的 drop_pct，并取 hist_high[symbol]（买入以来至昨日的
-      日线 high 累计最大，取值窗含当日——spec-01 §3.3）作回撤基准初值，op 固定 'trail'。
+      日线 high 累计最大，取值窗含当日——spec-01 §3.3）作回撤基准初值，mode 固定 'trail'
+      （此时 op 为 None，三档判定按 mode 区分）。
     """
     if o["order_type"] != "sell_trail":
-        op, trig = _trigger_price(o)
-        return op, trig, None, None
+        pv = prev.get(o["symbol"]) if prev else None
+        mode, op, trig, pct, not_limit = _trigger_price(o, prev=pv)
+        return mode, op, trig, None, None, pct, not_limit
     raw = json.loads(o["trigger"]) if o["trigger"] else {}
     if raw.get("kind") != "trail":
         raise EngineError("sell_trail 单 trigger 须为 kind=trail")
     drop = _D(raw.get("drop_pct"))
     if drop <= 0:
         raise EngineError("sell_trail 单 drop_pct 须 > 0")
-    return "trail", None, drop, _D(hist_high.get(o["symbol"]))
+    return "trail", None, None, drop, _D(hist_high.get(o["symbol"])), None, False
 
 
 _BOARD_LIMIT_PCT = {"main": "10", "gem": "20", "star": "20", "bj": "30", "st_main": "5"}
@@ -294,6 +323,33 @@ def settle_account(
         if symbol in l2_map:
             return _D(close_map[symbol])
         return _D(series_map[symbol][-1][1])
+
+    def cost_basis(symbol: str) -> Decimal | None:
+        """可卖持仓成本 = Σ(lot.buy_price×remaining)/Σremaining（buy_date<今日，T+1 口径）。
+
+        用作 vs_cost（spec-01 §2.4）的逐点触发基准；仅统计当日可卖 lot，避免当日新买
+        批次污染成本基准。无剩余可卖 lot 时返回 None（该点视为不触达）。
+        """
+        row = c.execute(
+            """
+            SELECT COALESCE(SUM(l.buy_price * l.remaining), 0) AS w,
+                   COALESCE(SUM(l.remaining), 0) AS t
+              FROM lots l JOIN holdings h ON h.id = l.holding_id
+             WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ? AND l.remaining > 0
+            """,
+            (account_id, symbol, trade_date),
+        ).fetchone()
+        t = _D(row["t"])
+        if t <= 0:
+            return None
+        return _D(row["w"]) / t
+
+    def cost_trigger_price(symbol: str, pct: Decimal) -> Decimal | None:
+        """vs_cost 动态折算价；无成本基准 → None。"""
+        base = cost_basis(symbol)
+        if base is None or base <= 0:
+            return None
+        return base * (_D("100") + pct) / _D("100")
     f = {k: Decimal(str(v)) for k, v in (fee or FEES).items()}
     prev = {k: _D(v) for k, v in (prev_close_map or {}).items()}
     hist_high = {k: _D(v) for k, v in (hist_high_map or {}).items()}
@@ -436,7 +492,9 @@ def settle_account(
                     continue
                 oid = o["id"]
                 try:
-                    op, trig, trail_drop, ref_high = _order_rule(o, hist_high)
+                    mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
+                        o, hist_high, prev
+                    )
                 except EngineGapError:
                     raise
                 except (json.JSONDecodeError, EngineError):
@@ -450,15 +508,27 @@ def settle_account(
                     if runtime[oid]["final"] != "active":
                         break
                     p = _D(pv)
-                    if op == "trail":
+                    if mode == "trail":
                         ref_high = max(ref_high, p)
                         if ref_high <= 0 or p > ref_high * (_D("100") - trail_drop) / _D("100"):
                             continue
+                    elif mode == "cost":
+                        X = cost_trigger_price(o["symbol"], pct)
+                        if X is None:
+                            continue                  # 无可卖成本基准：不触达（保持 active）
+                        if (op == "le" and p > X) or (op == "ge" and p < X):
+                            continue
+                        if not_limit and lim is not None:
+                            if p == (lim[1] if op == "le" else lim[0]):
+                                continue              # 触发时刻恰好封板：不触达（§2.4 not_limit）
                     elif trig is not None:
                         if op == "le" and p > trig:
                             continue
                         if op == "ge" and p < trig:
                             continue
+                        if not_limit and lim is not None:
+                            if p == (lim[1] if op == "le" else lim[0]):
+                                continue              # 触发时刻恰好封板：不触达（§2.4 not_limit）
                     if lim is not None and p == (lim[0] if o["order_type"] == "buy" else lim[1]):
                         continue                    # 涨停封死买不成交 / 跌停封死卖不成交（§3.5）
                     if o["order_type"] == "buy":
@@ -557,13 +627,15 @@ def settle_account(
                     continue
                 oid = o["id"]
                 try:
-                    op, trig, trail_drop, ref_high = _order_rule(o, hist_high)
+                    mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
+                        o, hist_high, prev
+                    )
                 except EngineGapError:
                     raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
-                if op != "trail" and trig is None:
+                if mode not in ("trail", "cost") and trig is None:
                     raise EngineGapError(
                         f"order {o['id']} L1 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
@@ -573,7 +645,7 @@ def settle_account(
                 prev_failed = False            # 上一根触达分钟资金/可卖不足（可复判 §2.3）
                 seen_after = False             # 是否已越过 created_at（首根可判分钟不要求“穿越”）
                 for ts, bopen, bhigh, blow, bclose in bars:
-                    if op == "trail":
+                    if mode == "trail":
                         high_px = bhigh if bhigh is not None else bclose
                         if high_px is not None and high_px > ref_high:
                             ref_high = high_px
@@ -585,16 +657,30 @@ def settle_account(
                             X = Decimal("0")
                             touched = False
                     else:
-                        X = trig
-                        touched = False
-                        if op == "le":
-                            touched = bclose <= X or (blow is not None and blow <= X)
+                        if mode == "cost":
+                            X = cost_trigger_price(o["symbol"], pct)
+                            touched = False
+                            if X is not None:
+                                if op == "le":
+                                    touched = bclose <= X or (blow is not None and blow <= X)
+                                else:
+                                    touched = bclose >= X or (bhigh is not None and bhigh >= X)
                         else:
-                            touched = bclose >= X or (bhigh is not None and bhigh >= X)
+                            X = trig
+                            touched = False
+                            if X is not None:
+                                if op == "le":
+                                    touched = bclose <= X or (blow is not None and blow <= X)
+                                else:
+                                    touched = bclose >= X or (bhigh is not None and bhigh >= X)
                     if lim is not None and bhigh is not None and blow is not None:
                         lv = lim[0] if o["order_type"] == "buy" else lim[1]
                         if bhigh == lv and blow == lv:
                             touched = False     # 整分钟封死（一字段）：买/卖不成交，开板分钟恢复（§3.5）
+                    if not_limit and lim is not None and bhigh is not None and blow is not None:
+                        lv = lim[1] if op == "le" else lim[0]
+                        if bhigh == lv and blow == lv:
+                            touched = False     # 整分钟封死方向板：pct_chg 触发要求未封板（§2.4）
                     is_after = not (o["created_at"] and o["created_at"] >= ts)
                     if is_after and touched and (not seen_after or not touched_prev or prev_failed):
                         p = X
@@ -717,13 +803,15 @@ def settle_account(
                     continue
                 oid = o["id"]
                 try:
-                    op, trig, trail_drop, ref_high = _order_rule(o, hist_high)
+                    mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
+                        o, hist_high, prev
+                    )
                 except EngineGapError:
                     raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
-                if op != "trail" and trig is None:
+                if mode not in ("trail", "cost") and trig is None:
                     raise EngineGapError(
                         f"order {o['id']} L2 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
@@ -732,19 +820,28 @@ def settle_account(
                 if o["created_at"] and o["created_at"] >= close_ts:
                     continue                      # 收盘后创建的 order 不参与当日判定（#38）
                 trail_quality = ""
-                if op == "trail":
+                if mode == "trail":
                     # spec-01 §3.3 L2 移动止盈：触达 = 当日 low ≤ 参考高点×(1−drop_pct)，
                     # 参考高点 = max(买入以来日线 high 累计最大, 当日 high)
                     ref_high = max(ref_high, hi)
                     if ref_high <= 0 or lo > ref_high * (_D("100") - trail_drop) / _D("100"):
                         continue
                     trail_quality = "degraded"
-                elif (op == "le" and lo > trig) or (op == "ge" and hi < trig):
-                    continue                      # 未触达：保持 active（today → expired）
+                else:
+                    if mode == "cost":
+                        X = cost_trigger_price(o["symbol"], pct)
+                    else:
+                        X = trig
+                    if X is None or ((op == "le" and lo > X) or (op == "ge" and hi < X)):
+                        continue                  # 未触达：保持 active（today → expired）
                 if lim is not None and hi == lo:
                     lv = lim[0] if o["order_type"] == "buy" else lim[1]
                     if hi == lv:
                         continue                  # 一字封死全天（日线近似口径）：买/卖不成交（§3.5）
+                if not_limit and lim is not None and hi == lo:
+                    lv = lim[1] if op == "le" else lim[0]
+                    if hi == lv:
+                        continue                  # 一字封死方向板：pct_chg 要求未封板（§2.4）
                 p = require_close(symbol)         # L2 恒以官方收盘价成交
                 if o["order_type"] == "buy":
                     amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)

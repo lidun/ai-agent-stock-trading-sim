@@ -119,11 +119,44 @@ def test_trigger_kind_canonical_persisted(authed_client):
 
 
 def test_trigger_unimplemented_kind_rejected(authed_client):
-    """未实现 kind（trail/pct_chg 等）与非法 op 均在 orderstore 前置显式拒单。"""
+    """未实现 kind 与非法 trigger 均在 orderstore 前置显式拒单。"""
     st = authed_client.app.state
     for bad in ({"kind": "trail", "drop_pct": 3},
-                {"kind": "pct_chg", "pct": 2},
+                {"kind": "pct_chg", "pct": 2},            # 缺 op
+                {"kind": "open_board"},
                 {"op": "gt", "price": 10.0}):
         with pytest.raises(orderstore.OrderError):
             orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
                                    qty=100, trigger=bad, price_type="limit")
+
+
+def test_pct_vscost_trigger_canonical_and_rejects(authed_client):
+    """pct_chg/vs_cost 下单规范化落库；op/pct/not_limit 越界在 orderstore 前置拒单。"""
+    import json as _json
+
+    from core.db import state_conn  # noqa: PLC0415
+    st = authed_client.app.state
+    o1 = orderstore.place_order(st, account_id=DEMO, creator=DEMO, order_type="sell_stop",
+                                direction="sell", symbol="600519", qty=100,
+                                trigger={"kind": "pct_chg", "op": "le", "pct": -5,
+                                         "not_limit": True},
+                                price_type="market")
+    o2 = orderstore.place_order(st, account_id=DEMO, creator=DEMO, order_type="sell_take_profit",
+                                direction="sell", symbol="600519", qty=100,
+                                trigger={"kind": "vs_cost", "op": "ge", "pct": 8},
+                                price_type="market")
+    conn = state_conn(st)
+    rows = {r["id"]: r["trigger"] for r in conn.execute(
+        "SELECT id, trigger FROM condition_orders WHERE id IN (?, ?)", (o1["id"], o2["id"]))}
+    assert _json.loads(rows[o1["id"]]) == {"kind": "pct_chg", "op": "le", "pct": -5.0,
+                                           "not_limit": True}
+    assert _json.loads(rows[o2["id"]]) == {"kind": "vs_cost", "op": "ge", "pct": 8.0}
+    for bad in ({"kind": "pct_chg", "op": "gt", "pct": -5},
+                {"kind": "pct_chg", "op": "le"},
+                {"kind": "pct_chg", "op": "le", "pct": 0},
+                {"kind": "pct_chg", "op": "le", "pct": -5, "not_limit": "yes"},
+                {"kind": "vs_cost", "op": "le"},
+                {"kind": "vs_cost", "op": "le", "pct": 0}):
+        with pytest.raises(orderstore.OrderError):
+            orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                   qty=100, trigger=bad, price_type="market")

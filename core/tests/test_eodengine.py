@@ -626,3 +626,159 @@ def test_lock_l2_oneword_down_sell_expires(authed_client):
                   )[0]["status"] == "expired"
     assert _fetch(st, "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'",
                   (DEMO,))[0]["quantity"] == 100
+
+
+def test_eod_pct_l0_not_limit_blocks_pinned_down(authed_client):
+    """pct_chg（昨收 −5%，le）L0：not_limit 在跌停封死采样点不触发，开板后按采样价成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-pctl0", order_type="buy", direction="buy", qty=100,
+                  trigger={"kind": "pct_chg", "op": "le", "pct": -5, "not_limit": True},
+                  created="2026-09-08T09:00:00", price_type="market")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 9.00), ("2026-09-08T09:32:00", 9.20),
+                               ("2026-09-08T09:33:00", 9.20)]},
+        close_map={"600000": 9.20},
+        prev_close_map={"600000": 10.00},
+        board_map={"600000": "main"},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-pctl0'")
+    assert len(tr) == 1 and tr[0]["price"] == 9.2   # 09:31 一字跌停(9.00)跳过；09:32 开板成交
+    assert tr[0]["basis_used"] == "l0"
+
+
+def test_eod_pct_l1_fills_at_converted_price(authed_client):
+    """pct_chg L1：折算触发价 X=昨收×(1+pct%)，按条件价成交（同价格类口径）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-pctl1-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l1_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    _insert_order(st, order_id="co-pctl1", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"kind": "pct_chg", "op": "le", "pct": -5},
+                  created="2026-09-08T09:00:00", price_type="market")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l1_map={"600000": [("2026-09-08T09:31:00", 9.6, 9.6, 9.2, 9.3),
+                           ("2026-09-08T09:32:00", 9.3, 9.4, 9.2, 9.3)]},
+        close_map={"600000": 9.3},
+        prev_close_map={"600000": 10.00},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-pctl1'")
+    assert len(tr) == 1 and tr[0]["basis_used"] == "l1"
+    assert abs(float(tr[0]["price"]) - 9.5) < 1e-9   # 昨收 10 → −5% 折算 X=9.50，按条件价成交
+
+
+def test_eod_pct_l2_range_fill_at_close(authed_client):
+    """pct_chg L2：日线区间触及折算价 → 官方收盘价成交（区间触达近似）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-pctl2-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l2_map={"600000": {"high": 9.6, "low": 9.3}},
+        close_map={"600000": 9.6},
+    )
+    _insert_order(st, order_id="co-pctl2", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"kind": "pct_chg", "op": "le", "pct": -5},
+                  created="2026-09-08T09:00:00", price_type="market")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l2_map={"600000": {"high": 9.6, "low": 9.1}},
+        close_map={"600000": 9.4},
+        prev_close_map={"600000": 10.00},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-pctl2'")
+    assert len(tr) == 1 and tr[0]["basis_used"] == "l2"
+    assert tr[0]["price"] == 9.4   # low 9.1 ≤ 折算 9.5 → 区间触达，官方收盘价成交
+
+
+def test_eod_vscost_l0_dynamic_threshold(authed_client):
+    """vs_cost L0：基准=可卖 lot 买入均价，折算 X=成本×（1+pct%），按采样价成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-vs-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    _insert_order(st, order_id="co-vs", order_type="sell_take_profit", direction="sell", qty=100,
+                  trigger={"kind": "vs_cost", "op": "ge", "pct": 8},
+                  created="2026-09-08T09:00:00", price_type="market")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 10.60), ("2026-09-08T09:32:00", 10.90)]},
+        close_map={"600000": 10.90},
+        prev_close_map={"600000": 10.00},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-vs'")
+    assert len(tr) == 1
+    # 成本 10.00 → X=10.80；09:31 10.60 未达，09:32 10.90 触发按采样价成交
+    assert tr[0]["price"] == 10.9
+    assert _fetch(st, "SELECT COUNT(*) AS n FROM holdings WHERE account_id=? AND symbol='600000'",
+                  (DEMO,))[0]["n"] == 0
+
+
+def test_eod_vscost_l1_basis_uses_sellable_lots(authed_client):
+    """vs_cost L1：多次买入（FIFO 不同买价）后成本基准=可卖 lot 均价，动态折算按条件价成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-vsl1-b1", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    _insert_order(st, order_id="co-vsl1-b2", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 12.05}, created="2026-09-07T09:31:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l1_map={"600000": [("2026-09-07T09:31:00", 10.00), ("2026-09-07T09:32:00", 12.00)]},
+        close_map={"600000": 12.00},
+    )
+    _insert_order(st, order_id="co-vsl1", order_type="sell_take_profit", direction="sell",
+                  qty=100, trigger={"kind": "vs_cost", "op": "ge", "pct": 8},
+                  created="2026-09-08T09:00:00", price_type="market")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l1_map={"600000": [("2026-09-08T09:31:00", 11.4, 11.4, 11.2, 11.3),
+                           ("2026-09-08T09:32:00", 11.3, 12.1, 11.3, 11.8)]},
+        close_map={"600000": 11.8},
+        prev_close_map={"600000": 11.0},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-vsl1'")
+    assert len(tr) == 1 and tr[0]["basis_used"] == "l1"
+    # L1 买价按条件价 10.05/12.05 → 成本 = 11.05 → X = 11.05×1.08 = 11.934；
+    # 09:31 high 11.4 未达；09:32 high 12.1 触发按 X 成交
+    assert abs(float(tr[0]["price"]) - 11.934) < 1e-9
+
+
+def test_eod_vscost_l2_no_basis_skips_and_expires(authed_client):
+    """vs_cost 无成本基准（无当日可卖 lot）→ 各采样点不触达，日终 expired 且零 insufficient。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-vsl2x", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"kind": "vs_cost", "op": "le", "pct": -5},
+                  created="2026-09-08T09:00:00", price_type="market")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l2_map={"600000": {"high": 8.0, "low": 7.0}},
+        close_map={"600000": 7.5},
+    )
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-vsl2x'")
+    row = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-vsl2x'"
+                  )[0]
+    assert row["status"] == "expired" and row["insufficient_events"] == 0
+
+
+def test_eod_pct_missing_prev_close_raises(authed_client):
+    """pct_chg 触发缺少昨收基准 → 显式 gap 整事务拒绝（无半截写入）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-pct-nopc", order_type="buy", direction="buy", qty=100,
+                  trigger={"kind": "pct_chg", "op": "le", "pct": -5},
+                  created="2026-09-08T09:00:00", price_type="market")
+    with pytest.raises(eodengine.EngineError, match="昨收"):
+        eodengine.settle_account(
+            st, DEMO, "2026-09-08",
+            series_map={"600000": [("2026-09-08T09:31:00", 9.0)]},
+            close_map={"600000": 9.0},
+        )
+    assert not _fetch(st, "SELECT * FROM trades")
