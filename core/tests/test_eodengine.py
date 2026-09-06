@@ -393,17 +393,122 @@ def test_eod_kind_trigger_price_le_fills_like_legacy(authed_client):
     assert tr["side"] == "buy" and tr["qty"] == 100 and tr["price"] == 10.0
 
 
-def test_eod_kind_trail_trigger_gap_no_write(authed_client):
-    """未实现 kind（trail）命中即 EngineGapError，整事务回滚、零落账（spec-01 §2.4 其余拒绝）。"""
+def test_eod_trail_no_holding_ins_then_expired(authed_client):
+    """sell_trail 无持仓/无历史基准 → ins 事件、保持 active 至日终 expired、零成交。"""
     st = authed_client.app.state
     _insert_order(st, order_id="co-tr", order_type="sell_trail", direction="sell", qty=100,
                   trigger={"kind": "trail", "drop_pct": 3}, created="2026-09-07T09:00:00")
-    with pytest.raises(eodengine.EngineGapError):
-        eodengine.settle_account(
-            st, DEMO, "2026-09-07",
-            series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
-            close_map={"600000": 10.00},
-        )
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00), ("2026-09-07T09:32:00", 10.50)]},
+        close_map={"600000": 10.00},
+    )
+    assert r["already_settled"] is False
     assert _cash(st) == 100000.0
-    assert not _fetch(st, "SELECT * FROM settlement_log WHERE account_id=?", (DEMO,))
-    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-tr'")[0]["status"] == "active"
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-tr'")
+    o = _fetch(st, "SELECT status FROM condition_orders WHERE id='co-tr'")[0]
+    assert o["status"] == "expired"
+
+
+def test_eod_trail_l0_drop_fills_at_sample(authed_client):
+    """移动止盈 L0（spec-01 §4.1 ✅）：回撤基准=hist_high 与采样累计最大，跌破 drop 线成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-tr-l0-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.90},
+    )
+    _insert_order(st, order_id="co-tr-l0", order_type="sell_trail", direction="sell", qty=100,
+                  trigger={"kind": "trail", "drop_pct": 10}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 12.00), ("2026-09-08T09:32:00", 11.50),
+                               ("2026-09-08T09:33:00", 10.90), ("2026-09-08T09:34:00", 10.70)]},
+        close_map={"600000": 10.70},
+        prev_close_map={"600000": 10.90},
+        hist_high_map={"600000": 12.0},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-tr-l0'")[0]
+    assert tr["side"] == "sell" and tr["qty"] == 100 and tr["price"] == 10.7
+    # hist_high=12 → 回撤线 12×0.9=10.8；09:33 价 10.9 未破线，09:34 价 10.7 跌破成交
+    assert _fetch(st, "SELECT COUNT(*) AS n FROM holdings WHERE account_id=? AND symbol='600000'",
+                  (DEMO,))[0]["n"] == 0
+
+
+def test_eod_trail_l1_degraded_drop_fill(authed_client):
+    """移动止盈 L1 退化（spec-01 §4.1 ⚠️）：分钟 high 累计最大为基准，跌破按线价成交并标 degraded。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-tr-l1-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l1_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.90},
+    )
+    _insert_order(st, order_id="co-tr-l1", order_type="sell_trail", direction="sell", qty=100,
+                  trigger={"kind": "trail", "drop_pct": 5}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l1_map={"600000": [("2026-09-08T09:31:00", 10.8, 12.5, 12.0, 12.0),
+                           ("2026-09-08T09:32:00", 12.5, 13.0, 11.5, 11.7)]},
+        close_map={"600000": 11.7},
+        prev_close_map={"600000": 10.90},
+        hist_high_map={"600000": 12.0},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-tr-l1'")[0]
+    assert tr["side"] == "sell" and tr["qty"] == 100 and tr["quality"] == "degraded"
+    # 09:31 high 12.5 抬高基准 → 线 12.5×0.95=11.875（low 12.0 未破）；
+    # 09:32 high 13.0 再抬高基准 → 线 13×0.95=12.35，low 11.5 跌破，按线价成交
+    assert abs(float(tr["price"]) - 12.35) < 1e-9
+
+
+def test_eod_trail_l2_degraded_single_point(authed_client):
+    """移动止盈 L2 退化（spec-01 §3.3 写死口径）：H=max(买入以来日线 high, 当日 high)，
+    当日 low ≤ H×(1−drop) 即触达，以官方收盘价成交并标 degraded。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-tr-l2-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 9.5}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l2_map={"600000": {"high": 9.8, "low": 9.2}},
+        close_map={"600000": 9.8},
+    )
+    _insert_order(st, order_id="co-tr-l2", order_type="sell_trail", direction="sell", qty=100,
+                  trigger={"kind": "trail", "drop_pct": 10}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l2_map={"600000": {"high": 12.6, "low": 11.0}},
+        close_map={"600000": 11.2},
+        prev_close_map={"600000": 9.8},
+        hist_high_map={"600000": 13.0},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-tr-l2'")[0]
+    assert tr["side"] == "sell" and tr["qty"] == 100 and tr["price"] == 11.2
+    assert tr["quality"] == "degraded" and tr["basis_used"] == "l2"
+    assert tr["trade_time"] == "2026-09-08T15:00:00"
+
+
+def test_eod_trail_l2_no_trigger_expired(authed_client):
+    """L2 trail 未跌破回撤线 → 保持 active 至日终 expired，零成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-tr-l2x-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 9.5}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l2_map={"600000": {"high": 9.8, "low": 9.2}},
+        close_map={"600000": 9.8},
+    )
+    _insert_order(st, order_id="co-tr-l2x", order_type="sell_trail", direction="sell", qty=100,
+                  trigger={"kind": "trail", "drop_pct": 10}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l2_map={"600000": {"high": 11.0, "low": 10.9}},
+        close_map={"600000": 10.9},
+        prev_close_map={"600000": 9.8},
+        hist_high_map={"600000": 10.0},
+    )
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-tr-l2x'")
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-tr-l2x'"
+                  )[0]["status"] == "expired"

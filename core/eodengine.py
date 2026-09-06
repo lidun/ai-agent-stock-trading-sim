@@ -2,9 +2,13 @@
 
 范围与边界（本版明确支持；其余拒绝而非静默跳过——宁可报 gap，不可错结）：
 - 账户：granularity=eod_replay 的策略账户；单日结算；settle_key UNIQUE 幂等（§3.1.5/§3.8 单事务）；
-- 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop}、
-  price_type ∈ {market, limit}、单票价格触发（trigger 统一 spec-01 §2.4 kind 语义，
-  canonical {"kind":"price_le"|"price_ge","price":X}；legacy {"op","price"} 兼容读取）；
+- 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop,
+  sell_trail}、price_type ∈ {market, limit}、单票价格触发（trigger 统一 spec-01 §2.4 kind
+  语义，canonical {"kind":"price_le"|"price_ge","price":X}；legacy {"op","price"} 兼容读取）；
+- 移动止盈（sell_trail，spec-01 §3.3/§4.1）：trigger {"kind":"trail","drop_pct":N}，
+  回撤基准=持仓期最高价（hist_high_map 提供买入以来至昨日的日线 high 累计最大，取值窗含
+  当日）——L0 用当日采样价累计最大、L1 用分钟 high/close 累计最大（退化 quality=degraded）、
+  L2 用 max(hist, 当日 high) 单点判定（退化 degraded），成交沿用各档价口径；
 - 档位：L0（series_map 采样点序列，触达采样点价成交）、L1（l1_map 分钟序列，spec-01 §3.3——
   相邻分钟确认触达、按条件价 X 成交、15:00 收盘分钟按保守口径 max/min(X, 官方收盘价) 并标
   close_minute_fill）与 L2（l2_map 当日 high/low 区间触达 + 官方收盘价成交，spec-01 §3.3，
@@ -21,7 +25,7 @@
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
 未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板类、
-trail 移动止盈、signal_registry/exit_trackings、涨跌停/ST/板块、公司行动。
+pct_chg/vs_cost/volume 组合类、signal_registry/exit_trackings、涨跌停/ST/板块、公司行动。
 """
 from __future__ import annotations
 
@@ -35,7 +39,7 @@ from core.db import state_conn, write_txn
 
 log = logging.getLogger(__name__)
 
-SUPPORTED_ORDER_TYPES = {"buy", "sell_take_profit", "sell_stop"}
+SUPPORTED_ORDER_TYPES = {"buy", "sell_take_profit", "sell_stop", "sell_trail"}
 
 _MONEY = Decimal("0.01")
 _COST = Decimal("0.0001")
@@ -123,6 +127,25 @@ def _trigger_price(o: dict):
     return op, _D(price)
 
 
+def _order_rule(o: dict, hist_high: dict[str, Decimal]) -> tuple:
+    """解析单条 order 的触发规则 → (op, trig, drop_pct, ref_high)。
+
+    - 价格类/legacy 走 _trigger_price，drop_pct/ref_high 均为 None；
+    - sell_trail 解析 kind=trail 的 drop_pct，并取 hist_high[symbol]（买入以来至昨日的
+      日线 high 累计最大，取值窗含当日——spec-01 §3.3）作回撤基准初值，op 固定 'trail'。
+    """
+    if o["order_type"] != "sell_trail":
+        op, trig = _trigger_price(o)
+        return op, trig, None, None
+    raw = json.loads(o["trigger"]) if o["trigger"] else {}
+    if raw.get("kind") != "trail":
+        raise EngineError("sell_trail 单 trigger 须为 kind=trail")
+    drop = _D(raw.get("drop_pct"))
+    if drop <= 0:
+        raise EngineError("sell_trail 单 drop_pct 须 > 0")
+    return "trail", None, drop, _D(hist_high.get(o["symbol"]))
+
+
 def _qty_ok(symbol: str, qty: int) -> bool:
     """申报数量规则委托 orderstore（单一事实源，spec-01 §3.7 D6）。"""
     from core.orderstore import qty_rule_ok  # noqa: PLC0415
@@ -201,6 +224,7 @@ def settle_account(
     l2_map: dict[str, dict] | None = None,
     close_map: dict[str, float],
     prev_close_map: dict[str, float] | None = None,
+    hist_high_map: dict[str, float] | None = None,
     fee: dict | None = None,
 ) -> dict:
     """对单个账户执行一日 EOD 结算（单 SQLite 事务原子写入）。
@@ -211,6 +235,8 @@ def settle_account(
     l2_map[symbol] = {"high": float, "low": float}（当日日线区间，spec-01 §3.3 L2：
     区间触达 + 官方收盘价成交，供历史日/分钟不可得票）。同一 symbol 在三个 map 中至多出现其一。
     close_map[symbol] = 当日官方收盘价；prev_close_map[symbol] = 前一日官方收盘价。
+    hist_high_map[symbol] = 该票买入以来至前一交易日的日线 high 累计最大（spec-01 §3.3
+    移动止盈回撤基准取值窗含买入当日；缺省该票 trail 以当日窗口起判）。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -236,6 +262,7 @@ def settle_account(
         return _D(series_map[symbol][-1][1])
     f = {k: Decimal(str(v)) for k, v in (fee or FEES).items()}
     prev = {k: _D(v) for k, v in (prev_close_map or {}).items()}
+    hist_high = {k: _D(v) for k, v in (hist_high_map or {}).items()}
     conn = state_conn(state)
     now = _now()
     settle_key = f"{trade_date}:{account_id}"
@@ -362,7 +389,7 @@ def settle_account(
                     continue
                 oid = o["id"]
                 try:
-                    op, trig = _trigger_price(o)
+                    op, trig, trail_drop, ref_high = _order_rule(o, hist_high)
                 except EngineGapError:
                     raise
                 except (json.JSONDecodeError, EngineError):
@@ -375,7 +402,11 @@ def settle_account(
                     if runtime[oid]["final"] != "active":
                         break
                     p = _D(pv)
-                    if trig is not None:
+                    if op == "trail":
+                        ref_high = max(ref_high, p)
+                        if ref_high <= 0 or p > ref_high * (_D("100") - trail_drop) / _D("100"):
+                            continue
+                    elif trig is not None:
                         if op == "le" and p > trig:
                             continue
                         if op == "ge" and p < trig:
@@ -476,13 +507,13 @@ def settle_account(
                     continue
                 oid = o["id"]
                 try:
-                    op, trig = _trigger_price(o)
+                    op, trig, trail_drop, ref_high = _order_rule(o, hist_high)
                 except EngineGapError:
                     raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
-                if trig is None:
+                if op != "trail" and trig is None:
                     raise EngineGapError(
                         f"order {o['id']} L1 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
@@ -491,16 +522,30 @@ def settle_account(
                 prev_failed = False            # 上一根触达分钟资金/可卖不足（可复判 §2.3）
                 seen_after = False             # 是否已越过 created_at（首根可判分钟不要求“穿越”）
                 for ts, bopen, bhigh, blow, bclose in bars:
-                    X = trig
-                    touched = False
-                    if op == "le":
-                        touched = bclose <= X or (blow is not None and blow <= X)
+                    if op == "trail":
+                        high_px = bhigh if bhigh is not None else bclose
+                        if high_px is not None and high_px > ref_high:
+                            ref_high = high_px
+                        if ref_high > 0:
+                            X = ref_high * (_D("100") - trail_drop) / _D("100")
+                            probe = blow if blow is not None else bclose
+                            touched = probe is not None and probe <= X
+                        else:
+                            X = Decimal("0")
+                            touched = False
                     else:
-                        touched = bclose >= X or (bhigh is not None and bhigh >= X)
+                        X = trig
+                        touched = False
+                        if op == "le":
+                            touched = bclose <= X or (blow is not None and blow <= X)
+                        else:
+                            touched = bclose >= X or (bhigh is not None and bhigh >= X)
                     is_after = not (o["created_at"] and o["created_at"] >= ts)
                     if is_after and touched and (not seen_after or not touched_prev or prev_failed):
                         p = X
                         quality = ""
+                        if o["order_type"] == "sell_trail":
+                            quality = "degraded"
                         if ts.endswith("T15:00:00"):
                             cl = require_close(symbol)
                             if o["order_type"] == "buy":
@@ -617,20 +662,28 @@ def settle_account(
                     continue
                 oid = o["id"]
                 try:
-                    op, trig = _trigger_price(o)
+                    op, trig, trail_drop, ref_high = _order_rule(o, hist_high)
                 except EngineGapError:
                     raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
-                if trig is None:
+                if op != "trail" and trig is None:
                     raise EngineGapError(
                         f"order {o['id']} L2 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
                 qty = int(Decimal(str(o["qty"])))
                 if o["created_at"] and o["created_at"] >= close_ts:
                     continue                      # 收盘后创建的 order 不参与当日判定（#38）
-                if (op == "le" and lo > trig) or (op == "ge" and hi < trig):
+                trail_quality = ""
+                if op == "trail":
+                    # spec-01 §3.3 L2 移动止盈：触达 = 当日 low ≤ 参考高点×(1−drop_pct)，
+                    # 参考高点 = max(买入以来日线 high 累计最大, 当日 high)
+                    ref_high = max(ref_high, hi)
+                    if ref_high <= 0 or lo > ref_high * (_D("100") - trail_drop) / _D("100"):
+                        continue
+                    trail_quality = "degraded"
+                elif (op == "le" and lo > trig) or (op == "ge" and hi < trig):
                     continue                      # 未触达：保持 active（today → expired）
                 p = require_close(symbol)         # L2 恒以官方收盘价成交
                 if o["order_type"] == "buy":
@@ -640,7 +693,7 @@ def settle_account(
                         runtime[oid]["ins"] += 1
                         continue                  # 收盘无现金 → 记 insufficient，不再有采样点
                     cash -= amount + fz["total"]
-                    tid = write_trade(o, "buy", qty, p, close_ts, fz)
+                    tid = write_trade(o, "buy", qty, p, close_ts, fz, quality=trail_quality)
                     hid = holding(o["symbol"], Decimal(qty), cost_basis=None)
                     amt_with_fee = amount + fz["total"]
                     cur = c.execute(
@@ -680,7 +733,7 @@ def settle_account(
                     amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                     fz = _fees(amount, side="sell", fee=f)
                     cash += amount - fz["total"]
-                    tid = write_trade(o, "sell", qty, p, close_ts, fz)
+                    tid = write_trade(o, "sell", qty, p, close_ts, fz, quality=trail_quality)
                     rem = qty
                     lots = c.execute(
                         """

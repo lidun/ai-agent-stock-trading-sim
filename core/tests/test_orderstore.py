@@ -55,6 +55,33 @@ def test_place_order_limit_requires_trigger(authed_client):
     assert order["status"] == "active"
 
 
+def test_trail_order_place_and_canonical(authed_client):
+    """sell_trail（kind=trail）可下单并规范落库；越界组合在 orderstore 前置拒单。"""
+    import json as _json
+
+    from core.db import state_conn  # noqa: PLC0415
+    st = authed_client.app.state
+    o = orderstore.place_order(st, account_id=DEMO, creator=DEMO, order_type="sell_trail",
+                               direction="sell", symbol="600519", qty=100,
+                               trigger={"kind": "trail", "drop_pct": 3}, price_type="market")
+    assert o["status"] == "active" and o["order_type"] == "sell_trail"
+    trig = _json.loads(state_conn(st).execute(
+        "SELECT trigger FROM condition_orders WHERE id=?", (o["id"],)).fetchone()["trigger"])
+    assert trig == {"kind": "trail", "drop_pct": 3.0}
+    # 组合越界：trail 仅限 sell_trail + market；drop_pct 须 > 0
+    for kwargs in ({"order_type": "buy", "direction": "buy",
+                    "trigger": {"kind": "trail", "drop_pct": 3}},
+                   {"order_type": "sell_trail", "direction": "sell", "price_type": "limit",
+                    "trigger": {"kind": "trail", "drop_pct": 3}},
+                   {"order_type": "sell_trail", "direction": "sell",
+                    "trigger": {"kind": "trail"}},
+                   {"order_type": "sell_trail", "direction": "sell",
+                    "trigger": {"kind": "trail", "drop_pct": 0}}):
+        with pytest.raises(orderstore.OrderError):
+            orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                   qty=100, **kwargs)
+
+
 def test_demo_order_via_chat_e2e(authed_client):
     """策略子 Agent 会话消息含「演示下单」→ 登记市价买入单并在回复中回执。"""
     from test_conv import _send, _wait_reply  # noqa: PLC0415

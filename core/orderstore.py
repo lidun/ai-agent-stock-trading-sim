@@ -48,18 +48,29 @@ def qty_rule_ok(symbol: str, qty: int) -> bool:
 
 
 _PRICE_KIND_OP = {"price_le": "le", "price_ge": "ge"}
-_UNIMPL_KINDS = {"trail", "pct_chg", "vs_cost", "open_board", "seal_confirm",
+_UNIMPL_KINDS = {"pct_chg", "vs_cost", "open_board", "seal_confirm",
                  "volume", "time", "and", "or"}
 
 
-def _canon_trigger(trig: dict) -> dict:
+def _canon_trigger(trig: dict, *, order_type: str) -> dict:
     """规范化 trigger → spec-01 §2.4 kind 语义（新单落库统一 canonical）。
 
-    kind 价格类（price_le/price_ge）原样返回；legacy {"op":"le"|"ge","price"} 等价映射；
-    其余 kind 属未实现语义 → 显式 OrderError 拒单（不静默放行）。
+    - price_le/price_ge 原样返回；legacy {"op":"le"|"ge","price"} 等价映射；
+    - kind=trail（移动止盈）仅允许 sell_trail 且 drop_pct>0；
+    - 其余 kind 属未实现语义 → 显式 OrderError 拒单（不静默放行）。
     """
     kind = trig.get("kind")
     if kind is not None:
+        if kind == "trail":
+            if order_type != "sell_trail":
+                raise OrderError("kind=trail 仅适用于 sell_trail 移动止盈单")
+            try:
+                drop = float(trig.get("drop_pct"))
+            except (TypeError, ValueError):
+                raise OrderError("kind=trail 需 drop_pct 数值") from None
+            if not drop > 0:
+                raise OrderError("kind=trail 的 drop_pct 须 > 0")
+            return {"kind": "trail", "drop_pct": drop}
         if kind in _UNIMPL_KINDS:
             raise OrderError(f"trigger kind={kind} 引擎尚未实现——拒绝下单")
         if kind not in _PRICE_KIND_OP or trig.get("price") is None:
@@ -84,7 +95,9 @@ def validate_order_payload(*, symbol: str, order_type: str, direction: str,
     trig: dict | None = None
     if trigger:
         trig = trigger if isinstance(trigger, dict) else json.loads(trigger)
-        trig = _canon_trigger(trig)
+        trig = _canon_trigger(trig, order_type=order_type)
+    if trig is not None and trig.get("kind") == "trail" and price_type != "market":
+        raise OrderError("trail 移动止盈单须 price_type=market")
     if price_type == "limit" and trig is None:
         raise OrderError("limit 单必须携带 trigger")
     if qty is None or int(qty) <= 0:
