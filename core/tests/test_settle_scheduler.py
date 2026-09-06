@@ -169,3 +169,34 @@ def test_trigger_advances_exit_tracking_on_pure_exit_day(authed_client):
     assert state_conn(st).execute(
         "SELECT sessions_done FROM exit_trackings WHERE account_id=?", (DEMO,)
     ).fetchone()["sessions_done"] == 1
+
+
+def test_catchup_fast_forwards_missed_trading_days(authed_client):
+    """spec-04 §2.6 启动快进回放：按交易日顺序补齐在途跟踪 + 结算，幂等可重复。"""
+    st = authed_client.app.state
+    _tracking_row(st, day="2026-09-02", px=11.0, bench=3000.0)
+    trigger = settle_scheduler.EodSettleTrigger(st, feed=DayRowsFeed())
+    out = trigger.catchup_missed(now=datetime.fromisoformat("2026-09-05T08:00:00"))
+    # 日历轴来自 600000 日线；“今天”(09-05) 不在列，避免用不完整档提前结算
+    assert out["trading_dates"] == ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+    assert len(out["dates"]) == 4 and not out["errors"]
+    # 卖出跟踪跨两个缺失会话日推进（09-03、09-04 各 1 次）
+    row = state_conn(st).execute(
+        "SELECT * FROM exit_trackings WHERE account_id=?", (DEMO,)
+    ).fetchone()
+    assert row["status"] == "tracking"
+    assert row["sessions_done"] == 2 and row["last_seen"] == "2026-09-04"
+    assert _settled_count(st) == 0                      # 无当日订单/持仓 → 纯推进，零记账
+    # 无缺口 → 补跑审计留痕
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='trade.eod_catchup_auto'"
+    ).fetchone()[0] == 1
+    # 幂等：新实例再次回放 → 同日推进 no-op，不重复记账
+    again = settle_scheduler.EodSettleTrigger(st, feed=DayRowsFeed())
+    out2 = again.catchup_missed(now=datetime.fromisoformat("2026-09-05T08:05:00"))
+    assert len(out2["dates"]) == 4 and not out2["errors"]
+    assert sum(d["exits"].get("updated", 0) for d in out2["dates"]) == 0
+    assert _settled_count(st) == 0
+    assert state_conn(st).execute(
+        "SELECT sessions_done FROM exit_trackings WHERE account_id=?", (DEMO,)
+    ).fetchone()["sessions_done"] == 2

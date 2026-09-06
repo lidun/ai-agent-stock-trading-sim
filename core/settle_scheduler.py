@@ -187,6 +187,52 @@ class EodSettleTrigger:
         return {"date": dstr, "status": "retry_gap", "errors": errors,
                 "accounts": accounts_r, "exits": exits}
 
+    def catchup_missed(self, *, now: datetime | None = None,
+                       start: date | None = None,
+                       lookback_days: int = 40,
+                       account_ids: list[str] | None = None) -> dict:
+        """spec-04 §2.4/§2.6 快进回放：启动时按交易日顺序补齐确定性引擎工作。
+
+        以 600000 日线轴为交易日本身（历史完整含收盘），范围 [start, today) 逐日推进：
+        先跑在途卖出跟踪（settle_exits），再结算当日各账户工作（settle_day.run_day）。
+        “今天”不在此列——当天会话由 settle_once 的实时探测/窗口处理，避免用不完整分钟档
+        提前结算。settle_key 与 exit 行内 last_seen 双重幂等，重复执行零重复（补跑留痕）。
+        """
+        now = now or bjt_now()
+        until = now.date()
+        start = start or (until - timedelta(days=lookback_days))
+        base = {"start": start.isoformat(), "until": until.isoformat()}
+        if until <= start:
+            return {**base, "trading_dates": [], "dates": []}
+        try:
+            rows = self.feed.day_rows("600000", start.isoformat(), until.isoformat())
+        except Exception:  # noqa: BLE001
+            log.exception("快进回放取交易日轴失败（跳过本轮）")
+            return {**base, "trading_dates": [], "dates": []}
+        trading = sorted({str(r.get("date")) for r in rows
+                          if start.isoformat() <= str(r.get("date")) < until.isoformat()})
+        if not trading:
+            return {**base, "trading_dates": [], "dates": []}
+        dates: list[dict] = []
+        errs: list[dict] = []
+        for d in trading:
+            exits = {}
+            if self._tracking_state(d)[0]:
+                exits = self._advance_exits(d)
+            report = settle_day.run_day(self.state, d, feed=self.feed,
+                                        account_ids=account_ids)
+            accts = report.get("accounts", [])
+            acct_errs = [a for a in accts if a.get("error")]
+            dates.append({"date": d, "exits": exits, "error": bool(acct_errs),
+                          "accounts": accts})
+            if acct_errs:
+                errs.append({"date": d, "errors": acct_errs})
+            self._done_dates.add(d)
+        self._audit("trade.eod_catchup_auto", "ok" if not errs else "partial",
+                    f"快进回放 {len(trading)} 个会话日（{trading[0]}..{trading[-1]}），"
+                    f"缺口会话 {len(errs)} 个")
+        return {**base, "trading_dates": trading, "dates": dates, "errors": errs}
+
     async def run_forever(self, tick_s: int) -> None:
         """每分钟 tick 循环（core 常驻内唯一结算触发点；操作全幂等）。"""
         while True:

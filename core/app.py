@@ -109,6 +109,11 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
 
         @app.on_event("startup")
         async def _start_eod_settle():
+            # spec-04 §2.6 启动第 4 步：进入 tick 前先快进补齐缺失交易日（幂等补跑）
+            try:
+                await asyncio.to_thread(trigger.catchup_missed)
+            except Exception:  # noqa: BLE001
+                log.exception("EOD 快进回放启动失败（继续进入 tick 循环）")
             app.state.settle_task = asyncio.create_task(
                 trigger.run_forever(settings.eod_settle_tick_s)
             )

@@ -369,6 +369,8 @@ def settle_exits(
                 continue                     # 本日个股与基准双缺：不推进、不虚构价
             if r["last_seen"] == trade_date:
                 continue                     # 同日重复调用幂等，不重复推进
+            if r["last_seen"] and r["last_seen"] > trade_date:
+                continue                     # 已推进到更晚日期：不回放更旧日期（单调计数）
             sess = int(r["sessions_done"]) + 1
             c.execute(
                 "UPDATE exit_trackings SET sessions_done=?, last_seen=? WHERE id=?",
