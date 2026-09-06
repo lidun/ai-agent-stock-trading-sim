@@ -782,3 +782,71 @@ def test_eod_pct_missing_prev_close_raises(authed_client):
             close_map={"600000": 9.0},
         )
     assert not _fetch(st, "SELECT * FROM trades")
+
+
+def test_eod_restricted_st_ipo_buy_blocked_default(authed_client):
+    """restrict_map 命中且账户未豁免 → 买入单开盘前 invalid（restricted_buy），普通票照常成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-rst", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, symbol="600000",
+                  created="2026-09-08T09:00:00")
+    _insert_order(st, order_id="co-rst2", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, symbol="600001",
+                  created="2026-09-08T09:00:00")
+    _insert_order(st, order_id="co-rfree", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, symbol="600002")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 10.00)],
+                    "600001": [("2026-09-08T09:31:00", 10.00)],
+                    "600002": [("2026-09-08T09:31:00", 10.00)]},
+        close_map={"600000": 10.0, "600001": 10.0, "600002": 10.0},
+        restrict_map={"600000": "st", "600001": "ipo, st"},
+    )
+    a = _fetch(st, "SELECT status, invalid_reason FROM condition_orders WHERE id='co-rst'")[0]
+    assert a["status"] == "invalid" and a["invalid_reason"] == "restricted_buy:st"
+    b = _fetch(st, "SELECT status, invalid_reason FROM condition_orders WHERE id='co-rst2'")[0]
+    assert b["status"] == "invalid" and b["invalid_reason"] == "restricted_buy:ipo,st"
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id IN ('co-rst','co-rst2')")
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-rfree'")
+
+
+def test_eod_restricted_buy_exempt_account(authed_client):
+    """accounts.buy_exempt=['st'] → ST 买入豁免成交（IPO 未豁免仍拦）。"""
+    st = authed_client.app.state
+    conn = state_conn(st)
+    with write_txn(conn) as c:
+        c.execute("UPDATE accounts SET buy_exempt=? WHERE id=?", ('["st"]', DEMO))
+    _insert_order(st, order_id="co-xst", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, symbol="600000")
+    _insert_order(st, order_id="co-xipo", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, symbol="600001",
+                  created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 10.00)],
+                    "600001": [("2026-09-08T09:31:00", 10.00)]},
+        close_map={"600000": 10.0, "600001": 10.0},
+        restrict_map={"600000": "st", "600001": "ipo"},
+    )
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-xst'")
+    b = _fetch(st, "SELECT status, invalid_reason FROM condition_orders WHERE id='co-xipo'")[0]
+    assert b["status"] == "invalid" and b["invalid_reason"] == "restricted_buy:ipo"
+
+
+def test_eod_restricted_sell_not_intercepted(authed_client):
+    """拦截仅作用于买入；卖出类（含已持仓 ST 减仓）不受 restrict_map 影响。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-rsell", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"op": "le", "price": 9.5}, symbol="600000",
+                  created="2026-09-08T09:30:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 9.40)]},
+        close_map={"600000": 9.40},
+        restrict_map={"600000": "st"},
+    )
+    row = _fetch(st, "SELECT status, invalid_reason, insufficient_events "
+                     "FROM condition_orders WHERE id='co-rsell'")[0]
+    assert row["invalid_reason"] == ""
+    assert row["status"] in ("active", "expired")  # 缺持仓 → insufficient 而非 restricted 拦截

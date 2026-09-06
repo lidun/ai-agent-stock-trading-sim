@@ -10,6 +10,10 @@
 - 涨跌停封死例外（spec-01 §3.5/§3.6，可选启用）：board_map 显式提供板块且 prev_close_map
   含该票时启用——涨跌停价按板块系数与 §0 四舍五入实时计算；涨停封死段买入不成交、跌停封死段
   卖出不成交，盘中开板后恢复；L1/L2 仅整分钟/一字板封死才阻断（无日内粒度的近似口径）；
+- ST/新股买入拦截（spec-01 §3.6）：restrict_map[symbol] 提供当日风险标记（st/ipo，逗号或空格
+  分隔可多标）且 accounts.buy_exempt（JSON token 数组，需审批，默认 []）不含对应 token → 买入单
+  开盘前置 invalid（invalid_reason=`restricted_buy:st[,ipo]`，进日报）；卖出类单不受拦截
+  （已持仓遇 ST 不自动卖 §3.6）。板块细判（创业板/科创板 ST 仍 ±20）由调用方合成 st+board 信息。
 - 移动止盈（sell_trail，spec-01 §3.3/§4.1）：trigger {"kind":"trail","drop_pct":N}，
   回撤基准=持仓期最高价（hist_high_map 提供买入以来至昨日的日线 high 累计最大，取值窗含
   当日）——L0 用当日采样价累计最大、L1 用分钟 high/close 累计最大（退化 quality=degraded）、
@@ -30,8 +34,7 @@
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
 未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板事件类、
-volume 量能类、signal_registry/exit_trackings、ST/新股买入拦截（账户豁免配置待接入）、
-公司行动。
+volume 量能类、signal_registry/exit_trackings、公司行动。
 """
 from __future__ import annotations
 
@@ -286,6 +289,7 @@ def settle_account(
     prev_close_map: dict[str, float] | None = None,
     hist_high_map: dict[str, float] | None = None,
     board_map: dict[str, str] | None = None,
+    restrict_map: dict[str, str] | None = None,
     fee: dict | None = None,
 ) -> dict:
     """对单个账户执行一日 EOD 结算（单 SQLite 事务原子写入）。
@@ -300,6 +304,9 @@ def settle_account(
     移动止盈回撤基准取值窗含买入当日；缺省该票 trail 以当日窗口起判）。
     board_map[symbol] = 板块（main|gem|star|bj|st_main，spec-01 §3.6 判定表）；仅当
     board_map 显式给出且 prev_close_map 含该票时启用涨跌停封死例外（§3.5），否则不设涨停限制。
+    restrict_map[symbol] = 当日风险标记（st=风险警示 ST、ipo=注册制新股上市 5 日内；逗号或空格
+    分隔可多标）。命中且账户 accounts.buy_exempt（JSON token 数组，需审批）未豁免 → 买入单开盘前
+    invalid（restricted_buy），见模块 doc。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -381,6 +388,18 @@ def settle_account(
             raise EngineError("份额须 > 0")
         version_no = acct["active_version_no"] or ""
 
+        raw_exempt = acct["buy_exempt"] if "buy_exempt" in acct.keys() else "[]"
+        try:
+            buy_exempt = {str(t) for t in json.loads(raw_exempt or "[]")}
+        except ValueError as exc:
+            raise EngineError("账户 buy_exempt 配置非法（须 JSON token 数组）") from exc
+        restrict_syms: dict[str, set[str]] = {}
+        for sym, tok in (restrict_map or {}).items():
+            toks = {t.strip().lower() for t in str(tok or "").split(",")}
+            keep = {t for t in toks if t in ("st", "ipo")}
+            if keep:
+                restrict_syms[sym] = keep
+
         if c.execute(
             "SELECT 1 FROM settlement_log WHERE settle_key=?", (settle_key,)
         ).fetchone():
@@ -419,6 +438,15 @@ def settle_account(
                 if not _qty_ok(o["symbol"], qty):
                     o["status"] = "invalid"
                     o["invalid_reason"] = "qty_rule"
+
+        # 开盘前静态校验：ST/新股买入拦截 → invalid（restricted_buy，§3.6）
+        for o in active:
+            if o["order_type"] != "buy":
+                continue
+            toks = restrict_syms.get(o["symbol"], set()) - buy_exempt
+            if toks:
+                o["status"] = "invalid"
+                o["invalid_reason"] = "restricted_buy:" + ",".join(sorted(toks))
 
         granularity_used: dict[str, str] = {}
 

@@ -367,6 +367,14 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE accounts_v6 RENAME TO accounts;
         """,
     ),
+    (
+        7,
+        """
+        -- #spec-01 §3.6 新股/ST 买入拦截（引擎切片）：账户级豁免（JSON token 数组，需审批）
+        -- token ∈ {"st","ipo"}；默认 [] = 全拦。引擎 settle 时按 restrict_map × 本列判定。
+        ALTER TABLE accounts ADD COLUMN buy_exempt TEXT NOT NULL DEFAULT '[]';
+        """,
+    ),
 ]
 
 
