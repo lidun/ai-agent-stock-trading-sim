@@ -512,3 +512,117 @@ def test_eod_trail_l2_no_trigger_expired(authed_client):
     assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-tr-l2x'")
     assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-tr-l2x'"
                   )[0]["status"] == "expired"
+
+
+def test_lock_limit_px_boards():
+    """涨跌停价按 spec-01 §3.6 板块系数与 §0 四舍五入（L0/L1/L2 封死判定的价口径）。"""
+    d = eodengine._limit_px
+    D = eodengine._D
+    assert d(D("10.00"), "main") == (D("11.00"), D("9.00"))
+    assert d(D("10.00"), "gem") == (D("12.00"), D("8.00"))
+    assert d(D("10.00"), "star") == (D("12.00"), D("8.00"))
+    assert d(D("10.00"), "bj") == (D("13.00"), D("7.00"))
+    assert d(D("10.00"), "st_main") == (D("10.50"), D("9.50"))
+    assert d(D("10.00"), "unknown") == (D("11.00"), D("9.00"))   # 未知板块回退 main
+    assert d(D("3.33"), "main") == (D("3.66"), D("3.00"))        # §0 half-up 到分
+
+
+def test_lock_l0_buy_skips_pinned_up_then_fills_on_gap(authed_client):
+    """涨停封死段买入不成交、盘中开板恢复（L0，main ±10%）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-lock-l0", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 11.0}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 11.00), ("2026-09-08T09:32:00", 11.00),
+                               ("2026-09-08T09:33:00", 10.98), ("2026-09-08T09:34:00", 10.98)]},
+        close_map={"600000": 10.98},
+        prev_close_map={"600000": 10.00},
+        board_map={"600000": "main"},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-lock-l0'")
+    assert len(tr) == 1
+    assert tr[0]["price"] == 10.98   # 09:31/09:32 封死涨停不成交；09:33 开板成交
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-lock-l0'"
+                  )[0]["status"] == "filled"
+
+
+def test_lock_l0_sell_blocked_at_pinned_down_expires(authed_client):
+    """跌停封死段卖出不成交（L0）：整日一字跌停 → 止损永不触发 → 日终 expired，持仓保留。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-lock-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    _insert_order(st, order_id="co-lock-sell", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"op": "le", "price": 9.30}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 9.00), ("2026-09-08T09:32:00", 9.00),
+                               ("2026-09-08T09:33:00", 9.00), ("2026-09-08T09:34:00", 9.00)]},
+        close_map={"600000": 9.00},
+        prev_close_map={"600000": 10.00},
+        board_map={"600000": "main"},
+    )
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-lock-sell'")
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-lock-sell'"
+                  )[0]["status"] == "expired"
+    assert _fetch(st, "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'",
+                  (DEMO,))[0]["quantity"] == 100
+
+
+def test_lock_l1_pinned_minute_blocks_then_open_minute_fill(authed_client):
+    """L1 整分钟封死（一字分钟）卖不成交；开板分钟恢复成交（§3.5 近似口径）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-lockl1-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l1_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    _insert_order(st, order_id="co-lockl1", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"op": "le", "price": 9.30}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l1_map={"600000": [("2026-09-08T09:31:00", 9.00, 9.00, 9.00, 9.00),
+                           ("2026-09-08T09:32:00", 9.00, 9.02, 8.95, 9.01)]},
+        close_map={"600000": 9.01},
+        prev_close_map={"600000": 10.00},
+        board_map={"600000": "main"},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-lockl1'")
+    assert len(tr) == 1
+    assert tr[0]["basis_used"] == "l1"
+    assert abs(float(tr[0]["price"]) - 9.3) < 1e-9   # 首分钟一字封死跳过，开板分钟按线价成交
+    assert _fetch(st, "SELECT COUNT(*) AS n FROM holdings WHERE account_id=? AND symbol='600000'",
+                  (DEMO,))[0]["n"] == 0
+
+
+def test_lock_l2_oneword_down_sell_expires(authed_client):
+    """L2 一字跌停全天（日线档近似口径 hi==lo==跌停价）卖出不成交 → 日终 expired。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-lockl2-buy", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 9.9}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        l2_map={"600000": {"high": 9.6, "low": 9.2}},
+        close_map={"600000": 9.6},
+    )
+    _insert_order(st, order_id="co-lockl2", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"op": "le", "price": 9.30}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l2_map={"600000": {"high": 9.00, "low": 9.00}},
+        close_map={"600000": 9.00},
+        prev_close_map={"600000": 10.00},
+        board_map={"600000": "main"},
+    )
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-lockl2'")
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-lockl2'"
+                  )[0]["status"] == "expired"
+    assert _fetch(st, "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'",
+                  (DEMO,))[0]["quantity"] == 100

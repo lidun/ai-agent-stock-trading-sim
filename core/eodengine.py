@@ -5,6 +5,9 @@
 - 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop,
   sell_trail}、price_type ∈ {market, limit}、单票价格触发（trigger 统一 spec-01 §2.4 kind
   语义，canonical {"kind":"price_le"|"price_ge","price":X}；legacy {"op","price"} 兼容读取）；
+- 涨跌停封死例外（spec-01 §3.5/§3.6，可选启用）：board_map 显式提供板块且 prev_close_map
+  含该票时启用——涨跌停价按板块系数与 §0 四舍五入实时计算；涨停封死段买入不成交、跌停封死段
+  卖出不成交，盘中开板后恢复；L1/L2 仅整分钟/一字板封死才阻断（无日内粒度的近似口径）；
 - 移动止盈（sell_trail，spec-01 §3.3/§4.1）：trigger {"kind":"trail","drop_pct":N}，
   回撤基准=持仓期最高价（hist_high_map 提供买入以来至昨日的日线 high 累计最大，取值窗含
   当日）——L0 用当日采样价累计最大、L1 用分钟 high/close 累计最大（退化 quality=degraded）、
@@ -24,8 +27,9 @@
 - 时间契约：交易日本地墙钟 naive ISO；order 仅在其 created_at 之后的采样点参与判定（防前视 #38）；
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
-未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板类、
-pct_chg/vs_cost/volume 组合类、signal_registry/exit_trackings、涨跌停/ST/板块、公司行动。
+未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板事件类、
+pct_chg/vs_cost/volume 组合类、signal_registry/exit_trackings、ST/新股买入拦截（账户豁免
+配置待接入）、公司行动。
 """
 from __future__ import annotations
 
@@ -67,6 +71,22 @@ def _D(v) -> Decimal:
 
 def _q(v: Decimal) -> str:
     return str(v)
+
+
+# spec-01 §3.6 板块涨跌幅系数（%）：main 主板 ±10%、gem 创业板 ±20%、star 科创板 ±20%、
+# bj 北交所 ±30%、st_main ST 主板 ±5%（§3.5 判定表）。涨/跌停价 = prev_close×(1±系数)
+# 按 §0 四舍五入到分；本引擎对上下限同为 half-up 对称口径（数据接入侧复核交易所规则时再调）。
+_BOARD_LIMITS = {"main": "10", "gem": "20", "star": "20", "bj": "30", "st_main": "5"}
+
+
+def _limit_px(prev_close: Decimal, board: str | None) -> tuple[Decimal, Decimal]:
+    """返回 (涨停价, 跌停价)。board 缺省或未知板块名称回退 main（±10%）。"""
+    pct = _BOARD_LIMITS.get(board or "main", "10")
+    k = _D(pct) / _D("100")
+    return (
+        (prev_close * (_D("1") + k)).quantize(_MONEY, ROUND_HALF_UP),
+        (prev_close * (_D("1") - k)).quantize(_MONEY, ROUND_HALF_UP),
+    )
 
 
 def _now() -> str:
@@ -144,6 +164,17 @@ def _order_rule(o: dict, hist_high: dict[str, Decimal]) -> tuple:
     if drop <= 0:
         raise EngineError("sell_trail 单 drop_pct 须 > 0")
     return "trail", None, drop, _D(hist_high.get(o["symbol"]))
+
+
+_BOARD_LIMIT_PCT = {"main": "10", "gem": "20", "star": "20", "bj": "30", "st_main": "5"}
+
+
+def _limit_px(prev_close: Decimal, board: str) -> tuple[Decimal, Decimal]:
+    """板块差异化涨跌停价（spec-01 §3.6 判定表；§0 四舍五入到分，Decimal）。"""
+    r = Decimal(_BOARD_LIMIT_PCT.get(board, "10")) / Decimal("100")
+    up = (prev_close * (Decimal("1") + r)).quantize(_MONEY, ROUND_HALF_UP)
+    down = (prev_close * (Decimal("1") - r)).quantize(_MONEY, ROUND_HALF_UP)
+    return up, down
 
 
 def _qty_ok(symbol: str, qty: int) -> bool:
@@ -225,6 +256,7 @@ def settle_account(
     close_map: dict[str, float],
     prev_close_map: dict[str, float] | None = None,
     hist_high_map: dict[str, float] | None = None,
+    board_map: dict[str, str] | None = None,
     fee: dict | None = None,
 ) -> dict:
     """对单个账户执行一日 EOD 结算（单 SQLite 事务原子写入）。
@@ -237,6 +269,8 @@ def settle_account(
     close_map[symbol] = 当日官方收盘价；prev_close_map[symbol] = 前一日官方收盘价。
     hist_high_map[symbol] = 该票买入以来至前一交易日的日线 high 累计最大（spec-01 §3.3
     移动止盈回撤基准取值窗含买入当日；缺省该票 trail 以当日窗口起判）。
+    board_map[symbol] = 板块（main|gem|star|bj|st_main，spec-01 §3.6 判定表）；仅当
+    board_map 显式给出且 prev_close_map 含该票时启用涨跌停封死例外（§3.5），否则不设涨停限制。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -263,6 +297,19 @@ def settle_account(
     f = {k: Decimal(str(v)) for k, v in (fee or FEES).items()}
     prev = {k: _D(v) for k, v in (prev_close_map or {}).items()}
     hist_high = {k: _D(v) for k, v in (hist_high_map or {}).items()}
+    boards = board_map or {}
+
+    def lock_limits(symbol: str):
+        """涨跌停封死判定专用：board_map 显式含该票且 prev_close 可得才返回 (up, down)。"""
+        if not boards:
+            return None
+        b = boards.get(symbol)
+        if not b:
+            return None
+        pc = prev.get(symbol)
+        if pc is None:
+            return None
+        return _limit_px(pc, b)
     conn = state_conn(state)
     now = _now()
     settle_key = f"{trade_date}:{account_id}"
@@ -396,6 +443,7 @@ def settle_account(
                     runtime[oid]["final"] = "invalid"
                     continue
                 qty = int(Decimal(str(o["qty"])))
+                lim = lock_limits(o["symbol"])
                 for ts, pv in ser:
                     if o["created_at"] and o["created_at"] >= ts:
                         continue                      # #38 防前视
@@ -411,6 +459,8 @@ def settle_account(
                             continue
                         if op == "ge" and p < trig:
                             continue
+                    if lim is not None and p == (lim[0] if o["order_type"] == "buy" else lim[1]):
+                        continue                    # 涨停封死买不成交 / 跌停封死卖不成交（§3.5）
                     if o["order_type"] == "buy":
                         amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                         fz = _fees(amount, side="buy", fee=f)
@@ -518,6 +568,7 @@ def settle_account(
                         f"order {o['id']} L1 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
                 qty = int(Decimal(str(o["qty"])))
+                lim = lock_limits(o["symbol"])
                 touched_prev = False           # 前一根分钟是否已处触达态
                 prev_failed = False            # 上一根触达分钟资金/可卖不足（可复判 §2.3）
                 seen_after = False             # 是否已越过 created_at（首根可判分钟不要求“穿越”）
@@ -540,6 +591,10 @@ def settle_account(
                             touched = bclose <= X or (blow is not None and blow <= X)
                         else:
                             touched = bclose >= X or (bhigh is not None and bhigh >= X)
+                    if lim is not None and bhigh is not None and blow is not None:
+                        lv = lim[0] if o["order_type"] == "buy" else lim[1]
+                        if bhigh == lv and blow == lv:
+                            touched = False     # 整分钟封死（一字段）：买/卖不成交，开板分钟恢复（§3.5）
                     is_after = not (o["created_at"] and o["created_at"] >= ts)
                     if is_after and touched and (not seen_after or not touched_prev or prev_failed):
                         p = X
@@ -673,6 +728,7 @@ def settle_account(
                         f"order {o['id']} L2 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
                 qty = int(Decimal(str(o["qty"])))
+                lim = lock_limits(o["symbol"])
                 if o["created_at"] and o["created_at"] >= close_ts:
                     continue                      # 收盘后创建的 order 不参与当日判定（#38）
                 trail_quality = ""
@@ -685,6 +741,10 @@ def settle_account(
                     trail_quality = "degraded"
                 elif (op == "le" and lo > trig) or (op == "ge" and hi < trig):
                     continue                      # 未触达：保持 active（today → expired）
+                if lim is not None and hi == lo:
+                    lv = lim[0] if o["order_type"] == "buy" else lim[1]
+                    if hi == lv:
+                        continue                  # 一字封死全天（日线近似口径）：买/卖不成交（§3.5）
                 p = require_close(symbol)         # L2 恒以官方收盘价成交
                 if o["order_type"] == "buy":
                     amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
