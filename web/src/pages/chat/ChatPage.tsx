@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import {
   App as AntApp,
   Avatar,
@@ -43,6 +44,7 @@ export default function ChatPage() {
   const { message } = AntApp.useApp();
   const { token } = antTheme.useToken();
   const { epoch, state: connState, subscribe } = useConnection();
+  const location = useLocation();
 
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [convs, setConvs] = useState<ConversationInfo[]>([]);
@@ -219,13 +221,16 @@ export default function ChatPage() {
         ]);
         setAgents(a);
         setConvs(c);
-        const manager = a.find((x) => x.role === "manager");
-        if (manager) await selectAgent(manager.id);
+        // 优先跳转 Agent 看板等入口携带的 agentId（卡片点击 → 聚焦对应会话）
+        const state = location.state as { agentId?: string } | null;
+        const requested = state?.agentId ? a.find((x) => x.id === state.agentId) : undefined;
+        const target = requested ?? a.find((x) => x.role === "manager");
+        if (target) await selectAgent(target.id);
       } catch (e) {
         message.error((e as Error).message ?? "初始化失败");
       }
     })();
-  }, [message, selectAgent]);
+  }, [message, selectAgent, location.state]);
 
   // 断线重连后 refetch（spec-06 §3）
   const prevEpoch = useRef(0);

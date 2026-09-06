@@ -27,13 +27,3 @@ export function ModulePlaceholder({ nav }: { nav: NavItem }) {
     </Card>
   );
 }
-
-export function ChatPlaceholder() {
-  return (
-    <EmptyState
-      icon="💬"
-      title="对话面板 · P1 交付中"
-      description="单 Agent 多会话对话能力将在此落地：新建/切换会话、消息流式展示与断线重连后的状态恢复。"
-    />
-  );
-}

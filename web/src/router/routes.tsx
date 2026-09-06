@@ -2,6 +2,7 @@ import { Navigate } from "react-router-dom";
 import type { RouteObject } from "react-router-dom";
 import SettingsPage from "../pages/Settings";
 import ChatPage from "../pages/chat/ChatPage";
+import AgentsPage from "../pages/agents/AgentsPage";
 import { ModulePlaceholder } from "../pages/Placeholder";
 import { NAV_ITEMS } from "../config/nav";
 
@@ -11,7 +12,13 @@ export const protectedChildren: RouteObject[] = [
   ...NAV_ITEMS.filter((n) => n.key !== "settings").map((n) => ({
     path: n.path,
     element:
-      n.key === "chat" ? <ChatPage /> : <ModulePlaceholder nav={n} />,
+      n.key === "chat" ? (
+        <ChatPage />
+      ) : n.key === "agents" ? (
+        <AgentsPage />
+      ) : (
+        <ModulePlaceholder nav={n} />
+      ),
   })),
   { path: "/settings", element: <SettingsPage /> },
   { path: "*", element: <Navigate to="/chat" replace /> },
