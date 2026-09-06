@@ -56,3 +56,13 @@ Entries discovered by the Agent during task execution should follow this format:
   - 结算自动触发默认关闭；常驻启用需设 `CORE_EOD_AUTO_SETTLE=1`，可配 `CORE_EOD_SETTLE_TICK_S`（默认 60）/`CORE_EOD_SETTLE_EARLIEST`（默认 15:35）/`CORE_EOD_SETTLE_RETRY_UNTIL`（默认 16:35）。
   - 触发判定是本地 SQL+腾讯快照（零日历表）：非交易日/未开盘快照 ts 与当日不符即跳过；测试一律注入 feed（tests/_feedkit.py FakeFeed/ReadySessionFeed/GapReplayFeed 系），禁止网络。
   - 进程内 _done_dates 仅节流，跨进程幂等靠 DB settle_key；单测回归命令见上条。
+
+[Project Knowledge Summary]
+- Date: 2026-09-06
+- Context: Discovered by Agent while binding 本仓库到 GitHub（用户账号 lidun，原 lidun/test 重命名为 lidun/ai-agent-stock-trading-sim 并清空绑定）
+- Category: Operations & Deployment
+- Instructions:
+  - 本项目 GitHub 远端 origin=https://github.com/lidun/ai-agent-stock-trading-sim.git，默认分支 main；本地分支名 master，推送需 `git push origin HEAD:main`。
+  - gh 已以账号 lidun 登录（web 设备流，浏览器一次性码授权）；沙箱内置 git 凭据助手对 github.com 会 500，需 `gh auth setup-git` 后推送走 gh 凭据助手。
+  - 历史遗留：远端 pr/smol-dev/zrye5w 分支与 PR #1 仍指向被替换前的旧内容（test 仓库残留），如需干净可删除该分支与 PR。
+  - 仓库为 PUBLIC；若需私有改 `gh repo edit lidun/ai-agent-stock-trading-sim --visibility private`。
