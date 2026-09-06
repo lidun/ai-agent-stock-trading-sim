@@ -40,8 +40,15 @@ def now_beijing_naive() -> str:
     return datetime.now(_BJT).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
-def qty_rule_ok(symbol: str, qty: int) -> bool:
-    """申报数量规则（spec-01 §3.7 D6 子集：主板 100 整数倍 / 科创板 ≥200 起任意整数）。"""
+def qty_rule_ok(symbol: str, qty: int, *, side: str = "buy") -> bool:
+    """申报数量规则（spec-01 §3.7 D6：买入按板块整手，卖出可零股）。
+
+    - side=buy：科创板 ≥200 起可 1 股递增；其余板块 100 整数倍；
+    - side=sell：A 股卖出允许零股（不足 100 股一次申报卖出），仅需正整数
+      （一次性卖出/尾股清仓语义由持仓可卖校验兜底，引擎记 insufficient）。
+    """
+    if side == "sell":
+        return qty > 0
     if symbol.startswith("688"):
         return qty >= 200
     return qty > 0 and qty % 100 == 0
@@ -144,8 +151,8 @@ def validate_order_payload(*, symbol: str, order_type: str, direction: str,
     if qty is None or int(qty) <= 0:
         raise OrderError("qty 须为正整数")
     qty = int(qty)
-    if not qty_rule_ok(symbol, qty):
-        raise OrderError(f"数量 {qty} 违反申报规则（主板 100 整数倍/科创板 ≥200）")
+    if not qty_rule_ok(symbol, qty, side=direction):
+        raise OrderError(f"数量 {qty} 违反申报规则（买入主板 100 整数倍/科创板 ≥200，卖出可零股）")
     return {"qty": qty, "trigger": trig}
 
 

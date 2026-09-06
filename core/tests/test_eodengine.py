@@ -1122,3 +1122,26 @@ def test_eod_exit_stale_close_when_price_missing(authed_client):
     assert r["status"] == "done" and r["quality"] == "stale_close"
     assert r["conclusion"] == "卖平"                          # -1.82% 区间
     assert abs(float(r["fwd_return_pct"]) + 1.8182) < 1e-3
+
+
+def test_eod_partial_sell_zero_lot_leaves_remaining(authed_client):
+    """卖出可零股（§3.7）：100 股持仓分 50 股卖出 → FIFO 余 50，不拒单。"""
+    st = authed_client.app.state
+    _buy_then(st)
+    _insert_order(st, order_id="co-zt", order_type="sell_take_profit", direction="sell", qty=50,
+                  trigger={"op": "ge", "price": 5.0}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 11.0)]},
+        close_map={"600000": 11.0},
+        prev_close_map={"600000": 10.0},
+    )
+    lot = _fetch(
+        st,
+        "SELECT l.remaining FROM lots l JOIN holdings h ON h.id=l.holding_id"
+        " WHERE l.account_id=? AND h.symbol='600000'",
+        (DEMO,),
+    )[0]
+    assert lot["remaining"] == 50
+    h = _fetch(st, "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'", (DEMO,))[0]
+    assert h["quantity"] == 50

@@ -178,3 +178,20 @@ def test_time_order_canonical_and_rejects(authed_client):
         place_order(st, account_id=DEMO, creator="agent-demo-001",
                     order_type="time", direction="buy", symbol="600000", qty=100,
                     trigger={"kind": "time", "at": "14:50"}, price_type="limit")
+
+
+def test_sell_zero_lot_qty_allowed(authed_client):
+    """spec-01 §3.7 卖出可零股：不足整手的卖出申报放行；买入仍强制整手规则。"""
+    from core.orderstore import OrderError, place_order
+    st = authed_client.app.state
+    o = place_order(st, account_id=DEMO, creator=DEMO, order_type="sell_take_profit",
+                    direction="sell", symbol="600519", qty=50,
+                    trigger={"kind": "price_ge", "price": 1500.0}, price_type="market")
+    assert o["status"] == "active"
+    o2 = place_order(st, account_id=DEMO, creator=DEMO, order_type="sell_take_profit",
+                     direction="sell", symbol="600519", qty=1,
+                     trigger={"kind": "price_ge", "price": 1500.0}, price_type="market")
+    assert o2["status"] == "active"
+    with pytest.raises(OrderError, match="申报规则"):
+        place_order(st, account_id=DEMO, creator=DEMO, symbol="600519", qty=150,
+                    trigger={"kind": "price_le", "price": 1500.0}, price_type="limit")
