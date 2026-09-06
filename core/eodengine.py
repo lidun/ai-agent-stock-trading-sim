@@ -3,7 +3,7 @@
 范围与边界（本版明确支持；其余拒绝而非静默跳过——宁可报 gap，不可错结）：
 - 账户：granularity=eod_replay 的策略账户；单日结算；settle_key UNIQUE 幂等（§3.1.5/§3.8 单事务）；
 - 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop,
-  sell_trail}、price_type ∈ {market, limit}、单票触发（trigger 统一 spec-01 §2.4 kind
+  sell_trail, sell_open_board}、price_type ∈ {market, limit}、单票触发（trigger 统一 spec-01 §2.4 kind
   语义）——价格类 price_le/price_ge（canonical {"kind","price"}；legacy {"op","price"}
   兼容读取）、涨跌幅类 pct_chg（昨收折算静态触发价，可选 not_limit 未封板）、相对成本类
   vs_cost（可卖持仓成本逐点折算动态触发价，spec-01 §2.4）；
@@ -14,6 +14,11 @@
   分隔可多标）且 accounts.buy_exempt（JSON token 数组，需审批，默认 []）不含对应 token → 买入单
   开盘前置 invalid（invalid_reason=`restricted_buy:st[,ipo]`，进日报）；卖出类单不受拦截
   （已持仓遇 ST 不自动卖 §3.6）。板块细判（创业板/科创板 ST 仍 ±20）由调用方合成 st+board 信息。
+- 开板卖出（sell_open_board，spec-01 §3.5/§4.1 事件行）：trigger {"kind":"open_board"} 仅 L0
+  有效——L1/L2 当日该票该单置 invalid（invalid_reason=`basis_requires_l0`，进日报不静默）。L0 语义：
+  需持仓且当日 L0 序列曾触涨停（price==涨停价，board_map×prev_close_map 裁定）后首次出现
+  price<涨停价 → 开盘采样点价成交；未封板即收市 → 当日不触发、today 单到期 expired。
+  未启用 board 涨跌停裁定（lim 不可得）时按无涨停概念处理：不触发也不报错。
 - 移动止盈（sell_trail，spec-01 §3.3/§4.1）：trigger {"kind":"trail","drop_pct":N}，
   回撤基准=持仓期最高价（hist_high_map 提供买入以来至昨日的日线 high 累计最大，取值窗含
   当日）——L0 用当日采样价累计最大、L1 用分钟 high/close 累计最大（退化 quality=degraded）、
@@ -33,8 +38,8 @@
 - 时间契约：交易日本地墙钟 naive ISO；order 仅在其 created_at 之后的采样点参与判定（防前视 #38）；
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
-未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板事件类、
-volume 量能类、signal_registry/exit_trackings、公司行动。
+未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/封板确认事件类
+（seal_confirm，需盘口/封单数据）、volume 量能类、signal_registry/exit_trackings、公司行动。
 """
 from __future__ import annotations
 
@@ -48,7 +53,8 @@ from core.db import state_conn, write_txn
 
 log = logging.getLogger(__name__)
 
-SUPPORTED_ORDER_TYPES = {"buy", "sell_take_profit", "sell_stop", "sell_trail"}
+SUPPORTED_ORDER_TYPES = {"buy", "sell_take_profit", "sell_stop", "sell_trail",
+                           "sell_open_board"}
 
 _MONEY = Decimal("0.01")
 _COST = Decimal("0.0001")
@@ -422,7 +428,12 @@ def settle_account(
             if o["symbol"] not in series_map and o["symbol"] not in l1_map \
                     and o["symbol"] not in l2_map:
                 raise EngineError(f"order {o['id']} 标的 {o['symbol']} 缺少当日序列")
-            active.append(dict(o))
+            o = dict(o)
+            if o["order_type"] == "sell_open_board" and feed_kind(o["symbol"]) != "l0":
+                # 开板事件类仅 L0 有效（spec-01 §4.1 矩阵 / §3.5）：L1/L2 → 显式 invalid
+                o["status"] = "invalid"
+                o["invalid_reason"] = "basis_requires_l0"
+            active.append(o)
 
         cash_start = _D(acct["cash"])    # 事务内期初快照（today_pnl 基准）
         cash = cash_start
@@ -509,6 +520,63 @@ def settle_account(
 
         # 内存运行态：insufficient 计数 / 终态（写盘集中在事务收尾）
         runtime = {o["id"]: {"ins": o["insufficient_events"], "final": "active"} for o in active}
+        ever_pinned: dict[str, bool] = {}
+
+        def sell_fill(o: dict, qty: int, p: Decimal, ts: str, *, oid: str) -> None:
+            """卖出撮合公共路径（L0/开板共用）：T+1 可卖校验、现金、FIFO 核销、清仓删除。"""
+            nonlocal cash
+            sellable = c.execute(
+                """
+                SELECT COALESCE(SUM(l.remaining), 0) AS s
+                  FROM lots l JOIN holdings h ON h.id = l.holding_id
+                 WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+                """,
+                (account_id, o["symbol"], trade_date),
+            ).fetchone()["s"]
+            if _D(sellable) < qty:         # 含 T+1 未到期：记事件继续
+                runtime[oid]["ins"] += 1
+                return
+            amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
+            fz = _fees(amount, side="sell", fee=f)
+            cash += amount - fz["total"]
+            tid = write_trade(o, "sell", qty, p, ts, fz)
+            rem = qty
+            lots = c.execute(
+                """
+                SELECT l.id, l.remaining FROM lots l
+                  JOIN holdings h ON h.id = l.holding_id
+                 WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ? AND l.remaining > 0
+                 ORDER BY l.buy_date ASC, l.id ASC
+                """,
+                (account_id, o["symbol"], trade_date),
+            ).fetchall()
+            for lot in lots:
+                if rem <= 0:
+                    break
+                take = min(int(_D(lot["remaining"])), rem)
+                c.execute(
+                    "UPDATE lots SET remaining=remaining-? WHERE id=?",
+                    (take, lot["id"]),
+                )
+                rem -= take
+            if rem:
+                raise EngineError(f"卖出 FIFO 核销不一致 {o['symbol']} rem={rem}")
+            held_qty[o["symbol"]] -= qty
+            holding(o["symbol"], Decimal(-qty))
+            if held_qty[o["symbol"]] <= 0:
+                c.execute(
+                    """
+                    DELETE FROM lots WHERE holding_id IN
+                      (SELECT id FROM holdings WHERE account_id=? AND symbol=?)
+                    """,
+                    (account_id, o["symbol"]),
+                )
+                c.execute(
+                    "DELETE FROM holdings WHERE account_id=? AND symbol=?",
+                    (account_id, o["symbol"]),
+                )
+                del held_qty[o["symbol"]]
+            runtime[oid]["final"] = "filled"
 
         # ---- L0 逐票回放（§3.2）----
         for symbol in sorted({o["symbol"] for o in active}):
@@ -519,15 +587,17 @@ def settle_account(
                 if o["symbol"] != symbol or o["status"] != "active":
                     continue
                 oid = o["id"]
-                try:
-                    mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
-                        o, hist_high, prev
-                    )
-                except EngineGapError:
-                    raise
-                except (json.JSONDecodeError, EngineError):
-                    runtime[oid]["final"] = "invalid"
-                    continue
+                mode = op = trig = trail_drop = ref_high = pct = not_limit = None
+                if o["order_type"] != "sell_open_board":
+                    try:
+                        mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
+                            o, hist_high, prev
+                        )
+                    except EngineGapError:
+                        raise
+                    except (json.JSONDecodeError, EngineError):
+                        runtime[oid]["final"] = "invalid"
+                        continue
                 qty = int(Decimal(str(o["qty"])))
                 lim = lock_limits(o["symbol"])
                 for ts, pv in ser:
@@ -536,6 +606,18 @@ def settle_account(
                     if runtime[oid]["final"] != "active":
                         break
                     p = _D(pv)
+                    if o["order_type"] == "sell_open_board":
+                        if lim is None:
+                            continue
+                        if p == lim[0]:               # 曾封板（触及涨停价，§3.5）
+                            ever_pinned[oid] = True
+                            continue
+                        if not ever_pinned.get(oid) or p > lim[0]:
+                            continue
+                        sell_fill(o, qty, p, ts, oid=oid)   # 首次开板采样点价成交
+                        if runtime[oid]["final"] == "filled":
+                            break
+                        continue
                     if mode == "trail":
                         ref_high = max(ref_high, p)
                         if ref_high <= 0 or p > ref_high * (_D("100") - trail_drop) / _D("100"):
@@ -591,59 +673,10 @@ def settle_account(
                         runtime[oid]["final"] = "filled"
                         break
                     else:
-                        sellable = c.execute(
-                            """
-                            SELECT COALESCE(SUM(l.remaining), 0) AS s
-                              FROM lots l JOIN holdings h ON h.id = l.holding_id
-                             WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
-                            """,
-                            (account_id, o["symbol"], trade_date),
-                        ).fetchone()["s"]
-                        if _D(sellable) < qty:         # 含 T+1 未到期
-                            runtime[oid]["ins"] += 1
-                            continue
-                        amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
-                        fz = _fees(amount, side="sell", fee=f)
-                        cash += amount - fz["total"]
-                        tid = write_trade(o, "sell", qty, p, ts, fz)
-                        rem = qty
-                        lots = c.execute(
-                            """
-                            SELECT l.id, l.remaining FROM lots l
-                              JOIN holdings h ON h.id = l.holding_id
-                             WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ? AND l.remaining > 0
-                             ORDER BY l.buy_date ASC, l.id ASC
-                            """,
-                            (account_id, o["symbol"], trade_date),
-                        ).fetchall()
-                        for lot in lots:
-                            if rem <= 0:
-                                break
-                            take = min(int(_D(lot["remaining"])), rem)
-                            c.execute(
-                                "UPDATE lots SET remaining=remaining-? WHERE id=?",
-                                (take, lot["id"]),
-                            )
-                            rem -= take
-                        if rem:
-                            raise EngineError(f"卖出 FIFO 核销不一致 {o['symbol']} rem={rem}")
-                        held_qty[o["symbol"]] -= qty
-                        holding(o["symbol"], Decimal(-qty))
-                        if held_qty[o["symbol"]] <= 0:
-                            c.execute(
-                                """
-                                DELETE FROM lots WHERE holding_id IN
-                                  (SELECT id FROM holdings WHERE account_id=? AND symbol=?)
-                                """,
-                                (account_id, o["symbol"]),
-                            )
-                            c.execute(
-                                "DELETE FROM holdings WHERE account_id=? AND symbol=?",
-                                (account_id, o["symbol"]),
-                            )
-                            del held_qty[o["symbol"]]
-                        runtime[oid]["final"] = "filled"
-                        break
+                        sell_fill(o, qty, p, ts, oid=oid)
+                        if runtime[oid]["final"] == "filled":
+                            break
+                        continue
 
         # ---- L1 档逐票回放（spec-01 §3.3：相邻分钟确认 + 按条件价 X 成交）----
         for symbol in sorted({o["symbol"] for o in active}):

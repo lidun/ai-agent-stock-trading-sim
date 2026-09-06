@@ -850,3 +850,94 @@ def test_eod_restricted_sell_not_intercepted(authed_client):
                      "FROM condition_orders WHERE id='co-rsell'")[0]
     assert row["invalid_reason"] == ""
     assert row["status"] in ("active", "expired")  # 缺持仓 → insufficient 而非 restricted 拦截
+
+
+def _buy_then(state, day1="2026-09-07", qty=100, price=10.0):
+    _insert_order(state, order_id="co-hd", order_type="buy", direction="buy", qty=qty,
+                  trigger={"op": "le", "price": 10.05}, created=f"{day1}T09:00:00")
+    eodengine.settle_account(
+        state, DEMO, day1,
+        series_map={"600000": [(f"{day1}T09:31:00", price)]},
+        close_map={"600000": price},
+    )
+
+
+def test_eod_open_board_fills_on_first_reopen(authed_client):
+    """涨停封死后首次开板采样点触发卖出（§3.5：曾封板后首次 price<涨停价）。"""
+    st = authed_client.app.state
+    _buy_then(st)
+    _insert_order(st, order_id="co-ob", order_type="sell_open_board", direction="sell", qty=100,
+                  trigger={"kind": "open_board"}, created="2026-09-08T09:29:00")
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 11.00),
+                               ("2026-09-08T09:32:00", 11.00),
+                               ("2026-09-08T09:33:00", 10.90)]},
+        close_map={"600000": 10.90},
+        prev_close_map={"600000": 10.0},
+        board_map={"600000": "main"},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-ob'")
+    assert len(tr) == 1
+    assert tr[0]["side"] == "sell" and abs(float(tr[0]["price"]) - 10.90) < 1e-9
+    assert tr[0]["basis_used"] == "l0" and tr[0]["quality"] == ""
+    assert not _fetch(st, "SELECT 1 FROM holdings WHERE account_id=? AND symbol='600000'", (DEMO,))
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-ob'")[0]["status"] == "filled"
+
+
+def test_eod_open_board_full_day_pinned_expires(authed_client):
+    """全天一字/封死无开板 → 卖出不触发，today 单 expired（无半截成交）。"""
+    st = authed_client.app.state
+    _buy_then(st)
+    _insert_order(st, order_id="co-ob2", order_type="sell_open_board", direction="sell", qty=100,
+                  trigger={"kind": "open_board"}, created="2026-09-08T09:29:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 11.00),
+                               ("2026-09-08T09:32:00", 11.00)]},
+        close_map={"600000": 11.00},
+        prev_close_map={"600000": 10.0},
+        board_map={"600000": "main"},
+    )
+    row = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-ob2'")[0]
+    assert row["status"] == "expired" and row["insufficient_events"] == 0
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-ob2'")
+
+
+def test_eod_open_board_never_pinned_expires(authed_client):
+    """当日未触及涨停 → 不构成'曾封板'，today 单 expired。"""
+    st = authed_client.app.state
+    _buy_then(st)
+    _insert_order(st, order_id="co-ob3", order_type="sell_open_board", direction="sell", qty=100,
+                  trigger={"kind": "open_board"}, created="2026-09-08T09:29:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 10.80),
+                               ("2026-09-08T09:32:00", 10.70)]},
+        close_map={"600000": 10.70},
+        prev_close_map={"600000": 10.0},
+        board_map={"600000": "main"},
+    )
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-ob3'")[0]["status"] == "expired"
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-ob3'")
+
+
+@pytest.mark.parametrize("feed", ["l1", "l2"])
+def test_eod_open_board_requires_l0_invalid(authed_client, feed):
+    """非 L0 档 → 显式 invalid basis_requires_l0（§4.1 矩阵事件行，不静默）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id=f"co-ob{feed}", order_type="sell_open_board", direction="sell",
+                  qty=100, trigger={"kind": "open_board"}, created="2026-09-08T09:29:00")
+    kw = {"l1_map": {"600000": [("2026-09-08T09:31:00", 10.90)]}} if feed == "l1" else {
+        "l2_map": {"600000": {"high": 11.5, "low": 10.2}}}
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        close_map={"600000": 10.90},
+        prev_close_map={"600000": 10.0},
+        **kw,
+    )
+    row = _fetch(st, "SELECT status, invalid_reason, settled_on FROM condition_orders "
+                     f"WHERE id='co-ob{feed}'")[0]
+    assert row["status"] == "invalid"
+    assert row["invalid_reason"] == "basis_requires_l0"
+    assert row["settled_on"] == "2026-09-08"
