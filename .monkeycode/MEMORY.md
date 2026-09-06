@@ -33,6 +33,12 @@ Entries discovered by the Agent during task execution should follow this format:
 
 [User Instruction Summary]
 - Date: 2026-09-06
+- Context: 完成多个开发切片后，用户补充推进方式约定
+- Instructions:
+  - 后续切片推进时无需询问用户"先做哪个"；由 Agent 自行按规格依赖与风险排序决定，并持续自主推进直至整个项目完成。
+
+[User Instruction Summary]
+- Date: 2026-09-06
 - Context: 完成 trigger kind 规范化切片后，用户说明后续默认提交
 - Instructions:
   - 完成每个开发切片（改动验证通过后）默认直接提交，无需再逐次询问是否提交；提交信息沿用仓库既有风格。
@@ -65,3 +71,11 @@ Entries discovered by the Agent during task execution should follow this format:
   - 本项目 GitHub 远端 origin=https://github.com/lidun/ai-agent-stock-trading-sim.git，默认分支 main；本地分支名 master，推送需 `git push origin HEAD:main`；按用户约定完成每个开发切片后默认提交并推送。
   - gh 已以账号 lidun 登录（web 设备流，浏览器一次性码授权）；沙箱内置 git 凭据助手对 github.com 会 500，需 `gh auth setup-git` 后推送走 gh 凭据助手。
   - 仓库为 PRIVATE（已私有化）；原 test 仓库残留的 PR #1 与 pr/smol-dev/zrye5w 分支已清理（closed，refs/pull/1/head 属正常残留可忽略）。
+
+[Project Knowledge Summary]
+- Date: 2026-09-06
+- Context: Discovered by Agent while debugging ST/新股拦截引擎测试（eodengine.py 快速多次源码修改后出现"修改不生效"假象）
+- Category: Troubleshooting & Debugging / Testing Methods
+- Instructions:
+  - 引擎测试 helper core/tests/test_eodengine.py `_insert_order` 的 created 默认是 "2026-09-07T09:00:00"；结算日不是 09-07 时新用例必须显式传 created=结算日时间，否则引擎终态循环按"非本日单（#38）"跳过状态写盘——订单会被撮合/成交/结算但状态不更新（settlement_log 照写），表现为断言 status 一直为初始 active/invalid_reason 空。
+  - 同一秒内连续多次改写 .py 源文件时，Python 的 pyc mtime 以秒为粒度，可能复用陈旧字节码导致"代码改了没生效"的假象；连续改源后重跑测试前执行 `find core -name '__pycache__' -type d -prune -exec rm -rf {} +` 或 touch 源文件避开同秒，防止用 DBG 探针排查时被误导。
