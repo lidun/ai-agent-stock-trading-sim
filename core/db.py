@@ -413,6 +413,17 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON exit_trackings(account_id, status, sell_date);
         """,
     ),
+    (
+        9,
+        """
+        -- 卖出跟踪按“行内会话日”推进（spec-01 §8.1 接线切片）：纯跟踪日可能没有账户结算
+        -- 活动，settlement_log 日序无法代表跟踪日进度 → 改由 settle_exits 每推进一个
+        -- 不同交易日自增 sessions_done（last_seen 防同日重复推进/重试幂等），不再依赖
+        -- settlement_log 计数。
+        ALTER TABLE exit_trackings ADD COLUMN sessions_done INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE exit_trackings ADD COLUMN last_seen TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 

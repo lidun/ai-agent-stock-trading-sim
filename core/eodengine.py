@@ -78,7 +78,7 @@ FEES = {
 # spec-01 §8.1 卖出跟踪：默认 N=10 个交易日后确定性结清（卖出当日不计，会计入下一起）；
 # 基准指数 = 沪深300（同期超额）；结清阈值 = fwd/excess 百分数（引擎常量，P1 校准用）。
 EXIT_DEFAULT_DAYS = 10
-EXIT_BENCH_SYMBOL = "000300"
+EXIT_BENCH_SYMBOL = "sh000300"     # 沪深300（指数），带交易所前缀避开 000300 深市个股
 _EXIT_OK_PCT = Decimal("-3")      # fwd/excess ≤ −3% → 卖对
 _EXIT_EARLY_PCT = Decimal("5")    # fwd/excess ≥ +5% → 卖早
 _EXIT_REASONS = {"止盈", "止损", "调仓", "主动", "强平", "清仓"}
@@ -325,15 +325,16 @@ def settle_exits(
     """每日推进卖出跟踪并到期结清（spec-01 §8.1；幂等，单事务，不动撮合账务）。
 
     market[sym] = {"close": float, "high": float, "low": float}——当日官方收盘及日内
-    高低（缺 high/low 时以 close 记极值）。基准指数以 market["000300"]（EXIT_BENCH_SYMBOL）
+    高低（缺 high/low 时以 close 记极值）。基准指数以 market[EXIT_BENCH_SYMBOL]（沪深300）
     提供，未提供时 excess 无法计算：结清仍按个股 fwd 判结论，quality 标 no_bench。
 
-    推进规则：跟踪行仅在其卖出日**之后**的结算日被推进（当日卖出行由本函数排除，避免把
-    卖出前盘中极值计入窗口）；每推进一日刷新 period_high/period_low 与最近可得价。自卖出
-    日起第 track_days（默认 EXIT_DEFAULT_DAYS=10）个结算日志日后结清——取当日官方收盘价；
-    当日缺价但此前有最近可得价 → 按最近价 stale 结清并标 quality=stale_close；两源皆缺时
-    保持 tracking 不虚构价。回归安全：settle_log 日序计数（同键幂等）驱动，非墙钟天数。
-    """
+    推进规则：跟踪行仅在其卖出日**之后**的交易日被推进（当日卖出行由本函数排除，避免把
+    卖出前盘中极值计入窗口）；每个不同 trade_date 至多推进一次（行内 last_seen 幂等，重试/
+    同日多次调用不重复推进），每推进一日 sessions_done += 1 并刷新 period_high/period_low
+    与最近可得价。sessions_done 达到 track_days（默认 EXIT_DEFAULT_DAYS=10）即结清——取当
+    日官方收盘价；当日缺价但此前有最近可得价 → 按最近价 stale 结清并标 quality=stale_close；
+    两源皆缺时保持 tracking 不虚构价。会话计数按行内推进日累计，与 settlement_log 是否活跃
+    无关（纯跟踪日没有账户结算活动也能照常推进），非墙钟天数。"""
     n = int(track_days or EXIT_DEFAULT_DAYS)
     md = market or {}
     conn = state_conn(state)
@@ -359,34 +360,33 @@ def settle_exits(
             bclose = _D(bd["close"]) if "close" in bd else None
             if close is None and bclose is None:
                 continue                     # 本日个股与基准双缺：不推进、不虚构价
-            sessions = c.execute(
-                """
-                SELECT COUNT(DISTINCT trade_date) AS n FROM settlement_log
-                 WHERE account_id=? AND trade_date > ? AND trade_date <= ?
-                """,
-                (account_id, r["sell_date"], trade_date),
-            ).fetchone()["n"]
-            if sessions > 0:                 # 非卖出当日 → 推进极值与最近价
-                ph = _D(r["period_high"])
-                pl = _D(r["period_low"])
-                if close is not None:
-                    np_high = high if high is not None else close
-                    np_low = low if low is not None else close
-                    if np_high > ph:
-                        ph = np_high
-                    if np_low < pl:
-                        pl = np_low
-                    c.execute(
-                        "UPDATE exit_trackings SET period_high=?, period_low=?, last_close=? WHERE id=?",
-                        (_q(ph), _q(pl), _q(close), r["id"]),
-                    )
-                if bclose is not None:
-                    c.execute(
-                        "UPDATE exit_trackings SET last_bench=? WHERE id=?",
-                        (_q(bclose), r["id"]),
-                    )
-                updated += 1
-            if sessions < n:
+            if r["last_seen"] == trade_date:
+                continue                     # 同日重复调用幂等，不重复推进
+            sess = int(r["sessions_done"]) + 1
+            c.execute(
+                "UPDATE exit_trackings SET sessions_done=?, last_seen=? WHERE id=?",
+                (sess, trade_date, r["id"]),
+            )
+            ph = _D(r["period_high"])
+            pl = _D(r["period_low"])
+            if close is not None:
+                np_high = high if high is not None else close
+                np_low = low if low is not None else close
+                if np_high > ph:
+                    ph = np_high
+                if np_low < pl:
+                    pl = np_low
+                c.execute(
+                    "UPDATE exit_trackings SET period_high=?, period_low=?, last_close=? WHERE id=?",
+                    (_q(ph), _q(pl), _q(close), r["id"]),
+                )
+            if bclose is not None:
+                c.execute(
+                    "UPDATE exit_trackings SET last_bench=? WHERE id=?",
+                    (_q(bclose), r["id"]),
+                )
+            updated += 1
+            if sess < n:
                 continue                     # 未到结清日：继续 tracking
             sp = _D(r["sell_price"])
             if close is not None:
@@ -464,7 +464,7 @@ def settle_account(
     分隔可多标）。命中且账户 accounts.buy_exempt（JSON token 数组，需审批）未豁免 → 买入单开盘前
     invalid（restricted_buy），见模块 doc。
     exit_market[sym] = {"close": float, "high": float, "low": float}：卖出登记时缓存当日基准
-    指数（key=EXIT_BENCH_SYMBOL "000300"）与个股官方收盘（用于卖出价偏差侧极端计），仅登记
+    指数（key=EXIT_BENCH_SYMBOL，沪深300）与个股官方收盘（用于卖出价偏差侧极端计），仅登记
     期用；每日跟踪推进由 settle_exits 单独调用（见模块 doc §8.1）。
     """
     series_map = series_map or {}

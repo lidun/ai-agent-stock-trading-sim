@@ -49,7 +49,13 @@ def _http_get(url: str) -> str:
 
 
 def secid_of(symbol: str) -> str:
-    """6 位代码 → 腾讯 secid（sh/sz 前缀）。"""
+    """6 位代码 → 腾讯 secid（sh/sz 前缀）。
+
+    已带交易所前缀（sh/sz+6 位，如指数 sh000300）则原样返回——供沪深 300 等
+    基准指数与证券代码空间（000300 同时是深市个股）区分开。
+    """
+    if len(symbol) == 8 and symbol[:2] in ("sh", "sz") and symbol[2:].isdigit():
+        return symbol
     if len(symbol) != 6 or not symbol.isdigit():
         raise ValueError(f"非法证券代码: {symbol}")
     return ("sh" if symbol[0] in ("6", "9", "5") else "sz") + symbol

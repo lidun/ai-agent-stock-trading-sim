@@ -64,6 +64,15 @@ def test_secid_of():
         q.secid_of("abc")
 
 
+def test_secid_of_prefixed_symbol_passthrough():
+    """已带交易所前缀的 8 位代码（指数/基准如 sh000300）原样透传——避免 000300 被误路由深市个股。"""
+    assert q.secid_of("sh000300") == "sh000300"
+    assert q.secid_of("sz000300") == "sz000300"
+    assert q.secid_of("sh600000") == "sh600000"
+    with pytest.raises(ValueError):
+        q.secid_of("sh00")
+
+
 def test_replay_l2_hist_range_from_day_rows(monkeypatch):
     """L2 历史档：由日 K 行构造 {high,low,官方收盘,前收}——区间触达判定与 T+1 前提。"""
     monkeypatch.setattr(q, "_http_get", lambda url: _day_text())

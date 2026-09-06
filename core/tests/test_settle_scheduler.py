@@ -1,9 +1,9 @@
-"""EOD 结算自动触发测试：窗口判定/交易日探测/缺口重试/幂等（feed 全注入，零网络）。"""
+"""EOD 结算自动触发测试：窗口判定/交易日探测/缺口重试/幂等/卖出跟踪推进（feed 全注入，零网络）。"""
 from __future__ import annotations
 
 from datetime import datetime
 
-from core import settle_scheduler
+from core import eodengine, settle_scheduler
 from core.db import state_conn
 from _feedkit import DATE, ReadySessionFeed
 from test_settle_day import DEMO, _insert_buy_order
@@ -17,6 +17,35 @@ def _settled_count(st) -> int:
     return state_conn(st).execute(
         "SELECT COUNT(*) FROM settlement_log WHERE account_id=?", (DEMO,)
     ).fetchone()[0]
+
+
+class DayRowsFeed(ReadySessionFeed):
+    """tracking 日线档：600000 与沪深300 确定性供给（缺票/缺日显式缺口）。"""
+
+    def day_rows(self, symbol, start, end):
+        from core import quotes_tencent as q
+        if symbol not in ("600000", eodengine.EXIT_BENCH_SYMBOL):
+            raise q.QuoteGapError(f"{symbol} 超出 tracking fixture 供给范围")
+        base = 10.0 if symbol == "600000" else 3000.0
+        rows = []
+        for d in ("2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"):
+            if start <= d <= end:
+                rows.append({"date": d, "open": base, "close": base,
+                             "high": base + 0.2, "low": base - 0.2})
+        return rows
+
+
+def _tracking_row(st, *, day="2026-09-03", symbol="600000", px=11.0, bench=3000.0,
+                  order_id="sched-ex"):
+    conn = state_conn(st)
+    with conn:
+        conn.execute(
+            "INSERT INTO exit_trackings"
+            " (id, account_id, sell_trade_id, symbol, sell_date, sell_price, qty,"
+            "  sell_reason, status, period_high, period_low, bench_sell_close, created_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, 100, '主动', 'tracking', ?, ?, ?, '2026-09-03T15:00:00')",
+            (f"et-{order_id}", DEMO, f"tr-{order_id}", symbol, day, px, px, px, bench),
+        )
 
 
 class GapReplayFeed(ReadySessionFeed):
@@ -115,3 +144,28 @@ def test_bjt_now_returns_naive_beijing_time():
     now = settle_scheduler.bjt_now()
     assert now.tzinfo is None
     assert len(now.isoformat()) >= 19
+
+
+def test_trigger_advances_exit_tracking_on_pure_exit_day(authed_client):
+    """无待结算工作但存在进行中卖出跟踪 → 纯跟踪日照常推进（不依赖结算活动），记账零结算。"""
+    st = authed_client.app.state
+    _tracking_row(st, px=11.0, bench=3000.0)
+    trigger = settle_scheduler.EodSettleTrigger(st, feed=DayRowsFeed())
+    out = trigger.settle_once(_at("15:40"))
+    assert out["status"] == "no_pending"
+    assert out["exits"]["tracked_accounts"] == 1 and out["exits"]["updated"] == 1
+    assert out["exits"]["closed"] == 0
+    row = state_conn(st).execute(
+        "SELECT * FROM exit_trackings WHERE account_id=?", (DEMO,)
+    ).fetchone()
+    assert row["status"] == "tracking"
+    assert row["sessions_done"] == 1 and row["last_seen"] == "2026-09-04"
+    assert abs(float(row["last_close"]) - 10.0) < 1e-9
+    assert abs(float(row["last_bench"]) - 3000.0) < 1e-9
+    assert _settled_count(st) == 0                      # 纯跟踪日不触发账户 EOD 结算
+    # 同日重试/重复 tick → done_dates 节流，不重复推进
+    again = trigger.settle_once(_at("15:41"))
+    assert again["status"] == "done"
+    assert state_conn(st).execute(
+        "SELECT sessions_done FROM exit_trackings WHERE account_id=?", (DEMO,)
+    ).fetchone()["sessions_done"] == 1
