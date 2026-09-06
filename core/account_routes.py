@@ -4,6 +4,8 @@
 - GET /api/accounts/{id}              单账户详情
 - GET /api/accounts/{id}/holdings     持仓+批次（spec-01 §2.2，引擎写入后呈现）
 - GET /api/accounts/{id}/condition-orders  条件单（spec-01 §2.3，引擎写入后呈现）
+- GET /api/accounts/{id}/trades       成交明细（spec-01 §2.5 trades）
+- GET /api/accounts/{id}/settlements  结算日志（spec-01 §2.5 settlement_log）
 """
 from __future__ import annotations
 
@@ -48,4 +50,23 @@ def account_condition_orders(agent_id: str, request: Request, session: SessionDe
     return {
         "account_id": agent_id,
         "condition_orders": tradestore.list_condition_orders(request.app.state, agent_id),
+    }
+
+
+@router.get("/accounts/{agent_id}/trades")
+def account_trades(agent_id: str, request: Request, session: SessionDep,
+                   settle_date: str | None = None):
+    _ensure_account(request.app.state, agent_id)
+    return {
+        "account_id": agent_id,
+        "trades": tradestore.list_trades(request.app.state, agent_id, settle_date=settle_date),
+    }
+
+
+@router.get("/accounts/{agent_id}/settlements")
+def account_settlements(agent_id: str, request: Request, session: SessionDep):
+    _ensure_account(request.app.state, agent_id)
+    return {
+        "account_id": agent_id,
+        "settlements": tradestore.list_settlements(request.app.state, agent_id),
     }

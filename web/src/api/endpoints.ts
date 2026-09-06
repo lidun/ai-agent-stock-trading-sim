@@ -242,3 +242,51 @@ export function listAccountConditionOrders(
 ): Promise<{ account_id: string; condition_orders: ConditionOrderInfo[] }> {
   return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/condition-orders`);
 }
+
+// ---------- 结算产物域（spec-01 §2.5：trades / settlement_log） ----------
+
+export interface TradeInfo {
+  id: string;
+  account_id: string;
+  order_id: string;
+  symbol: string;
+  side: "buy" | "sell";
+  qty: string;
+  price: string;
+  amount: string;
+  fee_total: string;
+  commission: string;
+  stamp_tax: string;
+  transfer_fee: string;
+  trade_time: string;
+  basis_used: string;
+  quality: string;
+  settle_date: string;
+  reason: string;
+  strategy_version_no: string;
+}
+
+export interface SettlementInfo {
+  id: string;
+  settle_key: string;
+  trade_date: string;
+  account_id: string;
+  agent_name: string;
+  granularity_used: Record<string, string>;
+  status: string;
+  created_at: string;
+}
+
+export function listAccountTrades(
+  agentId: string,
+  settleDate?: string,
+): Promise<{ account_id: string; trades: TradeInfo[] }> {
+  const q = settleDate ? `?settle_date=${encodeURIComponent(settleDate)}` : "";
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/trades${q}`);
+}
+
+export function listAccountSettlements(
+  agentId: string,
+): Promise<{ account_id: string; settlements: SettlementInfo[] }> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/settlements`);
+}

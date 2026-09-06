@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 from decimal import Decimal, ROUND_HALF_UP
 
 from core.db import read_txn, state_conn
@@ -125,5 +126,92 @@ def list_condition_orders(state, account_id: str, *, status: str | None = None) 
             "creator": d["creator"],
             "reason": d["reason"],
             "settled_on": d["settled_on"],
+        })
+    return out
+
+
+def list_trades(state, account_id: str, *, settle_date: str | None = None,
+                limit: int = 200) -> list[dict]:
+    """成交明细（spec-01 §2.5 trades；EOD 引擎结算产物）。"""
+    conn = state_conn(state)
+    where = "account_id = ?"
+    params: list = [account_id]
+    if settle_date:
+        where += " AND settle_date = ?"
+        params.append(settle_date)
+    params.append(limit)
+    with read_txn(conn) as c:
+        rows = c.execute(
+            f"""
+            SELECT id, account_id, order_id, symbol, side, qty, price, amount, fee_total,
+                   commission, stamp_tax, transfer_fee, trade_time, basis_requested,
+                   basis_used, quality, settle_date, reason, strategy_version_no
+              FROM trades WHERE {where}
+             ORDER BY trade_time DESC, id DESC LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "account_id": r["account_id"],
+            "order_id": r["order_id"],
+            "symbol": r["symbol"],
+            "side": r["side"],
+            "qty": _qty(r["qty"]),
+            "price": _money(r["price"]),
+            "amount": _money(r["amount"]),
+            "fee_total": _money(r["fee_total"]),
+            "commission": _money(r["commission"]),
+            "stamp_tax": _money(r["stamp_tax"]),
+            "transfer_fee": _money(r["transfer_fee"]),
+            "trade_time": r["trade_time"],
+            "basis_used": r["basis_used"],
+            "quality": r["quality"],
+            "settle_date": r["settle_date"],
+            "reason": r["reason"],
+            "strategy_version_no": r["strategy_version_no"],
+        }
+        for r in rows
+    ]
+
+
+def list_settlements(state, account_id: str | None = None, limit: int = 100) -> list[dict]:
+    """结算日志（spec-01 §2.5 settlement_log；settle_key 幂等唯一）。"""
+    conn = state_conn(state)
+    where = ""
+    params: list = []
+    if account_id:
+        where = "WHERE s.account_id = ?"
+        params = [account_id]
+    params.append(limit)
+    with read_txn(conn) as c:
+        rows = c.execute(
+            f"""
+            SELECT s.id, s.settle_key, s.trade_date, s.account_id, s.granularity_used,
+                   s.status, s.created_at, ag.name AS agent_name
+              FROM settlement_log s
+              LEFT JOIN accounts a ON a.id = s.account_id
+              LEFT JOIN agents ag ON ag.id = s.account_id
+              {where}
+             ORDER BY s.trade_date DESC, s.created_at DESC LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            used = json.loads(r["granularity_used"] or "{}")
+        except ValueError:
+            used = {}
+        out.append({
+            "id": r["id"],
+            "settle_key": r["settle_key"],
+            "trade_date": r["trade_date"],
+            "account_id": r["account_id"],
+            "agent_name": r["agent_name"] or r["account_id"],
+            "granularity_used": used,
+            "status": r["status"],
+            "created_at": r["created_at"],
         })
     return out

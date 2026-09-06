@@ -187,3 +187,32 @@ def test_eod_gap_refuses_and_writes_nothing(authed_client):
     assert _cash(st) == 100000.0
     assert not _fetch(st, "SELECT * FROM settlement_log WHERE account_id=?", (DEMO,))
     assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-gap'")[0]["status"] == "active"
+
+
+def test_settle_products_visible_via_api(authed_client):
+    """结算产物（成交/结算日志）经只读 API 序列化可见。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-api", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.90},
+    )
+    tr = authed_client.get(f"/api/accounts/{DEMO}/trades")
+    assert tr.status_code == 200, tr.text
+    rows = tr.json()["trades"]
+    assert len(rows) == 1
+    t = rows[0]
+    assert t["symbol"] == "600000" and t["side"] == "buy"
+    assert float(t["price"]) == 10.0 and float(t["qty"]) == 100
+    assert t["settle_date"] == "2026-09-07"
+    # settle_date 过滤
+    assert authed_client.get(f"/api/accounts/{DEMO}/trades?settle_date=2026-09-08").json()["trades"] == []
+    sl = authed_client.get(f"/api/accounts/{DEMO}/settlements")
+    assert sl.status_code == 200
+    logs = sl.json()["settlements"]
+    assert len(logs) == 1
+    assert logs[0]["settle_key"] == "2026-09-07:agent-demo-001"
+    assert logs[0]["granularity_used"] == {"600000": "l0"}
+    assert logs[0]["status"] == "done"

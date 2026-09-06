@@ -69,13 +69,13 @@ def test_trade_storage_empty_views(authed_client):
 
 def test_trade_storage_requires_auth(client):
     """持仓/条件单视图未登录一律 401。"""
-    for ep in ("holdings", "condition-orders"):
+    for ep in ("holdings", "condition-orders", "trades", "settlements"):
         assert client.get(f"/api/accounts/{DEMO}/{ep}").status_code == 401
 
 
 def test_trade_storage_scopes_and_auth(client, authed_client):
     """视图鉴权 + 归属不变式：非策略 Agent/不存在账户一律 404。"""
     assert authed_client.get(f"/api/accounts/{DEMO}/holdings").status_code == 200
-    for ep in ("holdings", "condition-orders"):
+    for ep in ("holdings", "condition-orders", "trades", "settlements"):
         assert authed_client.get(f"/api/accounts/{MANAGER}/{ep}").status_code == 404
         assert authed_client.get(f"/api/accounts/nope/{ep}").status_code == 404
