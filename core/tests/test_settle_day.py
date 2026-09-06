@@ -2,49 +2,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from types import SimpleNamespace
 
-from core import quotes_tencent as q
 from core import settle_day
 from core.db import state_conn, write_txn
+from _feedkit import FakeFeed
 
-FIX = Path(__file__).parent / "fixtures"
-DATE = "2026-09-04"
 DEMO = "agent-demo-001"
-
-
-class FakeFeed:
-    """基于 fixtures 的确定性 feed（600000 供给 2026-09-04，其余符号显式缺口）。"""
-
-    @staticmethod
-    def _pair(symbol, trade_date):
-        if symbol != "600000" or trade_date != DATE:
-            raise q.QuoteGapError(f"{symbol} {trade_date} 超出 fixture 供给范围")
-        rows = q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
-        on = [r for r in rows if r["date"] == trade_date][-1]
-        prev = [r for r in rows if r["date"] < trade_date][-1]
-        return on["close"], prev["close"]
-
-    def replay_day(self, symbol, trade_date):
-        close, prev_close = self._pair(symbol, trade_date)
-        sess = q.parse_minute_session(
-            (FIX / "tencent_minute_sh600000.json").read_text("utf-8")
-        )
-        if abs(sess["close_last"] - close) > q.Decimal("0.001"):
-            raise q.QuoteGapError("会话末价与官方收盘不一致")
-        bars = [(f"{trade_date}T{h[:2]}:{h[2:]}:00", float(c)) for h, c, _ in sess["bars"]]
-        return {"level": "l1", "official_close": float(close),
-                "prev_close": float(prev_close), "bars": bars,
-                "session_date": trade_date, "source": "tencent"}
-
-    def daily_pair(self, symbol, trade_date):
-        close, prev_close = self._pair(symbol, trade_date)
-        return {"official_close": float(close), "prev_close": float(prev_close),
-                "session_date": trade_date, "source": "tencent"}
-
-    def realtime_batch(self, symbols):
-        return {}
+DATE = "2026-09-04"
 
 
 def _insert_buy_order(state, *, order_id, account_id=DEMO, symbol="600000",

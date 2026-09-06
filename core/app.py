@@ -91,6 +91,41 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(conv_router)
     app.include_router(account_router)
 
+    if settings.eod_auto_settle:
+        # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点
+        import asyncio
+        from datetime import datetime as _dt
+
+        from core.settle_scheduler import EodSettleTrigger
+
+        def _hm(value: str):
+            return _dt.strptime(value, "%H:%M").time()
+
+        trigger = EodSettleTrigger(
+            app.state,
+            earliest=_hm(settings.eod_settle_earliest),
+            retry_until=_hm(settings.eod_settle_retry_until),
+        )
+
+        @app.on_event("startup")
+        async def _start_eod_settle():
+            app.state.settle_task = asyncio.create_task(
+                trigger.run_forever(settings.eod_settle_tick_s)
+            )
+            log.info("EOD 结算自动触发已启用：最早 %s，重试至 %s，tick %ss",
+                     settings.eod_settle_earliest, settings.eod_settle_retry_until,
+                     settings.eod_settle_tick_s)
+
+        @app.on_event("shutdown")
+        async def _stop_eod_settle():
+            task = getattr(app.state, "settle_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
     @app.get("/")
     def root():
         return {"service": "ai-agent-trading-core", "version": __version__,

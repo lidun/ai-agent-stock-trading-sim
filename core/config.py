@@ -52,6 +52,12 @@ class Settings:
     engine_stub_delay_ms: int = 300       # 桩处理推进间隔（UI 观察用；测试置 0）
     notifications_via_ws: bool = True     # 站内通知（web）默认开启（spec-06 §6.13 推送组）
 
+    # EOD 结算自动触发（spec-04 §2.2 第 2 项；spec-01 §3.1 窗口）
+    eod_auto_settle: bool = False         # 常驻自动结算开关（部署时置 1；测试默认关）
+    eod_settle_tick_s: int = 60           # tick 间隔
+    eod_settle_earliest: str = "15:35"    # 最早结算点（可配，spec-01 §3.1）
+    eod_settle_retry_until: str = "16:35" # 重试窗口终点（默认 15:35+60m）
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -89,6 +95,10 @@ def load_settings() -> Settings:
         engine_stub_enabled=_as_bool("CORE_ENGINE_STUB", True),
         engine_stub_delay_ms=_as_int("CORE_ENGINE_STUB_DELAY_MS", 300),
         notifications_via_ws=_as_bool("CORE_NOTIFICATIONS_WS", True),
+        eod_auto_settle=_as_bool("CORE_EOD_AUTO_SETTLE", False),
+        eod_settle_tick_s=_as_int("CORE_EOD_SETTLE_TICK_S", 60),
+        eod_settle_earliest=os.getenv("CORE_EOD_SETTLE_EARLIEST", "15:35"),
+        eod_settle_retry_until=os.getenv("CORE_EOD_SETTLE_RETRY_UNTIL", "16:35"),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )

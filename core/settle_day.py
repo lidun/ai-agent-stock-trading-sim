@@ -50,6 +50,35 @@ def eligible_accounts(state, *, account_ids: list[str] | None = None) -> list[st
     return [r["id"] for r in rows]
 
 
+def pending_any(state, trade_date: str) -> bool:
+    """任一 eod_replay 可结算账户在当日存在待结算工作（active 当日条件单或有持仓）。
+
+    零网络快速门（供自动触发器在进入行情探测前拦截空日）；判定口径与 run_day 一致。
+    """
+    conn = state_conn(state)
+    row = conn.execute(
+        """
+        SELECT 1 FROM accounts a
+         WHERE a.granularity='eod_replay'
+           AND a.status NOT IN ('halted','archived','paused_buy')
+           AND (
+               EXISTS (
+                   SELECT 1 FROM condition_orders co
+                    WHERE co.account_id = a.id AND co.status = 'active'
+                      AND co.created_at LIKE ?
+               )
+               OR EXISTS (
+                   SELECT 1 FROM holdings h
+                    WHERE h.account_id = a.id AND h.quantity > 0
+               )
+           )
+         LIMIT 1
+        """,
+        (trade_date + "%",),
+    ).fetchone()
+    return row is not None
+
+
 def _orders_for(state, account_id: str, trade_date: str) -> list[dict]:
     conn = state_conn(state)
     return [

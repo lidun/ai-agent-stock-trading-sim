@@ -41,3 +41,12 @@ Entries discovered by the Agent during task execution should follow this format:
   - 测试运行：`python3 -m pytest core/tests -q`（conftest 自布置隔离 CORE_DATA_DIR/测试口令，无需网络）；行情解析单测固定读 core/tests/fixtures/ 下录制样本，禁止依赖网络。
   - 实盘/冒烟运行库为 core/data/aat.db（.gitignore 忽略）；用隔离数据目录做回放冒烟时设 `CORE_DATA_DIR=<tmp>` 且 `CORE_SINGLE_INSTANCE_LOCK=0`（或直接调用 core.settle_day.run_day 不带 app 锁）。
   - 结算编排入口：`python3 -m core.settle_day --date YYYY-MM-DD [--account …]`；未显式给日期时用腾讯快照 ts 推断最近会话日。
+
+[Project Knowledge Summary]
+- Date: 2026-09-06
+- Context: Discovered by Agent while implementing EOD 结算自动触发（settle_scheduler 切片，spec-04 §2.2 第 2 项）
+- Category: Operations & Deployment
+- Instructions:
+  - 结算自动触发默认关闭；常驻启用需设 `CORE_EOD_AUTO_SETTLE=1`，可配 `CORE_EOD_SETTLE_TICK_S`（默认 60）/`CORE_EOD_SETTLE_EARLIEST`（默认 15:35）/`CORE_EOD_SETTLE_RETRY_UNTIL`（默认 16:35）。
+  - 触发判定是本地 SQL+腾讯快照（零日历表）：非交易日/未开盘快照 ts 与当日不符即跳过；测试一律注入 feed（tests/_feedkit.py FakeFeed/ReadySessionFeed/GapReplayFeed 系），禁止网络。
+  - 进程内 _done_dates 仅节流，跨进程幂等靠 DB settle_key；单测回归命令见上条。
