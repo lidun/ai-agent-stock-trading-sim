@@ -39,9 +39,10 @@ Entries discovered by the Agent during task execution should follow this format:
 
 [User Instruction Summary]
 - Date: 2026-09-06
-- Context: 完成 trigger kind 规范化切片后，用户说明后续默认提交
+- Context: 用户先约定切片完成后默认提交，后续进一步明确所有更改直接提交并推送（time 定时单切片完成时重申）
 - Instructions:
-  - 完成每个开发切片（改动验证通过后）默认直接提交，无需再逐次询问是否提交；提交信息沿用仓库既有风格。
+  - 完成每个开发切片或任何改动（验证通过后）默认直接 git 提交并推送到远端，无需再逐次询问是否提交/推送；提交信息沿用仓库既有风格。
+  - 本仓库推送方式：本地分支 master → `git push origin HEAD:main`（见下方远端条目）。
 
 [Project Knowledge Summary]
 - Date: 2026-09-06
