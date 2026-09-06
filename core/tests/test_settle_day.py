@@ -5,7 +5,7 @@ import json
 
 from core import settle_day
 from core.db import state_conn, write_txn
-from _feedkit import FakeFeed
+from _feedkit import FakeFeed, L2OnlyFeed
 
 DEMO = "agent-demo-001"
 DATE = "2026-09-04"
@@ -106,6 +106,30 @@ def test_settle_day_gap_reports_per_account_no_writes(authed_client):
     ).fetchone()["status"] == "active"
     tr = conn.execute("SELECT price, basis_used FROM trades WHERE order_id='sd-ok'").fetchone()
     assert tr is not None and tr["price"] == 9.28 and tr["basis_used"] == "l1"
+
+
+def test_settle_day_l2_fallback_when_minutes_unavailable(authed_client):
+    """分钟缺口 → run_day 自动回退 L2 日线区间：触达以官方收盘成交、basis_used='l2'。"""
+    st = authed_client.app.state
+    on = _day_row_on()
+    _insert_buy_order(st, order_id="sd-l2", trigger={"op": "le", "price": on["low"]})
+    report = settle_day.run_day(st, DATE, feed=L2OnlyFeed())
+    acct = [a for a in report["accounts"] if a["account_id"] == DEMO][0]
+    assert acct.get("error") is not True and acct.get("skipped") is not True
+    conn = state_conn(st)
+    tr = conn.execute("SELECT * FROM trades WHERE order_id='sd-l2'").fetchone()
+    assert tr is not None and tr["basis_used"] == "l2"
+    assert tr["price"] == on["close"] and tr["trade_time"] == f"{DATE}T15:00:00"
+    sl = conn.execute("SELECT * FROM settlement_log WHERE account_id=?", (DEMO,)).fetchone()
+    assert json.loads(sl["granularity_used"]) == {"600000": "l2"}
+
+
+def _day_row_on():
+    from core import quotes_tencent as q
+    from _feedkit import FIX
+    rows = q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
+    row = next(r for r in rows if r["date"] == DATE)
+    return {"high": float(row["high"]), "low": float(row["low"]), "close": float(row["close"])}
 
 
 def test_settle_day_empty_account_skipped(authed_client):

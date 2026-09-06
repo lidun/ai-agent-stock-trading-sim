@@ -38,6 +38,10 @@ class FakeFeed:
                 "prev_close": float(prev_close), "bars": bars,
                 "session_date": trade_date, "source": "tencent"}
 
+    def replay_l2(self, symbol, trade_date):
+        self._pair(symbol, trade_date)
+        raise q.QuoteGapError(f"{symbol} {trade_date} 无 L2 日线区间 fixture")
+
     def daily_pair(self, symbol, trade_date):
         close, prev_close = self._pair(symbol, trade_date)
         return {"official_close": float(close), "prev_close": float(prev_close),
@@ -45,6 +49,21 @@ class FakeFeed:
 
     def realtime_batch(self, symbols):
         return {}
+
+
+class L2OnlyFeed(FakeFeed):
+    """600000 仅供给 L2 日线档（replay_day 显式缺口）→ 驱动 run_day 的 L2 回退路径。"""
+
+    def replay_day(self, symbol, trade_date):
+        raise q.QuoteGapError(f"{symbol} {trade_date} 无分钟 fixture（L2 回退路径）")
+
+    def replay_l2(self, symbol, trade_date):
+        close, prev_close = self._pair(symbol, trade_date)
+        rows = q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
+        on = [r for r in rows if r["date"] == trade_date][-1]
+        return {"level": "l2", "high": float(on["high"]), "low": float(on["low"]),
+                "official_close": float(close), "prev_close": float(prev_close),
+                "session_date": trade_date, "source": "tencent"}
 
 
 class ReadySessionFeed(FakeFeed):

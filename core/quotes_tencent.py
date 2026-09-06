@@ -7,7 +7,8 @@
   15:06-15:30 的冻结续段按 is_extended 语义剔除（spec-03 §3.2/§4.1，不进判定序列）。
 
 源侧约束（v1，单源）：
-- 分钟数据仅提供最新一个交易会话；早于该日的分钟历史不可得 → 历史日补跑走 L2（引擎未支持则显式 gap）；
+- 分钟数据仅提供最新一个交易会话；早于该日的分钟历史不可得 → 历史日/老交易日补跑
+  走 L2 日线区间档（replay_l2，spec-01 §3.3 官方收盘价成交近似）；
 - L0 3 秒序列不由此源供给（本地采集器职责，spec-03 §3，P1 未接）；
 - quality/交叉抽检：source_family='tencent'，异族抽检第二源未配置前不做假抽检（spec-03 §7 B2 语义：跳过并记录）。
 
@@ -183,10 +184,37 @@ def daily_pair(symbol: str, trade_date: str) -> dict:
     }
 
 
+def replay_l2(symbol: str, trade_date: str) -> dict:
+    """构造某票某交易日 L2 回放输入（spec-01 §3.3：日线区间触达 + 官方收盘价成交）。
+
+    供历史日补跑/试运行回放：分钟深度不可得的交易日，退到日线 OHLC 区间近似档。
+    返回 {level:'l2', high, low, official_close, prev_close, session_date, source}。
+    """
+    start = (date.fromisoformat(trade_date) - timedelta(days=20)).isoformat()
+    day = day_rows(symbol, start, trade_date)
+    on = [r for r in day if r["date"] == trade_date]
+    if not on:
+        raise QuoteGapError(f"{symbol} {trade_date} 非交易日或无日线")
+    prev = [r for r in day if r["date"] < trade_date]
+    if not prev:
+        raise QuoteGapError(f"{symbol} 缺少 {trade_date} 前一日日线")
+    row = on[-1]
+    return {
+        "level": "l2",
+        "high": float(row["high"]),
+        "low": float(row["low"]),
+        "official_close": float(row["close"]),
+        "prev_close": float(prev[-1]["close"]),
+        "session_date": trade_date,
+        "source": SOURCE,
+    }
+
+
 def replay_day(symbol: str, trade_date: str) -> dict:
     """构造某票某交易日 L1 回放输入（spec-03 §4.1 get_replay_series 的 P1 单源实现）。
 
-    trade_date 必须是腾讯分时所能提供的最新完整交易会话（历史日分钟不可得 → QuoteGapError）。
+    trade_date 必须是腾讯分时所能提供的最新完整交易会话（历史日分钟不可得 → QuoteGapError，
+    由 settle_day 自动回退 replay_l2 的 L2 日线区间档）。分钟会话末价与官方日线收盘不一致 → 拒绝供给。
     返回 {level, official_close, prev_close, bars:[(ts_naive_beijing, close)], session_date, source}。
     """
     pair = daily_pair(symbol, trade_date)

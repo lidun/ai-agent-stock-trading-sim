@@ -62,3 +62,26 @@ def test_secid_of():
     assert q.secid_of("300750") == "sz300750"
     with pytest.raises(ValueError):
         q.secid_of("abc")
+
+
+def test_replay_l2_hist_range_from_day_rows(monkeypatch):
+    """L2 历史档：由日 K 行构造 {high,low,官方收盘,前收}——区间触达判定与 T+1 前提。"""
+    monkeypatch.setattr(q, "_http_get", lambda url: _day_text())
+    l2 = q.replay_l2("600000", "2026-08-21")
+    assert l2["level"] == "l2" and l2["session_date"] == "2026-08-21"
+    assert l2["source"] == q.SOURCE
+    rows = q.parse_day_rows(_day_text())
+    on = [r for r in rows if r["date"] == "2026-08-21"][-1]
+    prev = [r for r in rows if r["date"] == "2026-08-20"][-1]
+    assert l2["high"] == float(on["high"]) and l2["low"] == float(on["low"])
+    assert l2["official_close"] == float(on["close"])
+    assert l2["prev_close"] == float(prev["close"])
+
+
+def test_replay_l2_refuses_nontrading_or_missing_prev(monkeypatch):
+    """非交易日无当日日 K → gap；窗口内无前收（fixture 首行）→ gap（宁缺毋错，绝不虚构前收）。"""
+    monkeypatch.setattr(q, "_http_get", lambda url: _day_text())
+    with pytest.raises(q.QuoteGapError, match="非交易日或无日线"):
+        q.replay_l2("600000", "2026-09-05")     # 周末：fixture 末行为 09-04
+    with pytest.raises(q.QuoteGapError, match="缺少"):
+        q.replay_l2("600000", "2026-08-20")     # fixture 最早一日：无更早日线

@@ -4,17 +4,22 @@
 - 账户：granularity=eod_replay 的策略账户；单日结算；settle_key UNIQUE 幂等（§3.1.5/§3.8 单事务）；
 - 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop}、
   price_type ∈ {market, limit}、单票价格触发（trigger JSON {"op":"le"|"ge","price":X}）；
-- 档位：L0（series_map 采样点序列，触达采样点价成交）与 L1（l1_map 分钟序列，spec-01 §3.3——
+- 档位：L0（series_map 采样点序列，触达采样点价成交）、L1（l1_map 分钟序列，spec-01 §3.3——
   相邻分钟确认触达、按条件价 X 成交、15:00 收盘分钟按保守口径 max/min(X, 官方收盘价) 并标
-  close_minute_fill）；L1 下 price_type=market 无价单属未定义语义 → 显式 EngineGapError；
-- 成交价口径（§3.3 L0）：触达采样点价成交，滑点 0；
+  close_minute_fill）与 L2（l2_map 当日 high/low 区间触达 + 官方收盘价成交，spec-01 §3.3，
+  历史日/分钟不可得时的日线档）；L0/L1 下 price_type=market 无价单属未定义语义 → 显式
+  EngineGapError；
+- 成交价口径（§3.3 L0）：触达采样点价成交，滑点 0；L2 恒以官方收盘价成交；
 - T+1（§6.2）：可卖数 = Σ lots(buy_date < trade_date).remaining，当日新 lot 不可卖；
 - 全量成交：现金/可卖不足不成交、记 insufficient_events、继续参与后续采样（§2.3 v0.3）；
 - 收盘对齐（§3.2 步3）：序列末价与官方收盘价偏差 >0.3% → trade.quality='degraded'；
 - 份额法（§6.1）：NAV=(cash+Σqty×官方收盘价)/shares；today_pnl 对比期初估值（prev_close）；
-- 时间契约：交易日本地墙钟 naive ISO；order 仅在其 created_at 之后的采样点参与判定（防前视 #38）。
+- 对账双守恒（§6.5 D1=A）：单事务落账前自检——式一金额守恒（现金逐笔净流）与式二 NAV 守恒
+  （现金+持仓市值独立推导）并列校验，任一不平 → EngineError → 整事务回滚（带病不落账）；
+- 时间契约：交易日本地墙钟 naive ISO；order 仅在其 created_at 之后的采样点参与判定（防前视 #38）；
+  L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
-未支持（命中即抛 EngineGapError，不写任何数据）：L2 档、篮子/组合/定时/开板封板类、
+未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/开板封板类、
 trail 移动止盈、signal_registry/exit_trackings、涨跌停/ST/板块、公司行动。
 """
 from __future__ import annotations
@@ -114,6 +119,52 @@ def _norm_l1(bars) -> list[tuple[str, Decimal | None, Decimal | None, Decimal | 
     return out
 
 
+def _audit_conservation(c, account_id: str, trade_date: str, *, cash_start: Decimal,
+                        final_cash: Decimal, equity: Decimal, shares: Decimal, nav: Decimal,
+                        close_map: dict[str, float]) -> None:
+    """§6.5 对账双守恒自检（D1=A，单事务内、落账前执行）。
+
+    式一（金额守恒）：cash_start + Σ当日成交净流（卖出 amount−费用 / 买入 −(amount+费用)，全 Decimal）
+        == 期末现金，从 trades 逐笔独立推导，与引擎内存现金路径互相校验；
+    式二（NAV 守恒）：期末现金 + Σ期末持仓×官方收盘价（从 holdings 独立推导）== equity，
+        且 equity/shares 与落账 NAV 舍入一致。任何不平 → EngineError → 整事务回滚（带病不落账）。
+    """
+    flow = Decimal("0")
+    rows = c.execute(
+        "SELECT side, amount, fee_total FROM trades"
+        " WHERE account_id=? AND settle_date=?",
+        (account_id, trade_date),
+    ).fetchall()
+    for r in rows:
+        amt = _D(r["amount"])
+        fee = _D(r["fee_total"])
+        flow += (amt - fee) if r["side"] == "sell" else -(amt + fee)
+    if cash_start + flow != final_cash:
+        raise EngineError(
+            f"对账式一(金额守恒)不平 acct={account_id} {trade_date}: "
+            f"期末现金 {final_cash} ≠ 期初 {cash_start} + 当日净流 {flow}"
+        )
+    mv = Decimal("0")
+    for h in c.execute(
+        "SELECT symbol, quantity FROM holdings WHERE account_id=? AND quantity > 0",
+        (account_id,),
+    ):
+        sym = h["symbol"]
+        if sym not in close_map:
+            raise EngineError(f"对账式二缺 {sym} 官方收盘价——禁止虚构估值价")
+        mv += _D(h["quantity"]) * _D(close_map[sym])
+    if final_cash + mv != equity:
+        raise EngineError(
+            f"对账式二(NAV守恒)不平 acct={account_id} {trade_date}: "
+            f"期末现金+持仓市值 {final_cash + mv} ≠ 引擎 equity {equity}"
+        )
+    if (equity / shares).quantize(_COST, ROUND_HALF_UP) != nav:
+        raise EngineError(
+            f"对账式二(NAV守恒)不平 acct={account_id} {trade_date}: "
+            f"精确净值 {equity / shares} 与落账 nav {nav} 舍入不一致"
+        )
+
+
 def settle_account(
     state,
     account_id: str,
@@ -121,6 +172,7 @@ def settle_account(
     *,
     series_map: dict[str, list[tuple[str, float]]] | None = None,
     l1_map: dict[str, list[tuple]] | None = None,
+    l2_map: dict[str, dict] | None = None,
     close_map: dict[str, float],
     prev_close_map: dict[str, float] | None = None,
     fee: dict | None = None,
@@ -129,21 +181,32 @@ def settle_account(
 
     series_map[symbol] = [(本地墙钟 naive ISO, price), ...]（升序 L0 采样点）。
     l1_map[symbol] = [(本地墙钟 naive ISO, close), ...] 或 [(ts, open, high, low, close), ...]
-    （升序 1 分钟条，spec-01 §3.3 L1 判定）。同一 symbol 不得同时出现在两个 map。
+    （升序 1 分钟条，spec-01 §3.3 L1 判定）。
+    l2_map[symbol] = {"high": float, "low": float}（当日日线区间，spec-01 §3.3 L2：
+    区间触达 + 官方收盘价成交，供历史日/分钟不可得票）。同一 symbol 在三个 map 中至多出现其一。
     close_map[symbol] = 当日官方收盘价；prev_close_map[symbol] = 前一日官方收盘价。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
-    for sym in l1_map:
-        if sym in series_map:
-            raise EngineError(f"symbol {sym} 同时提供 L0 与 L1 序列——档位须按票唯一")
+    l2_map = l2_map or {}
+    seen = set(series_map) | set(l1_map)
+    for sym in l2_map:
+        if sym in seen:
+            raise EngineError(f"symbol {sym} 同时提供多档序列——档位须按票唯一")
+    seen |= set(l2_map)
 
     def feed_kind(symbol: str) -> str:
-        return "l1" if symbol in l1_map else "l0"
+        if symbol in l1_map:
+            return "l1"
+        if symbol in l2_map:
+            return "l2"
+        return "l0"
 
     def feed_last_price(symbol: str) -> Decimal:
         if symbol in l1_map:
             return l1_map[symbol][-1][4]
+        if symbol in l2_map:
+            return _D(close_map[symbol])
         return _D(series_map[symbol][-1][1])
     f = {k: Decimal(str(v)) for k, v in (fee or FEES).items()}
     prev = {k: _D(v) for k, v in (prev_close_map or {}).items()}
@@ -181,7 +244,8 @@ def settle_account(
                 raise EngineGapError(f"order {o['id']} type={o['order_type']} 未实现")
             if o["scope"] != "single" or o["basis"] != "replay_l0":
                 raise EngineGapError(f"order {o['id']} scope/basis 超出支持范围")
-            if o["symbol"] not in series_map and o["symbol"] not in l1_map:
+            if o["symbol"] not in series_map and o["symbol"] not in l1_map \
+                    and o["symbol"] not in l2_map:
                 raise EngineError(f"order {o['id']} 标的 {o['symbol']} 缺少当日序列")
             active.append(dict(o))
 
@@ -205,7 +269,7 @@ def settle_account(
         def require_close(symbol: str) -> Decimal:
             if symbol not in close_map:
                 raise EngineError(f"{symbol} 缺少官方收盘价——禁止以替代价虚构收盘价")
-            if symbol in series_map or symbol in l1_map:
+            if symbol in series_map or symbol in l1_map or symbol in l2_map:
                 granularity_used[symbol] = feed_kind(symbol)
             return _D(close_map[symbol])
 
@@ -289,7 +353,7 @@ def settle_account(
                         if op == "ge" and p < trig:
                             continue
                     if o["order_type"] == "buy":
-                        amount = p * qty
+                        amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                         fz = _fees(amount, side="buy", fee=f)
                         if cash < amount + fz["total"]:      # 资金不足：记事件继续（§2.3）
                             runtime[oid]["ins"] += 1
@@ -331,7 +395,7 @@ def settle_account(
                         if _D(sellable) < qty:         # 含 T+1 未到期
                             runtime[oid]["ins"] += 1
                             continue
-                        amount = p * qty
+                        amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                         fz = _fees(amount, side="sell", fee=f)
                         cash += amount - fz["total"]
                         tid = write_trade(o, "sell", qty, p, ts, fz)
@@ -415,7 +479,7 @@ def settle_account(
                                 p = min(X, cl)
                             quality = "close_minute_fill"
                         if o["order_type"] == "buy":
-                            amount = p * qty
+                            amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                             fz = _fees(amount, side="buy", fee=f)
                             if cash < amount + fz["total"]:
                                 runtime[oid]["ins"] += 1
@@ -461,7 +525,7 @@ def settle_account(
                                 runtime[oid]["ins"] += 1
                                 prev_failed = True
                             else:
-                                amount = p * qty
+                                amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
                                 fz = _fees(amount, side="sell", fee=f)
                                 cash += amount - fz["total"]
                                 tid = write_trade(o, "sell", qty, p, ts, fz, quality=quality)
@@ -511,9 +575,124 @@ def settle_account(
                         prev_failed = False
                     seen_after = seen_after or is_after
 
+        # ---- L2 档逐票回放（spec-01 §3.3/§4.1：日线区间触达 + 官方收盘价成交；历史日档）----
+        for symbol in sorted({o["symbol"] for o in active}):
+            if feed_kind(symbol) != "l2":
+                continue
+            hi = _D(l2_map[symbol]["high"])
+            lo = _D(l2_map[symbol]["low"])
+            close_ts = f"{trade_date}T15:00:00"
+            for o in active:
+                if o["symbol"] != symbol or o["status"] != "active":
+                    continue
+                oid = o["id"]
+                try:
+                    op, trig = _trigger_price(o)
+                except (json.JSONDecodeError, EngineError):
+                    runtime[oid]["final"] = "invalid"
+                    continue
+                if trig is None:
+                    raise EngineGapError(
+                        f"order {o['id']} L2 档 price_type=market 无价单属未定义语义（§3.3）"
+                    )
+                qty = int(Decimal(str(o["qty"])))
+                if o["created_at"] and o["created_at"] >= close_ts:
+                    continue                      # 收盘后创建的 order 不参与当日判定（#38）
+                if (op == "le" and lo > trig) or (op == "ge" and hi < trig):
+                    continue                      # 未触达：保持 active（today → expired）
+                p = require_close(symbol)         # L2 恒以官方收盘价成交
+                if o["order_type"] == "buy":
+                    amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
+                    fz = _fees(amount, side="buy", fee=f)
+                    if cash < amount + fz["total"]:
+                        runtime[oid]["ins"] += 1
+                        continue                  # 收盘无现金 → 记 insufficient，不再有采样点
+                    cash -= amount + fz["total"]
+                    tid = write_trade(o, "buy", qty, p, close_ts, fz)
+                    hid = holding(o["symbol"], Decimal(qty), cost_basis=None)
+                    amt_with_fee = amount + fz["total"]
+                    cur = c.execute(
+                        "SELECT quantity FROM holdings WHERE id=?", (hid,)
+                    ).fetchone()
+                    avg = (amt_with_fee / _D(cur["quantity"])).quantize(
+                        _COST, ROUND_HALF_UP
+                    )
+                    c.execute("UPDATE holdings SET avg_cost=? WHERE id=?", (_q(avg), hid))
+                    c.execute(
+                        """
+                        INSERT INTO lots(id, account_id, holding_id, buy_trade_id,
+                            buy_date, buy_price, quantity, remaining,
+                            strategy_version_no, corp_action_flags)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            "l" + secrets.token_hex(10), account_id, hid, tid,
+                            trade_date, _q(p.quantize(_COST, ROUND_HALF_UP)), qty, qty,
+                            o["strategy_version_no"] or version_no, "[]",
+                        ),
+                    )
+                    held_qty[o["symbol"]] = held_qty.get(o["symbol"], Decimal("0")) + qty
+                    runtime[oid]["final"] = "filled"
+                else:
+                    sellable = c.execute(
+                        """
+                        SELECT COALESCE(SUM(l.remaining), 0) AS s
+                          FROM lots l JOIN holdings h ON h.id = l.holding_id
+                         WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+                        """,
+                        (account_id, o["symbol"], trade_date),
+                    ).fetchone()["s"]
+                    if _D(sellable) < qty:        # T+1 未到期/无持仓 → 记 insufficient
+                        runtime[oid]["ins"] += 1
+                        continue
+                    amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
+                    fz = _fees(amount, side="sell", fee=f)
+                    cash += amount - fz["total"]
+                    tid = write_trade(o, "sell", qty, p, close_ts, fz)
+                    rem = qty
+                    lots = c.execute(
+                        """
+                        SELECT l.id, l.remaining FROM lots l
+                          JOIN holdings h ON h.id = l.holding_id
+                         WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+                           AND l.remaining > 0
+                         ORDER BY l.buy_date ASC, l.id ASC
+                        """,
+                        (account_id, o["symbol"], trade_date),
+                    ).fetchall()
+                    for lot in lots:
+                        if rem <= 0:
+                            break
+                        take = min(int(_D(lot["remaining"])), rem)
+                        c.execute(
+                            "UPDATE lots SET remaining=remaining-? WHERE id=?",
+                            (take, lot["id"]),
+                        )
+                        rem -= take
+                    if rem:
+                        raise EngineError(f"卖出 FIFO 核销不一致 {o['symbol']} rem={rem}")
+                    held_qty[o["symbol"]] -= qty
+                    holding(o["symbol"], Decimal(-qty))
+                    if held_qty[o["symbol"]] <= 0:
+                        c.execute(
+                            """
+                            DELETE FROM lots WHERE holding_id IN
+                              (SELECT id FROM holdings WHERE account_id=? AND symbol=?)
+                            """,
+                            (account_id, o["symbol"]),
+                        )
+                        c.execute(
+                            "DELETE FROM holdings WHERE account_id=? AND symbol=?",
+                            (account_id, o["symbol"]),
+                        )
+                        del held_qty[o["symbol"]]
+                    runtime[oid]["final"] = "filled"
+
         # 写盘条件单运行态 + today 单未成交 → expired（§3.2 步4）
         for o in active:
             st = runtime[o["id"]]
+            if o["created_at"] and not o["created_at"].startswith(trade_date):
+                continue      # 非本日单（跨日 long / 未来单）：不属本日结算处理范围（#38 语义）
             if o["status"] == "invalid":          # 开盘前静态校验（qty_rule）
                 c.execute(
                     "UPDATE condition_orders SET status='invalid', invalid_reason=?, settled_on=? WHERE id=?",
@@ -551,8 +730,9 @@ def settle_account(
             if cl > 0 and not tr["quality"] and (abs(lastp - cl) / cl) > _CLOSE_TOL:
                 c.execute("UPDATE trades SET quality='degraded' WHERE id=?", (tr["id"],))
 
-        # 份额法净值（§6.1）：equity = 期末现金 + 期末持仓×官方收盘价
-        equity = cash
+        # 份额法净值（§6.1）：equity = 期末现金(分位) + 期末持仓×官方收盘价
+        final_cash = cash.quantize(_MONEY, ROUND_HALF_UP)
+        equity = final_cash
         for symbol, qty in held_qty.items():
             equity += qty * require_close(symbol)
         init_hold_value = Decimal("0")               # 期初持仓按前收估值
@@ -564,8 +744,11 @@ def settle_account(
                 raise EngineError(f"期初持仓 {row['symbol']} 缺少 prev_close——禁止虚构估值价")
             init_hold_value += q * prev[row["symbol"]]
         start_equity = cash_start + init_hold_value
-        final_cash = cash.quantize(_MONEY, ROUND_HALF_UP)
         nav = (equity / shares).quantize(_COST, ROUND_HALF_UP)
+        # 对账自检（§6.5 双守恒，D1=A）：任一不平 → 抛错 → 整事务回滚（带病不落账）
+        _audit_conservation(c, account_id, trade_date, cash_start=cash_start,
+                            final_cash=final_cash, equity=equity, shares=shares,
+                            nav=nav, close_map=close_map)
         total_pnl = (equity - initial_capital).quantize(_MONEY, ROUND_HALF_UP)
         today_pnl = (equity - start_equity).quantize(_MONEY, ROUND_HALF_UP)
         c.execute(

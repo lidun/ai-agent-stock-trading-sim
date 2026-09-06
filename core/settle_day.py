@@ -100,14 +100,24 @@ def _held_symbols(state, account_id: str) -> list[str]:
 
 
 def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: str):
-    """按票取档。返回 (l1_map, close_map, prev_close_map)；缺口抛 quote/eodengine 异常。"""
+    """按票取档：分钟可得→L1，历史日/分钟缺口→L2 日线区间近似；均缺→抛异常。"""
     l1_map: dict = {}
+    l2_map: dict = {}
     close_map: dict = {}
     prev_close_map: dict = {}
     order_syms = sorted({o["symbol"] for o in orders})
     held_set = set(held_symbols)
     for sym in order_syms:
-        fd = feed.replay_day(sym, trade_date)
+        try:
+            fd = feed.replay_day(sym, trade_date)
+        except (quotes_tencent.QuoteGapError, quotes_tencent.QuoteSourceError) as exc:
+            fd2 = feed.replay_l2(sym, trade_date)
+            if fd2.get("level") != "l2" or "high" not in fd2 or "low" not in fd2:
+                raise quotes_tencent.QuoteGapError(f"{sym} {trade_date} L2 档不可用") from exc
+            l2_map[sym] = {"high": fd2["high"], "low": fd2["low"]}
+            close_map[sym] = float(fd2["official_close"])
+            prev_close_map[sym] = float(fd2["prev_close"])
+            continue
         if fd.get("level") != "l1" or not fd.get("bars"):
             raise eodengine.EngineGapError(f"{sym} {trade_date} 无可判定档位供给")
         l1_map[sym] = fd["bars"]
@@ -117,7 +127,7 @@ def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: 
         pair = feed.daily_pair(sym, trade_date)
         close_map[sym] = float(pair["official_close"])
         prev_close_map[sym] = float(pair["prev_close"])
-    return l1_map, close_map, prev_close_map
+    return l1_map, l2_map, close_map, prev_close_map
 
 
 def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
@@ -132,7 +142,7 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
                             "reason": "当日无订单且无持仓"})
             continue
         try:
-            l1_map, close_map, prev_close_map = _build_feeds(
+            l1_map, l2_map, close_map, prev_close_map = _build_feeds(
                 feed, orders, held, trade_date
             )
         except (eodengine.EngineError, eodengine.EngineGapError,
@@ -143,7 +153,8 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
         try:
             outcome = eodengine.settle_account(
                 state, aid, trade_date,
-                l1_map=l1_map, close_map=close_map, prev_close_map=prev_close_map,
+                l1_map=l1_map, l2_map=l2_map,
+                close_map=close_map, prev_close_map=prev_close_map,
             )
         except (eodengine.EngineError, eodengine.EngineGapError) as exc:
             results.append({"account_id": aid, "error": True, "reason": str(exc)})
