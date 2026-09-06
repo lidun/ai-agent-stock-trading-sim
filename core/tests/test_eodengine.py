@@ -941,3 +941,87 @@ def test_eod_open_board_requires_l0_invalid(authed_client, feed):
     assert row["status"] == "invalid"
     assert row["invalid_reason"] == "basis_requires_l0"
     assert row["settled_on"] == "2026-09-08"
+
+
+def test_eod_time_l0_buy_fills_at_clock(authed_client):
+    """L0 定时买入：到 at 时刻首个采样点成交（此前采样点不成交）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-t0", order_type="time", direction="buy", qty=100,
+                  trigger={"kind": "time", "at": "14:50"}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T14:49:00", 10.00),
+                               ("2026-09-08T14:50:00", 10.50),
+                               ("2026-09-08T14:51:00", 10.60)]},
+        close_map={"600000": 10.50},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-t0'")
+    assert len(tr) == 1
+    assert abs(float(tr[0]["price"]) - 10.50) < 1e-9
+    assert tr[0]["trade_time"] == "2026-09-08T14:50:00" and tr[0]["basis_used"] == "l0"
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-t0'")[0]["status"] == "filled"
+
+
+def test_eod_time_created_after_at_expires(authed_client):
+    """created_at 晚于 at → 防前视不触发，today 单 expired。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-t1", order_type="time", direction="buy", qty=100,
+                  trigger={"kind": "time", "at": "14:50"}, created="2026-09-08T14:55:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T14:50:00", 10.00),
+                               ("2026-09-08T14:55:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-t1'")[0]["status"] == "expired"
+    assert not _fetch(st, "SELECT * FROM trades WHERE order_id='co-t1'")
+
+
+def test_eod_time_l1_sell_at_minute_close(authed_client):
+    """L1 定时卖出：at 整分钟按该分钟收盘价成交（不需价格触发穿越）。"""
+    st = authed_client.app.state
+    _buy_then(st)
+    _insert_order(st, order_id="co-t2", order_type="time", direction="sell", qty=100,
+                  trigger={"kind": "time", "at": "14:50"}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l1_map={"600000": [("2026-09-08T14:49:00", 10.0, 10.2, 9.9, 10.1),
+                           ("2026-09-08T14:50:00", 10.5, 10.7, 10.4, 10.6)]},
+        close_map={"600000": 10.6},
+        prev_close_map={"600000": 10.1},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-t2'")
+    assert len(tr) == 1
+    assert abs(float(tr[0]["price"]) - 10.6) < 1e-9
+    assert tr[0]["trade_time"] == "2026-09-08T14:50:00" and tr[0]["basis_used"] == "l1"
+    assert not _fetch(st, "SELECT 1 FROM holdings WHERE account_id=? AND symbol='600000'", (DEMO,))
+
+
+def test_eod_time_l2_buy_at_official_close(authed_client):
+    """L2 日线近似档定时买入：按官方收盘价成交（无日内分钟）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-t3", order_type="time", direction="buy", qty=100,
+                  trigger={"kind": "time", "at": "14:50"}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        l2_map={"600000": {"high": 11.0, "low": 10.1}},
+        close_map={"600000": 10.45},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-t3'")
+    assert len(tr) == 1
+    assert abs(float(tr[0]["price"]) - 10.45) < 1e-9
+    assert tr[0]["basis_used"] == "l2"
+
+
+def test_eod_time_malformed_trigger_invalid(authed_client):
+    """at 非法/kind 不符 → 定时单 invalid（trigger_schema）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-t4", order_type="time", direction="buy", qty=100,
+                  trigger={"kind": "time", "at": "2500"}, created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T14:50:00", 10.00)]},
+        close_map={"600000": 10.00},
+    )
+    row = _fetch(st, "SELECT status, invalid_reason FROM condition_orders WHERE id='co-t4'")[0]
+    assert row["status"] == "invalid" and row["invalid_reason"] == "trigger_schema"

@@ -160,3 +160,21 @@ def test_pct_vscost_trigger_canonical_and_rejects(authed_client):
         with pytest.raises(orderstore.OrderError):
             orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
                                    qty=100, trigger=bad, price_type="market")
+
+
+def test_time_order_canonical_and_rejects(authed_client):
+    """time 定时单规范化与非法 at/price_type 拒单。"""
+    st = authed_client.app.state
+    from core.orderstore import OrderError, place_order
+    r = place_order(st, account_id=DEMO, creator="agent-demo-001",
+                    order_type="time", direction="buy", symbol="600000", qty=100,
+                    trigger={"kind": "time", "at": "14:50"}, price_type="market")
+    assert r["order_type"] == "time" and r["status"] == "active"
+    with pytest.raises(OrderError, match="HH:MM"):
+        place_order(st, account_id=DEMO, creator="agent-demo-001",
+                    order_type="time", direction="buy", symbol="600000", qty=100,
+                    trigger={"kind": "time", "at": "4:50pm"})
+    with pytest.raises(OrderError, match="price_type=market"):
+        place_order(st, account_id=DEMO, creator="agent-demo-001",
+                    order_type="time", direction="buy", symbol="600000", qty=100,
+                    trigger={"kind": "time", "at": "14:50"}, price_type="limit")

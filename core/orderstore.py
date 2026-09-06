@@ -48,7 +48,7 @@ def qty_rule_ok(symbol: str, qty: int) -> bool:
 
 
 _PRICE_KIND_OP = {"price_le": "le", "price_ge": "ge"}
-_UNIMPL_KINDS = {"open_board", "seal_confirm", "volume", "time", "and", "or"}
+_UNIMPL_KINDS = {"open_board", "seal_confirm", "volume", "and", "or"}
 
 
 def _parse_pct(trig: dict, *, kind: str) -> float:
@@ -104,6 +104,14 @@ def _canon_trigger(trig: dict, *, order_type: str) -> dict:
                 raise OrderError("kind=vs_cost 需 op(le|ge)")
             pct = _parse_pct(trig, kind=kind)
             return {"kind": kind, "op": op, "pct": pct}
+        if kind == "time":
+            if order_type != "time":
+                raise OrderError("kind=time 仅适用于 time 定时单")
+            at = trig.get("at")
+            if (not isinstance(at, str) or len(at) != 5 or at[2] != ":"
+                    or not at[:2].isdigit() or not at[3:].isdigit()):
+                raise OrderError("kind=time 的 at 须为 HH:MM（如 14:50）")
+            return {"kind": "time", "at": at}
         if kind in _UNIMPL_KINDS:
             raise OrderError(f"trigger kind={kind} 引擎尚未实现——拒绝下单")
         raise OrderError("trigger kind 非法或缺少 price")
@@ -129,6 +137,8 @@ def validate_order_payload(*, symbol: str, order_type: str, direction: str,
         trig = _canon_trigger(trig, order_type=order_type)
     if trig is not None and trig.get("kind") == "trail" and price_type != "market":
         raise OrderError("trail 移动止盈单须 price_type=market")
+    if trig is not None and trig.get("kind") == "time" and price_type != "market":
+        raise OrderError("time 定时单须 price_type=market")
     if price_type == "limit" and trig is None:
         raise OrderError("limit 单必须携带 trigger")
     if qty is None or int(qty) <= 0:

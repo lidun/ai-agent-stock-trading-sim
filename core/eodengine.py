@@ -3,7 +3,7 @@
 范围与边界（本版明确支持；其余拒绝而非静默跳过——宁可报 gap，不可错结）：
 - 账户：granularity=eod_replay 的策略账户；单日结算；settle_key UNIQUE 幂等（§3.1.5/§3.8 单事务）；
 - 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop,
-  sell_trail, sell_open_board}、price_type ∈ {market, limit}、单票触发（trigger 统一 spec-01 §2.4 kind
+  sell_trail, sell_open_board, time}、price_type ∈ {market, limit}、单票触发（trigger 统一 spec-01 §2.4 kind
   语义）——价格类 price_le/price_ge（canonical {"kind","price"}；legacy {"op","price"}
   兼容读取）、涨跌幅类 pct_chg（昨收折算静态触发价，可选 not_limit 未封板）、相对成本类
   vs_cost（可卖持仓成本逐点折算动态触发价，spec-01 §2.4）；
@@ -23,6 +23,9 @@
   回撤基准=持仓期最高价（hist_high_map 提供买入以来至昨日的日线 high 累计最大，取值窗含
   当日）——L0 用当日采样价累计最大、L1 用分钟 high/close 累计最大（退化 quality=degraded）、
   L2 用 max(hist, 当日 high) 单点判定（退化 degraded），成交沿用各档价口径；
+- 定时单（time，spec-01 §2.4/§4.1 时间行，与档无关）：trigger {"kind":"time","at":"HH:MM"}；
+  到点按该档采样价/分钟收盘价成交（L2 日线近似档按官方收盘价），created_at 早于触发时刻才有效
+  （#38），一次性判定——资金/可卖不足记 insufficient 后当日不再复判、today 单到期 expired；
 - 档位：L0（series_map 采样点序列，触达采样点价成交）、L1（l1_map 分钟序列，spec-01 §3.3——
   相邻分钟确认触达、按条件价 X 成交、15:00 收盘分钟按保守口径 max/min(X, 官方收盘价) 并标
   close_minute_fill）与 L2（l2_map 当日 high/low 区间触达 + 官方收盘价成交，spec-01 §3.3，
@@ -38,8 +41,8 @@
 - 时间契约：交易日本地墙钟 naive ISO；order 仅在其 created_at 之后的采样点参与判定（防前视 #38）；
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
-未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/定时/封板确认事件类
-（seal_confirm，需盘口/封单数据）、volume 量能类、signal_registry/exit_trackings、公司行动。
+未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/封板确认事件类（seal_confirm，
+需盘口/封单数据）、volume 量能类、signal_registry/exit_trackings、公司行动。
 """
 from __future__ import annotations
 
@@ -54,7 +57,7 @@ from core.db import state_conn, write_txn
 log = logging.getLogger(__name__)
 
 SUPPORTED_ORDER_TYPES = {"buy", "sell_take_profit", "sell_stop", "sell_trail",
-                           "sell_open_board"}
+                           "sell_open_board", "time"}
 
 _MONEY = Decimal("0.01")
 _COST = Decimal("0.0001")
@@ -213,6 +216,21 @@ def _limit_px(prev_close: Decimal, board: str) -> tuple[Decimal, Decimal]:
     up = (prev_close * (Decimal("1") + r)).quantize(_MONEY, ROUND_HALF_UP)
     down = (prev_close * (Decimal("1") - r)).quantize(_MONEY, ROUND_HALF_UP)
     return up, down
+
+
+def _time_at(o: dict) -> str:
+    """time 单 trigger（{"kind":"time","at":"HH:MM"}）解析；非法 → ValueError。"""
+    try:
+        trig = json.loads(o["trigger"] or "{}")
+    except ValueError as exc:
+        raise ValueError(f"time 触发器 JSON 非法: {exc}") from exc
+    if trig.get("kind") != "time":
+        raise ValueError("time 单 trigger.kind 须为 time")
+    at = trig.get("at")
+    if (not isinstance(at, str) or len(at) != 5 or at[2] != ":"
+            or not at[:2].isdigit() or not at[3:].isdigit()):
+        raise ValueError("time.at 须为 HH:MM（如 14:50）")
+    return at
 
 
 def _qty_ok(symbol: str, qty: int) -> bool:
@@ -439,9 +457,9 @@ def settle_account(
         cash = cash_start
         initial_capital = _D(acct["initial_capital"])
 
-        # 开盘前静态校验：买入数量规则 → invalid（qty_rule，§3.7）
+        # ---- 开盘前静态校验：买入数量规则 → invalid（qty_rule，§3.7）----
         for o in active:
-            if not o["order_type"].startswith("sell"):
+            if o["direction"] == "buy":
                 try:
                     qty = int(Decimal(str(o["qty"])))
                 except Exception as exc:
@@ -578,6 +596,36 @@ def settle_account(
                 del held_qty[o["symbol"]]
             runtime[oid]["final"] = "filled"
 
+        def buy_fill(o: dict, qty: int, p: Decimal, ts: str, *, oid: str) -> None:
+            """买入撮合公共路径（L0/定时共用）：资金校验、费用、持仓/lot 落账与摊薄。"""
+            nonlocal cash
+            amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
+            fz = _fees(amount, side="buy", fee=f)
+            if cash < amount + fz["total"]:      # 资金不足：记事件继续（§2.3）
+                runtime[oid]["ins"] += 1
+                return
+            cash -= amount + fz["total"]
+            tid = write_trade(o, "buy", qty, p, ts, fz)
+            hid = holding(o["symbol"], Decimal(qty), cost_basis=None)
+            amt_with_fee = amount + fz["total"]
+            cur = c.execute("SELECT quantity FROM holdings WHERE id=?", (hid,)).fetchone()
+            avg = (amt_with_fee / _D(cur["quantity"])).quantize(_COST, ROUND_HALF_UP)
+            c.execute("UPDATE holdings SET avg_cost=? WHERE id=?", (_q(avg), hid))
+            c.execute(
+                """
+                INSERT INTO lots(id, account_id, holding_id, buy_trade_id, buy_date,
+                    buy_price, quantity, remaining, strategy_version_no, corp_action_flags)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "l" + secrets.token_hex(10), account_id, hid, tid, trade_date,
+                    _q(p.quantize(_COST, ROUND_HALF_UP)), qty, qty,
+                    o["strategy_version_no"] or version_no, "[]",
+                ),
+            )
+            held_qty[o["symbol"]] = held_qty.get(o["symbol"], Decimal("0")) + qty
+            runtime[oid]["final"] = "filled"
+
         # ---- L0 逐票回放（§3.2）----
         for symbol in sorted({o["symbol"] for o in active}):
             if feed_kind(symbol) != "l0":
@@ -588,7 +636,7 @@ def settle_account(
                     continue
                 oid = o["id"]
                 mode = op = trig = trail_drop = ref_high = pct = not_limit = None
-                if o["order_type"] != "sell_open_board":
+                if o["order_type"] not in ("sell_open_board", "time"):
                     try:
                         mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
                             o, hist_high, prev
@@ -596,6 +644,13 @@ def settle_account(
                     except EngineGapError:
                         raise
                     except (json.JSONDecodeError, EngineError):
+                        runtime[oid]["final"] = "invalid"
+                        continue
+                at = None
+                if o["order_type"] == "time":
+                    try:
+                        at = _time_at(o)
+                    except ValueError:
                         runtime[oid]["final"] = "invalid"
                         continue
                 qty = int(Decimal(str(o["qty"])))
@@ -618,6 +673,14 @@ def settle_account(
                         if runtime[oid]["final"] == "filled":
                             break
                         continue
+                    if o["order_type"] == "time":
+                        if ts[11:16] < at:
+                            continue
+                        if o["direction"] == "buy":
+                            buy_fill(o, qty, p, ts, oid=oid)
+                        else:
+                            sell_fill(o, qty, p, ts, oid=oid)
+                        break                        # 定时单一次性判定（资金/可卖不足亦不复判）
                     if mode == "trail":
                         ref_high = max(ref_high, p)
                         if ref_high <= 0 or p > ref_high * (_D("100") - trail_drop) / _D("100"):
@@ -642,36 +705,10 @@ def settle_account(
                     if lim is not None and p == (lim[0] if o["order_type"] == "buy" else lim[1]):
                         continue                    # 涨停封死买不成交 / 跌停封死卖不成交（§3.5）
                     if o["order_type"] == "buy":
-                        amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
-                        fz = _fees(amount, side="buy", fee=f)
-                        if cash < amount + fz["total"]:      # 资金不足：记事件继续（§2.3）
-                            runtime[oid]["ins"] += 1
-                            continue
-                        cash -= amount + fz["total"]
-                        tid = write_trade(o, "buy", qty, p, ts, fz)
-                        hid = holding(o["symbol"], Decimal(qty), cost_basis=None)
-                        # 摊薄 avg_cost（含费，§2.2 口径）
-                        amt_with_fee = amount + fz["total"]
-                        cur = c.execute(
-                            "SELECT quantity FROM holdings WHERE id=?", (hid,)
-                        ).fetchone()
-                        avg = (amt_with_fee / _D(cur["quantity"])).quantize(_COST, ROUND_HALF_UP)
-                        c.execute("UPDATE holdings SET avg_cost=? WHERE id=?", (_q(avg), hid))
-                        c.execute(
-                            """
-                            INSERT INTO lots(id, account_id, holding_id, buy_trade_id, buy_date,
-                                buy_price, quantity, remaining, strategy_version_no, corp_action_flags)
-                            VALUES (?,?,?,?,?,?,?,?,?,?)
-                            """,
-                            (
-                                "l" + secrets.token_hex(10), account_id, hid, tid, trade_date,
-                                _q(p.quantize(_COST, ROUND_HALF_UP)), qty, qty,
-                                o["strategy_version_no"] or version_no, "[]",
-                            ),
-                        )
-                        held_qty[o["symbol"]] = held_qty.get(o["symbol"], Decimal("0")) + qty
-                        runtime[oid]["final"] = "filled"
-                        break
+                        buy_fill(o, qty, p, ts, oid=oid)
+                        if runtime[oid]["final"] == "filled":
+                            break
+                        continue
                     else:
                         sell_fill(o, qty, p, ts, oid=oid)
                         if runtime[oid]["final"] == "filled":
@@ -687,16 +724,25 @@ def settle_account(
                 if o["symbol"] != symbol or o["status"] != "active":
                     continue
                 oid = o["id"]
-                try:
-                    mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
-                        o, hist_high, prev
-                    )
-                except EngineGapError:
-                    raise
-                except (json.JSONDecodeError, EngineError):
-                    runtime[oid]["final"] = "invalid"
-                    continue
-                if mode not in ("trail", "cost") and trig is None:
+                mode = op = trig = trail_drop = ref_high = pct = not_limit = None
+                if o["order_type"] not in ("sell_open_board", "time"):
+                    try:
+                        mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
+                            o, hist_high, prev
+                        )
+                    except EngineGapError:
+                        raise
+                    except (json.JSONDecodeError, EngineError):
+                        runtime[oid]["final"] = "invalid"
+                        continue
+                at = None
+                if o["order_type"] == "time":
+                    try:
+                        at = _time_at(o)
+                    except ValueError:
+                        runtime[oid]["final"] = "invalid"
+                        continue
+                if mode not in ("trail", "cost") and trig is None and at is None:
                     raise EngineGapError(
                         f"order {o['id']} L1 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
@@ -706,6 +752,17 @@ def settle_account(
                 prev_failed = False            # 上一根触达分钟资金/可卖不足（可复判 §2.3）
                 seen_after = False             # 是否已越过 created_at（首根可判分钟不要求“穿越”）
                 for ts, bopen, bhigh, blow, bclose in bars:
+                    if o["order_type"] == "time":
+                        if o["created_at"] and o["created_at"] >= ts:
+                            continue                      # #38 防前视
+                        if ts[11:16] < at:
+                            continue
+                        p = bclose if bclose is not None else Decimal("0")
+                        if o["direction"] == "buy":
+                            buy_fill(o, qty, p, ts, oid=oid)
+                        else:
+                            sell_fill(o, qty, p, ts, oid=oid)
+                        break                            # 定时单一次性判定（同 L0 口径）
                     if mode == "trail":
                         high_px = bhigh if bhigh is not None else bclose
                         if high_px is not None and high_px > ref_high:
@@ -863,16 +920,25 @@ def settle_account(
                 if o["symbol"] != symbol or o["status"] != "active":
                     continue
                 oid = o["id"]
-                try:
-                    mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
-                        o, hist_high, prev
-                    )
-                except EngineGapError:
-                    raise
-                except (json.JSONDecodeError, EngineError):
-                    runtime[oid]["final"] = "invalid"
-                    continue
-                if mode not in ("trail", "cost") and trig is None:
+                mode = op = trig = trail_drop = ref_high = pct = not_limit = None
+                if o["order_type"] not in ("sell_open_board", "time"):
+                    try:
+                        mode, op, trig, trail_drop, ref_high, pct, not_limit = _order_rule(
+                            o, hist_high, prev
+                        )
+                    except EngineGapError:
+                        raise
+                    except (json.JSONDecodeError, EngineError):
+                        runtime[oid]["final"] = "invalid"
+                        continue
+                at = None
+                if o["order_type"] == "time":
+                    try:
+                        at = _time_at(o)
+                    except ValueError:
+                        runtime[oid]["final"] = "invalid"
+                        continue
+                if mode not in ("trail", "cost") and trig is None and at is None:
                     raise EngineGapError(
                         f"order {o['id']} L2 档 price_type=market 无价单属未定义语义（§3.3）"
                     )
@@ -880,6 +946,14 @@ def settle_account(
                 lim = lock_limits(o["symbol"])
                 if o["created_at"] and o["created_at"] >= close_ts:
                     continue                      # 收盘后创建的 order 不参与当日判定（#38）
+                if o["order_type"] == "time":
+                    # L2 为日线近似档：无日内分钟 → 定时单按官方收盘价成交近似（§4.1 时间行）
+                    p = require_close(symbol)
+                    if o["direction"] == "buy":
+                        buy_fill(o, qty, p, close_ts, oid=oid)
+                    else:
+                        sell_fill(o, qty, p, close_ts, oid=oid)
+                    continue
                 trail_quality = ""
                 if mode == "trail":
                     # spec-01 §3.3 L2 移动止盈：触达 = 当日 low ≤ 参考高点×(1−drop_pct)，
