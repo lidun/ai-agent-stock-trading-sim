@@ -1145,3 +1145,68 @@ def test_eod_partial_sell_zero_lot_leaves_remaining(authed_client):
     assert lot["remaining"] == 50
     h = _fetch(st, "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'", (DEMO,))[0]
     assert h["quantity"] == 50
+
+
+def _buy_holding(st, *, day="2026-09-01", order_id="co-fz-base", px=10.0):
+    _insert_order(st, order_id=order_id, order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.5}, created=f"{day}T09:00:00", validity="long")
+    eodengine.settle_account(
+        st, DEMO, day,
+        series_map={"600000": [(f"{day}T09:31:00", px)]},
+        close_map={"600000": px},
+    )
+
+
+def test_eod_circuit_freeze_blocks_buys_keeps_active_then_resumes(authed_client):
+    """熔断日买入冻结（§7 D5）：买入不成交/不推进/标事件，卖出照常；多日冻结逐日计数；解冻恢复。"""
+    st = authed_client.app.state
+    _buy_holding(st)                                    # 09-01 建仓 100 股（供保护性卖出）
+    # 09-07 熔断日：保护性卖单 + 长期买入单 + 当日买入单
+    _insert_order(st, order_id="co-fz-sell", order_type="sell_take_profit", direction="sell",
+                  qty=100, trigger={"op": "ge", "price": 9.0}, created="2026-09-07T09:00:00")
+    _insert_order(st, order_id="co-fz2", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.5}, created="2026-09-07T09:00:00", validity="long")
+    _insert_order(st, order_id="co-fz3", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.5}, created="2026-09-07T09:00:00")
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 9.5)]},
+        close_map={"600000": 9.5},
+        prev_close_map={"600000": 10.0},
+        circuit_freeze=True,
+    )
+    assert r["circuit_blocked"] == 2                    # co-fz2 + co-fz3 被冻结
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-fz-sell'")[0]["side"] == "sell"
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-fz2'") == []
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-fz3'") == []
+    o2 = _fetch(st, "SELECT status, circuit_break_events, insufficient_events, invalid_reason"
+                    " FROM condition_orders WHERE id='co-fz2'")[0]
+    assert o2["status"] == "active" and o2["circuit_break_events"] == 1
+    assert o2["insufficient_events"] == 0 and o2["invalid_reason"] == ""
+    o3 = _fetch(st, "SELECT status, circuit_break_events FROM condition_orders WHERE id='co-fz3'")[0]
+    assert o3["status"] == "expired" and o3["circuit_break_events"] == 1   # today 单窗口已过照常到期
+    aud = _fetch(st, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='trade.circuit_break'"
+                     " AND object_id IN ('co-fz2','co-fz3')")[0]["n"]
+    assert aud == 2
+    # 次日仍熔断：long 单不推进，事件再计一次
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 9.5)]},
+        close_map={"600000": 9.5},
+        prev_close_map={"600000": 9.5},
+        circuit_freeze=True,
+    )
+    o2 = _fetch(st, "SELECT status, circuit_break_events FROM condition_orders WHERE id='co-fz2'")[0]
+    assert o2["status"] == "active" and o2["circuit_break_events"] == 2
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-fz2'") == []
+    # 解冻日：挂单恢复参与 → 条件触达成交，事件计数保留
+    eodengine.settle_account(
+        st, DEMO, "2026-09-09",
+        series_map={"600000": [("2026-09-09T09:31:00", 9.5)]},
+        close_map={"600000": 9.5},
+        prev_close_map={"600000": 9.5},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-fz2'")
+    assert len(tr) == 1 and tr[0]["side"] == "buy"
+    o2 = _fetch(st, "SELECT status, circuit_break_events FROM condition_orders WHERE id='co-fz2'")[0]
+    assert o2["status"] == "filled" and o2["circuit_break_events"] == 2

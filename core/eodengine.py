@@ -48,6 +48,13 @@
 卖出跟踪（§8.1）引擎侧已实现：卖出成交自动登记 exit_trackings；跟踪推进与结清由
 settle_exits 在结算日调用（N=10 交易日结清，确定性/零 token，停牌缺价→最近可得价 stale
 结清标注，不虚构价）。signal_registry 的卖出登记语义在 §8.1 内以 exit_trackings 承载。
+
+熔断日买入冻结（§7 D5）引擎侧语义：settle_account 收 circuit_freeze=True 表示该账户当日
+处于熔断——当日买入类单（direction=buy）整日跳过判定：不成交、不推进、不触发 invalid/
+insufficient（保持 active），每冻结交易日标一次 circuit_break_events 并 audit 留痕；已有
+挂单不撤单；卖出类单照常判定/成交；当日结算照常执行。today 单仍按既有日终口径 expired
+（当日窗口已过），long/until 单保持 active 待解冻日恢复参与。软风控的状态来源/审批复位
+属策略侧（spec-05/管理 Agent），引擎只消费确定性日级开关。
 """
 from __future__ import annotations
 
@@ -445,6 +452,7 @@ def settle_account(
     hist_high_map: dict[str, float] | None = None,
     board_map: dict[str, str] | None = None,
     restrict_map: dict[str, str] | None = None,
+    circuit_freeze: bool = False,
     fee: dict | None = None,
     exit_market: dict[str, dict] | None = None,
 ) -> dict:
@@ -466,6 +474,8 @@ def settle_account(
     exit_market[sym] = {"close": float, "high": float, "low": float}：卖出登记时缓存当日基准
     指数（key=EXIT_BENCH_SYMBOL，沪深300）与个股官方收盘（用于卖出价偏差侧极端计），仅登记
     期用；每日跟踪推进由 settle_exits 单独调用（见模块 doc §8.1）。
+    circuit_freeze：账户当日熔断开关（spec-01 §7 D5）——True 时买入类单整日冻结（语义见模块
+    doc）；卖出类单不受影响；默认 False（无熔断状态，引擎行为与既有版本一致）。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -672,8 +682,27 @@ def settle_account(
             )
             return tid
 
-        # 内存运行态：insufficient 计数 / 终态（写盘集中在事务收尾）
-        runtime = {o["id"]: {"ins": o["insufficient_events"], "final": "active"} for o in active}
+        # 内存运行态：insufficient / circuit_break 计数 / 终态（写盘集中在事务收尾）
+        runtime = {o["id"]: {"ins": o["insufficient_events"],
+                             "cct": o.get("circuit_break_events", 0),
+                             "final": "active"} for o in active}
+
+        # 熔断日买入冻结（§7 D5）：当日买入类单整日跳过判定——不成交、不推进、不触发
+        # invalid/insufficient（保持 active），每冻结交易日计一次 circuit_break 事件并审计。
+        frozen_buys: dict[str, dict] = {}
+        if circuit_freeze:
+            for o in active:
+                if o["direction"] == "buy" and o["status"] == "active":
+                    oid = o["id"]
+                    runtime[oid]["cct"] += 1
+                    frozen_buys[oid] = o
+                    c.execute(
+                        "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+                        " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+                        (_now(), account_id, "trade.circuit_break", "condition_order", oid,
+                         "blocked", f"{trade_date} 熔断冻结买入单 {oid} {o['symbol']}（不成交不推进）", ""),
+                    )
+
         ever_pinned: dict[str, bool] = {}
 
         def register_exit(o: dict, tid: str, qty: int, price: Decimal) -> None:
@@ -794,7 +823,7 @@ def settle_account(
                 continue
             ser = series_map[symbol]
             for o in active:
-                if o["symbol"] != symbol or o["status"] != "active":
+                if o["symbol"] != symbol or o["status"] != "active" or o["id"] in frozen_buys:
                     continue
                 oid = o["id"]
                 mode = op = trig = trail_drop = ref_high = pct = not_limit = None
@@ -883,7 +912,7 @@ def settle_account(
                 continue
             bars = l1_map[symbol]
             for o in active:
-                if o["symbol"] != symbol or o["status"] != "active":
+                if o["symbol"] != symbol or o["status"] != "active" or o["id"] in frozen_buys:
                     continue
                 oid = o["id"]
                 mode = op = trig = trail_drop = ref_high = pct = not_limit = None
@@ -1079,7 +1108,7 @@ def settle_account(
             lo = _D(l2_map[symbol]["low"])
             close_ts = f"{trade_date}T15:00:00"
             for o in active:
-                if o["symbol"] != symbol or o["status"] != "active":
+                if o["symbol"] != symbol or o["status"] != "active" or o["id"] in frozen_buys:
                     continue
                 oid = o["id"]
                 mode = op = trig = trail_drop = ref_high = pct = not_limit = None
@@ -1228,11 +1257,19 @@ def settle_account(
                     runtime[oid]["final"] = "filled"
                     register_exit(o, tid, qty, p)
 
+        # 熔断事件计数先于状态收尾落盘（跨日 long/until 单不经过“本日单”收尾，需独立持久化）
+        for o in active:
+            st = runtime[o["id"]]
+            if st["cct"] != o.get("circuit_break_events", 0):
+                c.execute(
+                    "UPDATE condition_orders SET circuit_break_events=? WHERE id=?",
+                    (st["cct"], o["id"]),
+                )
+
         # 写盘条件单运行态 + today 单未成交 → expired（§3.2 步4）
         for o in active:
             st = runtime[o["id"]]
-            if o["created_at"] and not o["created_at"].startswith(trade_date):
-                continue      # 非本日单（跨日 long / 未来单）：不属本日结算处理范围（#38 语义）
+            is_today = not o["created_at"] or o["created_at"].startswith(trade_date)
             if o["status"] == "invalid":          # 开盘前静态校验（qty_rule）
                 c.execute(
                     "UPDATE condition_orders SET status='invalid', invalid_reason=?, settled_on=? WHERE id=?",
@@ -1244,20 +1281,22 @@ def settle_account(
                     "UPDATE condition_orders SET status='invalid', invalid_reason=?, settled_on=? WHERE id=?",
                     ("trigger_schema", trade_date, o["id"]),
                 )
-            else:
-                final = st["final"]
-                if final == "active" and o["validity"] == "today":
-                    final = "expired"
-                if final != "active":
-                    c.execute(
-                        "UPDATE condition_orders SET status=?, settled_on=? WHERE id=?",
-                        (final, trade_date, o["id"]),
-                    )
-                if st["ins"] != o["insufficient_events"]:
-                    c.execute(
-                        "UPDATE condition_orders SET insufficient_events=? WHERE id=?",
-                        (st["ins"], o["id"]),
-                    )
+                continue
+            final = st["final"]
+            if final == "active" and o["validity"] == "today" and is_today:
+                final = "expired"                 # 仅本日单适用 today 到期（§3.2 步4）
+            if final == "active" and not is_today:
+                continue      # 跨日单未发生状态迁移（created 非本日，#38）：不触碰 DB，防陈旧 today 过期
+            if final != "active":
+                c.execute(
+                    "UPDATE condition_orders SET status=?, settled_on=? WHERE id=?",
+                    (final, trade_date, o["id"]),
+                )
+            if st["ins"] != o["insufficient_events"]:
+                c.execute(
+                    "UPDATE condition_orders SET insufficient_events=? WHERE id=?",
+                    (st["ins"], o["id"]),
+                )
 
         # 收盘价对齐 → degraded（§3.2 步3 / §8.5；已有质量标记不覆盖）
         trs = c.execute(
@@ -1311,6 +1350,7 @@ def settle_account(
             "nav": _q(nav),
             "total_pnl": _q(total_pnl),
             "today_pnl": _q(today_pnl),
+            "circuit_blocked": len(frozen_buys),
         }
         log.info("settle %s %s -> %s", trade_date, account_id, summary["today_pnl"])
         return summary

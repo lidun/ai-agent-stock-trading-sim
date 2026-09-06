@@ -424,6 +424,15 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE exit_trackings ADD COLUMN last_seen TEXT NOT NULL DEFAULT '';
         """,
     ),
+    (
+        10,
+        """
+        -- spec-01 §7 D5 熔断日买入冻结：熔断触发的账户当日买入类单不成交、不推进（保持
+        -- active），每冻结交易日标一次 circuit_break 事件（audit 留痕 + 本列计数供日报
+        -- 数据段，语义同 insufficient_events）；卖出类单照常。解冻后挂单恢复参与。
+        ALTER TABLE condition_orders ADD COLUMN circuit_break_events INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
 ]
 
 
