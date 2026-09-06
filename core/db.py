@@ -207,6 +207,80 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
           FROM agents WHERE role = 'strategy';
         """,
     ),
+    (
+        4,
+        """
+        -- 撮合引擎存储层（spec-01 §2.2 holdings/lots、§2.3 condition_orders）
+        -- 只建结构供引擎写入；本切片不含撮合逻辑，未提供写端点。
+
+        CREATE TABLE IF NOT EXISTS holdings (
+            id          TEXT PRIMARY KEY,
+            account_id  TEXT NOT NULL REFERENCES accounts(id),
+            symbol      TEXT NOT NULL,
+            quantity    REAL NOT NULL DEFAULT 0,
+            avg_cost    REAL NOT NULL DEFAULT 0,   -- 派生只读：真实价含费摊薄成本
+            updated_ts  TEXT NOT NULL,
+            UNIQUE (account_id, symbol)
+        );
+
+        -- lots = T+1 可卖唯一事实源（spec-01 §2.2：卖出可卖数= Σ lots(buy_date<今日).remaining）
+        CREATE TABLE IF NOT EXISTS lots (
+            id                   TEXT PRIMARY KEY,
+            account_id           TEXT NOT NULL REFERENCES accounts(id),
+            holding_id           TEXT NOT NULL REFERENCES holdings(id),
+            buy_trade_id         TEXT NOT NULL DEFAULT '',
+            buy_date             TEXT NOT NULL,
+            buy_price            REAL NOT NULL,
+            quantity             REAL NOT NULL,
+            remaining            REAL NOT NULL,
+            strategy_version_no  TEXT NOT NULL DEFAULT '',
+            corp_action_flags    TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_lots_account_buydate ON lots(account_id, buy_date);
+
+        -- condition_orders：交易意图唯一通道（spec-01 §2.3）
+        CREATE TABLE IF NOT EXISTS condition_orders (
+            id                   TEXT PRIMARY KEY,
+            account_id           TEXT NOT NULL REFERENCES accounts(id),
+            order_type           TEXT NOT NULL
+                                 CHECK (order_type IN ('buy', 'sell_take_profit', 'sell_stop',
+                                                       'sell_trail', 'sell_open_board',
+                                                       'buy_seal_confirm', 'basket', 'time', 'combo')),
+            direction            TEXT NOT NULL CHECK (direction IN ('buy', 'sell')),
+            scope                TEXT NOT NULL DEFAULT 'single'
+                                 CHECK (scope IN ('single', 'basket', 'holding')),
+            symbol               TEXT NOT NULL DEFAULT '',
+            symbols              TEXT NOT NULL DEFAULT '[]',
+            trigger              TEXT NOT NULL DEFAULT '',
+            basis                TEXT NOT NULL DEFAULT 'replay_l0'
+                                 CHECK (basis IN ('replay_l0', 'approx_l2', 'intraday')),
+            price_ref            TEXT NOT NULL DEFAULT 'absolute'
+                                 CHECK (price_ref IN ('absolute', 'pct_change', 'vs_cost')),
+            qty                  REAL,
+            amount               REAL,
+            budget               REAL,
+            price_type           TEXT NOT NULL DEFAULT 'market'
+                                 CHECK (price_type IN ('market', 'limit')),
+            limit_price          REAL,
+            validity             TEXT NOT NULL DEFAULT 'today'
+                                 CHECK (validity IN ('today', 'until', 'long')),
+            valid_until          TEXT NOT NULL DEFAULT '',
+            priority             INTEGER NOT NULL DEFAULT 0,
+            status               TEXT NOT NULL DEFAULT 'active'
+                                 CHECK (status IN ('active', 'partial', 'filled', 'cancelled',
+                                                   'expired', 'invalid')),
+            insufficient_events  INTEGER NOT NULL DEFAULT 0,
+            invalid_reason       TEXT NOT NULL DEFAULT '',
+            strategy_version_no  TEXT NOT NULL DEFAULT '',
+            created_at           TEXT NOT NULL,
+            creator              TEXT NOT NULL,
+            reason               TEXT NOT NULL DEFAULT '',
+            settled_on           TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_co_account_status ON condition_orders(account_id, status);
+        CREATE INDEX IF NOT EXISTS idx_co_account_created ON condition_orders(account_id, created_at);
+        """,
+    ),
 ]
 
 

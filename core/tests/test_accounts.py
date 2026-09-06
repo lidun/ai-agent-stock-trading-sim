@@ -52,3 +52,30 @@ def test_account_list_matches_agents(authed_client):
     ra = authed_client.get("/api/accounts")
     acct_ids = {a["id"] for a in ra.json()["accounts"]}
     assert strategy_ids == acct_ids
+
+
+def test_trade_storage_empty_views(authed_client):
+    """引擎存储层基座：持仓/条件单表就位但引擎尚未写入，返回空态。"""
+    h = authed_client.get(f"/api/accounts/{DEMO}/holdings")
+    assert h.status_code == 200, h.text
+    assert h.json()["account_id"] == DEMO
+    assert h.json()["holdings"] == []
+
+    co = authed_client.get(f"/api/accounts/{DEMO}/condition-orders")
+    assert co.status_code == 200, co.text
+    assert co.json()["account_id"] == DEMO
+    assert co.json()["condition_orders"] == []
+
+
+def test_trade_storage_requires_auth(client):
+    """持仓/条件单视图未登录一律 401。"""
+    for ep in ("holdings", "condition-orders"):
+        assert client.get(f"/api/accounts/{DEMO}/{ep}").status_code == 401
+
+
+def test_trade_storage_scopes_and_auth(client, authed_client):
+    """视图鉴权 + 归属不变式：非策略 Agent/不存在账户一律 404。"""
+    assert authed_client.get(f"/api/accounts/{DEMO}/holdings").status_code == 200
+    for ep in ("holdings", "condition-orders"):
+        assert authed_client.get(f"/api/accounts/{MANAGER}/{ep}").status_code == 404
+        assert authed_client.get(f"/api/accounts/nope/{ep}").status_code == 404

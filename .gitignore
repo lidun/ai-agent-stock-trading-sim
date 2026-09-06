@@ -185,3 +185,4 @@
 **/.ruff_cache/
 core/data/
 
+core/core/
