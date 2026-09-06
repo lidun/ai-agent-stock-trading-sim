@@ -62,7 +62,6 @@ Entries discovered by the Agent during task execution should follow this format:
 - Context: Discovered by Agent while binding 本仓库到 GitHub（用户账号 lidun，原 lidun/test 重命名为 lidun/ai-agent-stock-trading-sim 并清空绑定）
 - Category: Operations & Deployment
 - Instructions:
-  - 本项目 GitHub 远端 origin=https://github.com/lidun/ai-agent-stock-trading-sim.git，默认分支 main；本地分支名 master，推送需 `git push origin HEAD:main`。
+  - 本项目 GitHub 远端 origin=https://github.com/lidun/ai-agent-stock-trading-sim.git，默认分支 main；本地分支名 master，推送需 `git push origin HEAD:main`；按用户约定完成每个开发切片后默认提交并推送。
   - gh 已以账号 lidun 登录（web 设备流，浏览器一次性码授权）；沙箱内置 git 凭据助手对 github.com 会 500，需 `gh auth setup-git` 后推送走 gh 凭据助手。
-  - 历史遗留：远端 pr/smol-dev/zrye5w 分支与 PR #1 仍指向被替换前的旧内容（test 仓库残留），如需干净可删除该分支与 PR。
-  - 仓库为 PUBLIC；若需私有改 `gh repo edit lidun/ai-agent-stock-trading-sim --visibility private`。
+  - 仓库为 PRIVATE（已私有化）；原 test 仓库残留的 PR #1 与 pr/smol-dev/zrye5w 分支已清理（closed，refs/pull/1/head 属正常残留可忽略）。
