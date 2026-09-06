@@ -377,3 +377,33 @@ def test_settle_products_visible_via_api(authed_client):
     assert logs[0]["settle_key"] == "2026-09-07:agent-demo-001"
     assert logs[0]["granularity_used"] == {"600000": "l0"}
     assert logs[0]["status"] == "done"
+
+
+def test_eod_kind_trigger_price_le_fills_like_legacy(authed_client):
+    """spec-01 §2.4 canonical kind 触发（price_le）与 legacy op 等价成交。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-k1", order_type="buy", direction="buy", qty=100,
+                  trigger={"kind": "price_le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.20), ("2026-09-07T09:32:00", 10.00)]},
+        close_map={"600000": 10.90},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-k1'")[0]
+    assert tr["side"] == "buy" and tr["qty"] == 100 and tr["price"] == 10.0
+
+
+def test_eod_kind_trail_trigger_gap_no_write(authed_client):
+    """未实现 kind（trail）命中即 EngineGapError，整事务回滚、零落账（spec-01 §2.4 其余拒绝）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-tr", order_type="sell_trail", direction="sell", qty=100,
+                  trigger={"kind": "trail", "drop_pct": 3}, created="2026-09-07T09:00:00")
+    with pytest.raises(eodengine.EngineGapError):
+        eodengine.settle_account(
+            st, DEMO, "2026-09-07",
+            series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+            close_map={"600000": 10.00},
+        )
+    assert _cash(st) == 100000.0
+    assert not _fetch(st, "SELECT * FROM settlement_log WHERE account_id=?", (DEMO,))
+    assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-tr'")[0]["status"] == "active"

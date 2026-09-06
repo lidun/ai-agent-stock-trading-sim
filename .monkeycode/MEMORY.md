@@ -31,6 +31,12 @@ Entries discovered by the Agent during task execution should follow this format:
 
 ## Entries
 
+[User Instruction Summary]
+- Date: 2026-09-06
+- Context: 完成 trigger kind 规范化切片后，用户说明后续默认提交
+- Instructions:
+  - 完成每个开发切片（改动验证通过后）默认直接提交，无需再逐次询问是否提交；提交信息沿用仓库既有风格。
+
 [Project Knowledge Summary]
 - Date: 2026-09-06
 - Context: Discovered by Agent while implementing 腾讯系行情适配器与 EOD 结算编排（settle_day 切片）

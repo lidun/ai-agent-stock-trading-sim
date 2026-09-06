@@ -70,3 +70,33 @@ def test_demo_order_via_chat_e2e(authed_client):
     assert orders[0]["symbol"] == "600519"
     assert int(float(orders[0]["qty"])) == 100 and orders[0]["status"] == "active"
     assert orders[0]["id"] in reply["body"]
+
+
+def test_trigger_kind_canonical_persisted(authed_client):
+    """spec-01 §2.4 canonical kind 接受且落库统一 kind；legacy op 兼容并规范化存储。"""
+    import json as _json
+
+    from core.db import state_conn  # noqa: PLC0415
+    st = authed_client.app.state
+    o1 = orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                qty=100, trigger={"kind": "price_le", "price": 1500.0},
+                                price_type="limit")
+    o2 = orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                qty=100, trigger={"op": "ge", "price": 1600.0},
+                                price_type="limit")
+    conn = state_conn(st)
+    rows = {r["id"]: r["trigger"] for r in conn.execute(
+        "SELECT id, trigger FROM condition_orders WHERE id IN (?, ?)", (o1["id"], o2["id"]))}
+    assert _json.loads(rows[o1["id"]]) == {"kind": "price_le", "price": 1500.0}
+    assert _json.loads(rows[o2["id"]]) == {"kind": "price_ge", "price": 1600.0}
+
+
+def test_trigger_unimplemented_kind_rejected(authed_client):
+    """未实现 kind（trail/pct_chg 等）与非法 op 均在 orderstore 前置显式拒单。"""
+    st = authed_client.app.state
+    for bad in ({"kind": "trail", "drop_pct": 3},
+                {"kind": "pct_chg", "pct": 2},
+                {"op": "gt", "price": 10.0}):
+        with pytest.raises(orderstore.OrderError):
+            orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                   qty=100, trigger=bad, price_type="limit")

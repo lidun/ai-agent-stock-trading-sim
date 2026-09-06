@@ -47,6 +47,30 @@ def qty_rule_ok(symbol: str, qty: int) -> bool:
     return qty > 0 and qty % 100 == 0
 
 
+_PRICE_KIND_OP = {"price_le": "le", "price_ge": "ge"}
+_UNIMPL_KINDS = {"trail", "pct_chg", "vs_cost", "open_board", "seal_confirm",
+                 "volume", "time", "and", "or"}
+
+
+def _canon_trigger(trig: dict) -> dict:
+    """规范化 trigger → spec-01 §2.4 kind 语义（新单落库统一 canonical）。
+
+    kind 价格类（price_le/price_ge）原样返回；legacy {"op":"le"|"ge","price"} 等价映射；
+    其余 kind 属未实现语义 → 显式 OrderError 拒单（不静默放行）。
+    """
+    kind = trig.get("kind")
+    if kind is not None:
+        if kind in _UNIMPL_KINDS:
+            raise OrderError(f"trigger kind={kind} 引擎尚未实现——拒绝下单")
+        if kind not in _PRICE_KIND_OP or trig.get("price") is None:
+            raise OrderError("trigger kind 非法或缺少 price")
+        return {"kind": kind, "price": trig["price"]}
+    op = trig.get("op")
+    if op not in ("le", "ge") or trig.get("price") is None:
+        raise OrderError("trigger 需含 op(le|ge) 与 price")
+    return {"kind": "price_le" if op == "le" else "price_ge", "price": trig["price"]}
+
+
 def validate_order_payload(*, symbol: str, order_type: str, direction: str,
                            qty, trigger, price_type: str) -> dict:
     if order_type not in VALID_ORDER_TYPES:
@@ -60,9 +84,7 @@ def validate_order_payload(*, symbol: str, order_type: str, direction: str,
     trig: dict | None = None
     if trigger:
         trig = trigger if isinstance(trigger, dict) else json.loads(trigger)
-        op = trig.get("op")
-        if op not in ("le", "ge") or trig.get("price") is None:
-            raise OrderError("trigger 需含 op(le|ge) 与 price")
+        trig = _canon_trigger(trig)
     if price_type == "limit" and trig is None:
         raise OrderError("limit 单必须携带 trigger")
     if qty is None or int(qty) <= 0:

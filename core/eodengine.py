@@ -3,7 +3,8 @@
 范围与边界（本版明确支持；其余拒绝而非静默跳过——宁可报 gap，不可错结）：
 - 账户：granularity=eod_replay 的策略账户；单日结算；settle_key UNIQUE 幂等（§3.1.5/§3.8 单事务）；
 - 条件单：scope=single、basis=replay_l0、order_type ∈ {buy, sell_take_profit, sell_stop}、
-  price_type ∈ {market, limit}、单票价格触发（trigger JSON {"op":"le"|"ge","price":X}）；
+  price_type ∈ {market, limit}、单票价格触发（trigger 统一 spec-01 §2.4 kind 语义，
+  canonical {"kind":"price_le"|"price_ge","price":X}；legacy {"op","price"} 兼容读取）；
 - 档位：L0（series_map 采样点序列，触达采样点价成交）、L1（l1_map 分钟序列，spec-01 §3.3——
   相邻分钟确认触达、按条件价 X 成交、15:00 收盘分钟按保守口径 max/min(X, 官方收盘价) 并标
   close_minute_fill）与 L2（l2_map 当日 high/low 区间触达 + 官方收盘价成交，spec-01 §3.3，
@@ -81,16 +82,41 @@ def _fees(amount: Decimal, *, side: str, fee: dict) -> dict[str, Decimal]:
     }
 
 
+_PRICE_KINDS = {"price_le": "le", "price_ge": "ge"}
+_UNIMPL_KINDS = ("trail", "pct_chg", "vs_cost", "open_board", "seal_confirm",
+                 "volume", "time", "and", "or")
+
+
+def _kind_price(kind: str, raw: dict):
+    """spec-01 §2.4 kind 价格触发 → (op, price)；未实现/非法 kind 显式报错不静默。"""
+    op = _PRICE_KINDS.get(kind)
+    if op is None:
+        if kind in _UNIMPL_KINDS:
+            raise EngineGapError(f"trigger kind={kind} 尚未实现（spec-01 §2.4）")
+        raise EngineError("trigger JSON kind 非法")
+    price = raw.get("price")
+    if price is None:
+        raise EngineError("trigger JSON kind 触发缺少 price")
+    return op, _D(price)
+
+
 def _trigger_price(o: dict):
-    """limit 单解析触发价；market 单恒触发。返回 (op, price)。"""
+    """limit 单解析触发价；market 单恒触发。返回 (op, price)。
+
+    kind 价格类为 spec-01 §2.4 canonical；op/price 为 legacy 兼容（历史落库单）。
+    """
     if o["price_type"] == "market":
         raw = json.loads(o["trigger"]) if o["trigger"] else None
         if not raw:
             return None, None
+        if "kind" in raw:
+            return _kind_price(raw["kind"], raw)
         return raw.get("op") or None, _D(raw.get("price"))
     if not o["trigger"]:
         raise EngineError("limit 单缺少 trigger JSON")
     raw = json.loads(o["trigger"])
+    if "kind" in raw:
+        return _kind_price(raw["kind"], raw)
     op, price = raw.get("op"), raw.get("price")
     if op not in ("le", "ge") or price is None:
         raise EngineError("trigger JSON 需含 op(le|ge) 与 price")
@@ -337,6 +363,8 @@ def settle_account(
                 oid = o["id"]
                 try:
                     op, trig = _trigger_price(o)
+                except EngineGapError:
+                    raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
@@ -449,6 +477,8 @@ def settle_account(
                 oid = o["id"]
                 try:
                     op, trig = _trigger_price(o)
+                except EngineGapError:
+                    raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
@@ -588,6 +618,8 @@ def settle_account(
                 oid = o["id"]
                 try:
                     op, trig = _trigger_price(o)
+                except EngineGapError:
+                    raise
                 except (json.JSONDecodeError, EngineError):
                     runtime[oid]["final"] = "invalid"
                     continue
