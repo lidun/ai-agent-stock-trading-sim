@@ -324,6 +324,49 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_settlelog_account ON settlement_log(account_id, trade_date);
         """,
     ),
+    (
+        6,
+        """
+        -- #63 独立试运行账户：accounts 与 agents 由 1:1（id 同键）放开为 1:N
+        --（account.agent_id → agent；role main/trial/validation 区分用途，parent_agent_id 指父 Agent）。
+        -- 既有主账户迁移：role=main、parent=自身；child 表按 accounts(id) 的 FK 语义不变。
+        -- @disable_fk
+        CREATE TABLE IF NOT EXISTS accounts_v6 (
+            id                  TEXT PRIMARY KEY,
+            agent_id            TEXT NOT NULL REFERENCES agents(id),
+            role                TEXT NOT NULL DEFAULT 'main'
+                                CHECK (role IN ('main', 'trial', 'validation')),
+            parent_agent_id     TEXT NOT NULL DEFAULT '',
+            initial_capital     REAL NOT NULL DEFAULT 100000.0,
+            cash                REAL NOT NULL DEFAULT 100000.0,
+            nav                 REAL NOT NULL DEFAULT 1.0,
+            shares              REAL NOT NULL DEFAULT 100000.0,
+            total_pnl           REAL NOT NULL DEFAULT 0.0,
+            today_pnl           REAL NOT NULL DEFAULT 0.0,
+            granularity         TEXT NOT NULL DEFAULT 'eod_replay'
+                                CHECK (granularity IN ('eod_replay', 'intraday_5m', 'intraday_1m')),
+            granularity_history TEXT NOT NULL DEFAULT '[]',
+            settle_key          TEXT NOT NULL DEFAULT '',
+            status              TEXT NOT NULL DEFAULT 'normal'
+                                CHECK (status IN ('trial', 'normal', 'paused_buy', 'halted', 'archived')),
+            active_version_no   TEXT NOT NULL DEFAULT '',
+            created_ts          TEXT NOT NULL,
+            updated_ts          TEXT NOT NULL
+        );
+
+        INSERT INTO accounts_v6
+            (id, agent_id, role, parent_agent_id, initial_capital, cash, nav, shares,
+             total_pnl, today_pnl, granularity, granularity_history, settle_key, status,
+             active_version_no, created_ts, updated_ts)
+        SELECT id, id, 'main', id, initial_capital, cash, nav, shares,
+               total_pnl, today_pnl, granularity, granularity_history, settle_key, status,
+               active_version_no, created_ts, updated_ts
+          FROM accounts;
+
+        DROP TABLE accounts;
+        ALTER TABLE accounts_v6 RENAME TO accounts;
+        """,
+    ),
 ]
 
 
@@ -343,7 +386,15 @@ def migrate(db_path: Path) -> None:
             if current > 0:
                 _snapshot_before_upgrade(db_path, current)
             # 事务内执行 DDL（sqlite3 executescript 会隐式提交，故显式包 BEGIN/COMMIT）
-            conn.executescript(f"BEGIN;\n{sql}\nCOMMIT;")
+            # @disable_fk 标记：需重建被引用的父表（drop+rename），必须临时关闭外键
+            fk_off = "@disable_fk" in sql
+            if fk_off:
+                conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.executescript(f"BEGIN;\n{sql}\nCOMMIT;")
+            finally:
+                if fk_off:
+                    conn.execute("PRAGMA foreign_keys=ON")
             with write_txn(conn) as c:
                 c.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",

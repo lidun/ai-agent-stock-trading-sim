@@ -192,7 +192,7 @@ def list_settlements(state, account_id: str | None = None, limit: int = 100) -> 
                    s.status, s.created_at, ag.name AS agent_name
               FROM settlement_log s
               LEFT JOIN accounts a ON a.id = s.account_id
-              LEFT JOIN agents ag ON ag.id = s.account_id
+              LEFT JOIN agents ag ON ag.id = a.agent_id
               {where}
              ORDER BY s.trade_date DESC, s.created_at DESC LIMIT ?
             """,

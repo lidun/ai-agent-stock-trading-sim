@@ -42,13 +42,14 @@ def _seed_agent_account(state, agent_id: str):
         c.execute(
             """
             INSERT OR IGNORE INTO accounts
-                (id, initial_capital, cash, nav, shares, total_pnl, today_pnl,
+                (id, agent_id, role, parent_agent_id,
+                 initial_capital, cash, nav, shares, total_pnl, today_pnl,
                  granularity, granularity_history, settle_key, status, active_version_no,
                  created_ts, updated_ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (agent_id, 100000.0, 100000.0, 1.0, 100000.0, 0.0, 0.0,
-             "eod_replay", "[]", "", "normal", "", "", ""),
+            (agent_id, agent_id, "main", agent_id, 100000.0, 100000.0, 1.0, 100000.0,
+             0.0, 0.0, "eod_replay", "[]", "", "normal", "", "", ""),
         )
 
 

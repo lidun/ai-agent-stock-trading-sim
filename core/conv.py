@@ -14,7 +14,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from core import chatstore, engine
+from core import accountstore, chatstore, engine
 from core.auth import audit, get_request_context, require_session
 from core.ws import broadcast
 
@@ -29,6 +29,10 @@ class ConversationCreateIn(BaseModel):
     agent_id: str = Field(min_length=1, max_length=128)
 
 
+class AgentCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+
+
 class MessageSendIn(BaseModel):
     body: str = Field(min_length=1, max_length=20000)
 
@@ -38,6 +42,25 @@ class MessageSendIn(BaseModel):
 @router.get("/agents")
 def agents(request: Request, session: SessionDep):
     return {"agents": chatstore.list_agents(request.app.state)}
+
+
+@router.post("/agents")
+def create_trial_agent(payload: AgentCreateIn, request: Request, session: SessionDep):
+    """开通试运行策略子 Agent：随建主 normal + trial 双账户（spec-01 §2.8 #63）。"""
+    import secrets as _secrets
+
+    agent_id = "agent-" + _secrets.token_hex(6)
+    try:
+        created = accountstore.create_trial_agent(
+            request.app.state, agent_id=agent_id, name=payload.name.strip())
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          "account.trial_agent_create", result="ok",
+          object_type="agent", object_id=agent_id,
+          detail=f"开通试运行子 Agent {payload.name}（main+trial 双账户）",
+          ctx=get_request_context(request))
+    return created
 
 
 # ---------- Conversations ----------

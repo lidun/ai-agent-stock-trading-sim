@@ -99,9 +99,9 @@ def place_order(
     with write_txn(conn) as c:
         row = c.execute(
             """
-            SELECT a.id, a.granularity, a.status AS acct_status, ag.role AS agent_role,
-                   ag.status AS agent_status
-              FROM accounts a JOIN agents ag ON ag.id = a.id
+            SELECT a.id, a.granularity, a.status AS acct_status, a.role AS acct_role,
+                   ag.role AS agent_role, ag.status AS agent_status
+              FROM accounts a JOIN agents ag ON ag.id = a.agent_id
              WHERE a.id = ?
             """,
             (account_id,),
@@ -110,10 +110,16 @@ def place_order(
             raise OrderError("账户不存在（仅策略 Agent 拥有模拟账户）")
         if row["agent_role"] != "strategy":
             raise OrderError("管理 Agent 非交易账户，不能下单")
-        if row["acct_status"] not in ("normal",):
-            raise OrderError(f"账户状态 {row['acct_status']} 不允许下单")
-        if row["agent_status"] not in ("running",):
-            raise OrderError(f"Agent 生命周期 {row['agent_status']} 不允许下单")
+        # 下单资格（#63 双账户）：主账户 normal 由 running Agent 交易；trial 账户
+        # status=trial 由试运行期 Agent 交易（回放期下单）；其余状态组合拒绝
+        allowed = (
+            row["agent_status"] == "running" and row["acct_status"] == "normal"
+        ) or (
+            row["agent_status"] == "trial" and row["acct_status"] == "trial"
+        )
+        if not allowed:
+            raise OrderError(
+                f"账户状态 {row['acct_status']}/{row['agent_status']} 不允许下单")
         oid = "co" + secrets.token_hex(10)
         c.execute(
             """
