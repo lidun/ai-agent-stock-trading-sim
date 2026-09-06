@@ -1210,3 +1210,60 @@ def test_eod_circuit_freeze_blocks_buys_keeps_active_then_resumes(authed_client)
     assert len(tr) == 1 and tr[0]["side"] == "buy"
     o2 = _fetch(st, "SELECT status, circuit_break_events FROM condition_orders WHERE id='co-fz2'")[0]
     assert o2["status"] == "filled" and o2["circuit_break_events"] == 2
+
+
+def test_eod_long_buy_insufficient_keeps_active_then_recheck_next_day(authed_client):
+    """D2 跨日复判：long 买入单资金不足日终保持 active（不 expired/不填），次日价格回落资金
+    满足 → 复判成交（spec-01 §2.3：日终仍不足但 active（long 单）继续跨日）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-ins-xd", order_type="buy", direction="buy", qty=20000,
+                  trigger={"op": "le", "price": 7.5}, created="2026-09-01T09:00:00", validity="long")
+    r = eodengine.settle_account(
+        st, DEMO, "2026-09-01",
+        series_map={"600000": [("2026-09-01T09:31:00", 7.5)]},
+        close_map={"600000": 7.5},
+    )
+    assert r["circuit_blocked"] == 0
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-ins-xd'") == []
+    o = _fetch(st, "SELECT status, insufficient_events, settled_on FROM condition_orders"
+                   " WHERE id='co-ins-xd'")[0]
+    assert o["status"] == "active" and o["insufficient_events"] >= 1 and o["settled_on"] == ""
+    # 次日价格跌至资金可覆盖 → 复判成交（金额 ~4.5×20000=90000 < 余额）
+    eodengine.settle_account(
+        st, DEMO, "2026-09-02",
+        series_map={"600000": [("2026-09-02T09:31:00", 4.5)]},
+        close_map={"600000": 4.5},
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-ins-xd'")
+    assert len(tr) == 1 and tr[0]["side"] == "buy" and abs(float(tr[0]["price"]) - 4.5) < 1e-9
+    o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-ins-xd'")[0]
+    assert o["status"] == "filled" and o["insufficient_events"] >= 1
+
+
+def test_eod_long_sell_t1_insufficient_keeps_active_then_recheck_next_day(authed_client):
+    """T+1 卖出跨日复判：当日买入 lot 当日卖不可卖（insufficient，保持 active），次日 T+1
+    解冻 → 可卖满足复判成交（spec-01 §6.2 / §2.3 可卖不足语义，卖出可零股侧）。"""
+    st = authed_client.app.state
+    _insert_order(st, order_id="co-t1s-b", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.5}, created="2026-09-01T09:00:00", validity="long")
+    _insert_order(st, order_id="co-t1s-s", order_type="sell_stop", direction="sell", qty=100,
+                  trigger={"op": "ge", "price": 9.0}, created="2026-09-01T09:00:00", validity="long")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-01",
+        series_map={"600000": [("2026-09-01T09:31:00", 9.5)]},
+        close_map={"600000": 9.5},
+    )
+    assert _fetch(st, "SELECT * FROM trades WHERE order_id='co-t1s-s'") == []
+    o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-t1s-s'")[0]
+    assert o["status"] == "active" and o["insufficient_events"] >= 1   # T+1：当日新 lot 不可卖
+    # 次日 lot 解冻 → 卖出复判成交
+    eodengine.settle_account(
+        st, DEMO, "2026-09-02",
+        series_map={"600000": [("2026-09-02T09:31:00", 9.5)]},
+        close_map={"600000": 9.5},
+        prev_close_map={"600000": 9.5},        # 期初持仓按前收估值（首日已建仓）
+    )
+    tr = _fetch(st, "SELECT * FROM trades WHERE order_id='co-t1s-s'")
+    assert len(tr) == 1 and tr[0]["side"] == "sell"
+    o = _fetch(st, "SELECT status, insufficient_events FROM condition_orders WHERE id='co-t1s-s'")[0]
+    assert o["status"] == "filled" and o["insufficient_events"] >= 1
