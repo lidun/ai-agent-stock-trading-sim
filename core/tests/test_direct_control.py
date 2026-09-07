@@ -71,6 +71,53 @@ def test_emergency_sell_all_graceful_and_blocked(authed_client):
     authed_client.patch(f"/api/agents/{DEMO}/control", json={"op": "resume"}, headers=csrf_headers(authed_client))
 
 
+def test_freeze_security_gate_and_unfreeze(authed_client):
+    """冻结证券：取消该票 active 买入单、新买入拦截、卖出保留；解除恢复可买。"""
+    st = authed_client.app.state
+    h = csrf_headers(authed_client)
+    # 冻结前挂一笔该票买入单
+    pre = orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                 qty=100, price_type="market", direction="buy",
+                                 reason="冻结前挂单")
+    assert pre["status"] == "active"
+    # 冻结：即时生效并取消挂单
+    fr = authed_client.post(f"/api/agents/{DEMO}/frozen",
+                            json={"symbol": "600519", "reason": "停牌风险冻结"},
+                            headers=h)
+    assert fr.status_code == 200, fr.text
+    assert fr.json()["cancelled_buy_orders"] == 1
+    conn = state_conn(st)
+    assert conn.execute(
+        "SELECT status FROM condition_orders WHERE id=?", (pre["id"],)
+    ).fetchone()["status"] == "cancelled"
+    # 新买入被拦截；卖出保留
+    with pytest.raises(orderstore.OrderError):
+        orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                               qty=100, price_type="market", direction="buy",
+                               reason="冻结期买入应被拒")
+    sell = orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                  qty=100, price_type="market", direction="sell",
+                                  reason="冻结期卖出保留")
+    assert sell["direction"] == "sell"
+    # 清单常驻可见；重复冻结幂等拒绝
+    listed = authed_client.get(f"/api/frozen?agent_id={DEMO}").json()["frozen"]
+    assert [f["symbol"] for f in listed] == ["600519"]
+    dup = authed_client.post(f"/api/agents/{DEMO}/frozen",
+                             json={"symbol": "600519"}, headers=h)
+    assert dup.status_code == 409 and "已处于冻结" in dup.json()["detail"]
+    # 解除 → 恢复可买
+    un = authed_client.delete(f"/api/agents/{DEMO}/frozen/600519", headers=h)
+    assert un.status_code == 200 and un.json()["removed"] == 1
+    ok = orderstore.place_order(st, account_id=DEMO, creator=DEMO, symbol="600519",
+                                qty=100, price_type="market", direction="buy",
+                                reason="解除后恢复买入")
+    assert ok["status"] == "active"
+    # 非策略 Agent 冻结拒绝
+    mgr = authed_client.post(f"/api/agents/{MANAGER}/frozen",
+                             json={"symbol": "600519"}, headers=h)
+    assert mgr.status_code == 409
+
+
 def test_control_guards(authed_client):
     # 管理 Agent 无交易账户
     mgr = authed_client.patch(f"/api/agents/{MANAGER}/control",

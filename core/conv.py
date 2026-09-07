@@ -42,6 +42,11 @@ class ControlIn(BaseModel):
     op: str = Field(pattern="^(pause_buy|halt|resume)$")
 
 
+class FrozenIn(BaseModel):
+    symbol: str = Field(min_length=1, max_length=16)
+    reason: str = Field(default="", max_length=200)
+
+
 class MessageSendIn(BaseModel):
     body: str = Field(min_length=1, max_length=20000)
 
@@ -79,6 +84,49 @@ def trial_progress(agent_id: str, request: Request, session: SessionDep):
     if progress is None:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} 不存在")
     return progress
+
+
+@router.get("/frozen")
+def frozen_list(request: Request, session: SessionDep,
+                agent_id: str | None = None):
+    """冻结证券清单（常驻展示，spec-06 §6.3）。"""
+    return {"frozen": accountstore.list_frozen(request.app.state, agent_id=agent_id)}
+
+
+@router.post("/agents/{agent_id}/frozen")
+def freeze_security(agent_id: str, payload: FrozenIn,
+                    request: Request, session: SessionDep):
+    """冻结证券：单票买入即时冻结（同事务取消该票 active 买入单）。"""
+    try:
+        result = accountstore.freeze_security(
+            request.app.state, agent_id=agent_id, symbol=payload.symbol.strip(),
+            reason=payload.reason, operator=session["session"]["username"])
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          "account.freeze_security", result="ok",
+          object_type="account", object_id=result["account_id"],
+          detail=f"冻结证券 {payload.symbol}：取消该票买入单 {result['cancelled_buy_orders']} 张",
+          ctx=get_request_context(request))
+    return result
+
+
+@router.delete("/agents/{agent_id}/frozen/{symbol}")
+def unfreeze_security(agent_id: str, symbol: str,
+                      request: Request, session: SessionDep):
+    """解除冻结证券：恢复可买。"""
+    try:
+        result = accountstore.unfreeze_security(
+            request.app.state, agent_id=agent_id, symbol=symbol,
+            operator=session["session"]["username"])
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          "account.unfreeze_security", result="ok",
+          object_type="account", object_id=result["agent_id"],
+          detail=f"解除冻结证券 {symbol}",
+          ctx=get_request_context(request))
+    return result
 
 
 @router.patch("/agents/{agent_id}/control")

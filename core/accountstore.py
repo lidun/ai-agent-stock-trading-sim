@@ -8,6 +8,7 @@ trial/validation 账户 parent 指向父 Agent（spec-01 §2.8）。
 from __future__ import annotations
 
 from decimal import ROUND_HALF_UP, Decimal
+from uuid import uuid4
 
 from core.db import read_txn, state_conn, write_txn
 
@@ -219,6 +220,74 @@ def add_trial_session(state, agent_id: str, trade_date: str) -> dict:
                 (agent_id,),
             )
     return trial_replay(state, agent_id)
+
+
+def freeze_security(state, *, agent_id: str, symbol: str,
+                    reason: str = "", operator: str = "user") -> dict:
+    """冻结证券（spec-06 §6.3）：该 Agent 主账户单票冻结买入（保留卖出与风控）。
+
+    冻结即时生效：同事务取消该票全部 active 买入条件单（含冻结前已挂单），卖出单不受影响；
+    解除冻结后恢复可买。重复冻结拒绝（幂等防抖）。
+    """
+    symbol = (symbol or "").strip()
+    if not symbol:
+        raise LookupError("冻结证券须提供 symbol")
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        agent = c.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None:
+            raise LookupError(f"Agent {agent_id} 不存在")
+        if agent["role"] != "strategy":
+            raise LookupError(f"Agent {agent_id} 为非策略 Agent，无交易账户可冻结")
+        main = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='main'", (agent_id,)
+        ).fetchone()
+        if main is None:
+            raise LookupError(f"Agent {agent_id} 无主账户")
+        dup = c.execute(
+            "SELECT 1 FROM frozen_securities WHERE agent_id=? AND symbol=?",
+            (agent_id, symbol)).fetchone()
+        if dup:
+            raise LookupError(f"证券 {symbol} 已处于冻结中（如需变更请先解除）")
+        ts = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+        c.execute(
+            "INSERT INTO frozen_securities (id, agent_id, account_id, symbol, reason,"
+            f" created_by, created_ts) VALUES (?,?,?,?,?,?,{ts})",
+            ("fz" + uuid4().hex, agent_id, main["id"], symbol, reason.strip(), operator),
+        )
+        cancelled = c.execute(
+            "UPDATE condition_orders SET status='cancelled' WHERE account_id=?"
+            " AND symbol=? AND direction='buy' AND status IN ('active','partial')",
+            (main["id"], symbol)).rowcount
+    return {"agent_id": agent_id, "account_id": main["id"], "symbol": symbol,
+            "cancelled_buy_orders": cancelled}
+
+
+def unfreeze_security(state, *, agent_id: str, symbol: str,
+                      operator: str = "user") -> dict:
+    """解除冻结：删除该 Agent 该票冻结记录，恢复可买。审计由路由层落。"""
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        cur = c.execute(
+            "DELETE FROM frozen_securities WHERE agent_id=? AND symbol=?",
+            (agent_id, symbol)).rowcount
+    if not cur:
+        raise LookupError(f"Agent {agent_id} 无 {symbol} 的冻结记录")
+    return {"agent_id": agent_id, "symbol": symbol, "removed": cur}
+
+
+def list_frozen(state, *, agent_id: str | None = None) -> list[dict]:
+    """冻结清单（常驻展示）；agent_id 为空返回全局。"""
+    conn = state_conn(state)
+    with read_txn(conn) as c:
+        sql = ("SELECT id, agent_id, symbol, reason, created_by, created_ts"
+               " FROM frozen_securities")
+        args: tuple = ()
+        if agent_id:
+            sql += " WHERE agent_id=?"
+            args = (agent_id,)
+        sql += " ORDER BY created_ts DESC, symbol"
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
 
 
 def control_agent(state, *, agent_id: str, op: str,

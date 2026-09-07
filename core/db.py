@@ -570,6 +570,25 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON approval_requests(agent_id, type, status);
         """,
     ),
+    (
+        18,
+        """
+        -- 冻结证券（spec-01 直控接口 / spec-06 §6.3）：逐票冻结买入，保留卖出与风控。
+        -- 冻结即时生效：冻结时该 Agent 主账户该票 active 买入单同事务取消；解除后恢复可买。
+        CREATE TABLE IF NOT EXISTS frozen_securities (
+            id         TEXT PRIMARY KEY,
+            agent_id   TEXT NOT NULL REFERENCES agents(id),
+            account_id TEXT NOT NULL REFERENCES accounts(id),
+            symbol     TEXT NOT NULL,
+            reason     TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT 'user',
+            created_ts TEXT NOT NULL,
+            UNIQUE (agent_id, symbol)
+        );
+        CREATE INDEX IF NOT EXISTS idx_frozen_agent_symbol
+            ON frozen_securities(agent_id, symbol);
+        """,
+    ),
 ]
 
 

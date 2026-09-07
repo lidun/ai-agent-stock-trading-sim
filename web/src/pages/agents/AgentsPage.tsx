@@ -12,6 +12,7 @@ import {
   Modal,
   Skeleton,
   Space,
+  Table,
   Tag,
   Tooltip,
   Typography,
@@ -23,6 +24,7 @@ import {
   ClearOutlined,
   CrownOutlined,
   ExperimentOutlined,
+  LockOutlined,
   LoadingOutlined,
   MessageOutlined,
   PauseCircleOutlined,
@@ -32,13 +34,17 @@ import {
 import {
   controlAgent,
   emergencySellAll,
+  freezeSecurity,
   listAccounts,
   listAgents,
   listConversations,
+  listFrozen,
+  unfreezeSecurity,
   type AccountInfo,
   type AgentInfo,
   type ConversationInfo,
   type ControlOp,
+  type FrozenSecurity,
 } from "../../api/endpoints";
 import { useConnection } from "../../connection";
 import { daySeparator, fmtBeijing, fmtBeijingTime } from "../../utils/time";
@@ -171,6 +177,68 @@ export default function AgentsPage() {
   const [clearAgent, setClearAgent] = useState<AgentInfo | null>(null);
   const [clearConfirm, setClearConfirm] = useState("");
   const [clearing, setClearing] = useState(false);
+
+  const [frozenAgent, setFrozenAgent] = useState<AgentInfo | null>(null);
+  const [frozenRows, setFrozenRows] = useState<FrozenSecurity[]>([]);
+  const [frozenLoading, setFrozenLoading] = useState(false);
+  const [frozenSymbol, setFrozenSymbol] = useState("");
+  const [frozenReason, setFrozenReason] = useState("");
+
+  const reloadFrozen = useCallback(async (agentId: string) => {
+    setFrozenLoading(true);
+    try {
+      const r = await listFrozen(agentId);
+      setFrozenRows(r.frozen);
+    } catch (e) {
+      message.error((e as Error).message ?? "加载冻结清单失败");
+    } finally {
+      setFrozenLoading(false);
+    }
+  }, [message]);
+
+  const openFrozen = (agent: AgentInfo) => {
+    setFrozenSymbol("");
+    setFrozenReason("");
+    setFrozenAgent(agent);
+    void reloadFrozen(agent.id);
+  };
+
+  const doFreeze = async () => {
+    const sym = frozenSymbol.trim();
+    if (!frozenAgent || !sym) {
+      message.warning("请填写要冻结的证券代码");
+      return;
+    }
+    try {
+      const r = await freezeSecurity(frozenAgent.id, sym, frozenReason.trim());
+      message.success(`已冻结买入 ${sym}${r.cancelled_buy_orders > 0 ? `，同步取消该票买入单 ${r.cancelled_buy_orders} 张` : ""}`);
+      setFrozenSymbol("");
+      setFrozenReason("");
+      void reloadFrozen(frozenAgent.id);
+      void reload();
+    } catch (e) {
+      message.error((e as Error).message ?? "冻结失败");
+    }
+  };
+
+  const doUnfreeze = (row: FrozenSecurity) => {
+    if (!frozenAgent) return;
+    modal.confirm({
+      title: `解除冻结 ${row.symbol}？`,
+      content: "解除后该 Agent 恢复买入此证券；此前因冻结被取消的单据不会自动重建。",
+      okText: "解除冻结",
+      okButtonProps: { type: "primary" },
+      onOk: async () => {
+        try {
+          await unfreezeSecurity(frozenAgent.id, row.symbol);
+          message.success(`已解除冻结 ${row.symbol}`);
+          void reloadFrozen(frozenAgent.id);
+        } catch (e) {
+          message.error((e as Error).message ?? "解除失败");
+        }
+      },
+    });
+  };
 
   const runControl = (agent: AgentInfo, op: ControlOp) => {
     const meta = {
@@ -308,6 +376,10 @@ export default function AgentsPage() {
                             label: "熔断冻结（买卖全停）",
                           },
                         ]),
+                    {
+                      key: "frozen", icon: <LockOutlined />,
+                      label: "冻结证券…（逐票清单）",
+                    },
                     { type: "divider" as const },
                     {
                       key: "clear", icon: <ClearOutlined />, danger: true,
@@ -444,6 +516,10 @@ export default function AgentsPage() {
                               setClearAgent(agent);
                               return;
                             }
+                            if (key === "frozen") {
+                              openFrozen(agent);
+                              return;
+                            }
                             runControl(agent, key as ControlOp);
                           },
                         }}
@@ -500,6 +576,53 @@ export default function AgentsPage() {
           }}
         />
       )}
+
+      <Modal
+        title={`冻结证券 · ${frozenAgent?.name ?? ""}（冻结买入保留卖出）`}
+        open={frozenAgent !== null}
+        onCancel={() => setFrozenAgent(null)}
+        footer={null}
+        width={520}
+      >
+        <Space.Compact style={{ display: "flex", marginBottom: 8 }}>
+          <Input
+            placeholder="证券代码，如 600519"
+            value={frozenSymbol}
+            onChange={(e) => setFrozenSymbol(e.target.value)}
+            maxLength={16}
+          />
+          <Input
+            placeholder="冻结原因（可选）"
+            value={frozenReason}
+            onChange={(e) => setFrozenReason(e.target.value)}
+            maxLength={200}
+          />
+          <Button type="primary" icon={<LockOutlined />} onClick={() => void doFreeze()}>
+            冻结
+          </Button>
+        </Space.Compact>
+        <Table<FrozenSecurity>
+          rowKey="id"
+          size="small"
+          loading={frozenLoading}
+          dataSource={frozenRows}
+          locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前无冻结证券" /> }}
+          pagination={false}
+          columns={[
+            { title: "证券", dataIndex: "symbol", width: 110 },
+            { title: "冻结原因", dataIndex: "reason", ellipsis: true },
+            { title: "冻结时间", dataIndex: "created_ts", width: 160, render: (v: string) => fmtBeijingTime(v) },
+            {
+              title: "操作", key: "op", width: 90,
+              render: (_, row) => (
+                <Button size="small" onClick={() => doUnfreeze(row)}>
+                  解除
+                </Button>
+              ),
+            },
+          ]}
+        />
+      </Modal>
 
       <Modal
         title="紧急清仓（需输入确认）"

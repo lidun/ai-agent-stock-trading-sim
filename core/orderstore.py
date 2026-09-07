@@ -183,7 +183,7 @@ def place_order(
         row = c.execute(
             """
             SELECT a.id, a.granularity, a.status AS acct_status, a.role AS acct_role,
-                   ag.role AS agent_role, ag.status AS agent_status
+                   ag.id AS agent_id, ag.role AS agent_role, ag.status AS agent_status
               FROM accounts a JOIN agents ag ON ag.id = a.agent_id
              WHERE a.id = ?
             """,
@@ -193,6 +193,13 @@ def place_order(
             raise OrderError("账户不存在（仅策略 Agent 拥有模拟账户）")
         if row["agent_role"] != "strategy":
             raise OrderError("管理 Agent 非交易账户，不能下单")
+        # 冻结证券（spec-06 §6.3）：该 Agent 单票冻结买入，卖出不受影响（即时生效）
+        if direction == "buy":
+            frozen = c.execute(
+                "SELECT 1 FROM frozen_securities WHERE agent_id=? AND symbol=?",
+                (row["agent_id"], symbol)).fetchone()
+            if frozen:
+                raise OrderError(f"证券 {symbol} 已冻结买入（用户直控，保留卖出与风控）")
         # 下单资格（#63 双账户 + §6.3 直控）：主账户 normal 由 running Agent 交易；
         # 直控冻结买入（acct=paused_buy）保留卖出与风控 → direction=sell 仍放行；
         # trial 账户 status=trial 由试运行期 Agent 交易（回放期下单）；其余组合拒绝

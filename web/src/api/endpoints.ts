@@ -1,4 +1,4 @@
-import { apiGet, apiPatch, apiPost } from "./client";
+import { apiDelete, apiGet, apiPatch, apiPost } from "./client";
 
 export interface Me {
   user: string;
@@ -183,6 +183,46 @@ export function controlAgent(agentId: string, op: ControlOp): Promise<ControlRes
 
 export function emergencySellAll(agentId: string): Promise<EmergencySellResult> {
   return apiPost(`/api/agents/${encodeURIComponent(agentId)}/control/sell-all`);
+}
+
+// ---------- 冻结证券（spec-06 §6.3 逐票冻结买入/解除，常驻清单） ----------
+
+export interface FrozenSecurity {
+  id: string;
+  agent_id: string;
+  symbol: string;
+  reason: string;
+  created_by: string;
+  created_ts: string;
+}
+
+export interface FreezeResult {
+  agent_id: string;
+  account_id: string;
+  symbol: string;
+  cancelled_buy_orders: number;
+}
+
+export function listFrozen(agentId?: string): Promise<{ frozen: FrozenSecurity[] }> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiGet(`/api/frozen${q}`);
+}
+
+export function freezeSecurity(
+  agentId: string,
+  symbol: string,
+  reason: string,
+): Promise<FreezeResult> {
+  return apiPost(`/api/agents/${encodeURIComponent(agentId)}/frozen`, { symbol, reason });
+}
+
+export function unfreezeSecurity(
+  agentId: string,
+  symbol: string,
+): Promise<{ agent_id: string; symbol: string; removed: number }> {
+  return apiDelete(
+    `/api/agents/${encodeURIComponent(agentId)}/frozen/${encodeURIComponent(symbol)}`,
+  );
 }
 
 export function listConversations(): Promise<{ conversations: ConversationInfo[] }> {
