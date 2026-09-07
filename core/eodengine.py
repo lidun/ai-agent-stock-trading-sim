@@ -494,7 +494,8 @@ def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
                        now: str) -> dict:
     """除权日公司行动（spec-01 §2.2/§6.6；结算事务内首步调用，按事件 kind 分派）。
 
-    events[symbol] 支持两种 kind（同一事件表后续可多事件）：
+    events[symbol] 可为单个事件 dict，也可为事件 dict 列表（同票同日多事件，如
+    "送转+派息"同日并行——列表顺序即应用顺序，数据供给须按官方口径排列）：
       {"kind": "split", "ratio": s}——送转：buy_date < ex_date 存量 lot 数量 ×(1+s)
     向下取整到股（尾差审计）、buy_price ÷(1+s)（成本摊薄，舍入成本位）、holdings.
     quantity/avg_cost 同步重建、lot 标幂等 tag；当日新买入 lot 不重写。
@@ -502,24 +503,33 @@ def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
     lot remaining × dps 入账（默认不计税，tax=True 时按 §6.4 简化档红利税逐 lot 计税
     分摊扣减）；成本与持仓数量不变；净额经返回 cash_credit 注入结算现金路径（并入
     守恒式一）。当日无存量 lot（含当日才建仓）→ 该事件 no-op。
-    除 split/dividend 外的 kind（rights/delist…）未实现 → EngineGapError（不静默、
-    不虚构入账，归 §6.6 后续切片）。
+      {"kind": "rights", "ratio": r, "price": p, "participate": bool}——配股：默认
+    放弃（不动现金/持仓，仅审计）；participate=True 时按存量 lot remaining × r × p
+    扣现金缴款并新增配股 lot（配股价成本、buy_date=ex_date，T+1 后才可卖，当日新增
+    lot 不参与本日卖出），现金不足以缴款 → 自动放弃并审计（declined_insufficient）。
+    配股缴款额经返回 cash_credit（负值）纳入守恒式一。
+    其他 kind（delist…）未实现 → EngineGapError（不静默、不虚构入账，归 §6.6 后续切片）。
     """
     out = {"applied": 0, "symbols": [], "cash_credit": Decimal("0")}
     for symbol in sorted(events):
-        ev = events[symbol] or {}
-        kind = str(ev.get("kind") or "split")
-        if kind not in ("split", "dividend"):
-            raise EngineGapError(
-                f"corp_action kind={kind}（{symbol}）引擎侧未支持（spec-01 §6.6 后续切片）"
-            )
-        if kind == "split":
-            applied = _corp_split(c, account_id, ex_date, symbol, ev, now)
-        else:
-            applied = _corp_dividend(c, account_id, ex_date, symbol, ev, now, out)
-        if applied:
-            out["applied"] += 1
-            out["symbols"].append(symbol)
+        raw = events[symbol] or {}
+        evs = raw if isinstance(raw, list) else [raw]
+        for ev in evs:
+            kind = str(ev.get("kind") or "split")
+            if kind == "split":
+                applied = _corp_split(c, account_id, ex_date, symbol, ev, now)
+            elif kind == "dividend":
+                applied = _corp_dividend(c, account_id, ex_date, symbol, ev, now, out)
+            elif kind == "rights":
+                applied = _corp_rights(c, account_id, ex_date, symbol, ev, now, out)
+            else:
+                raise EngineGapError(
+                    f"corp_action kind={kind}（{symbol}）引擎侧未支持（spec-01 §6.6 后续切片）"
+                )
+            if applied:
+                out["applied"] += 1
+                if symbol not in out["symbols"]:
+                    out["symbols"].append(symbol)
     return out
 
 
@@ -661,6 +671,104 @@ def _corp_dividend(c, account_id: str, ex_date: str, symbol: str, ev: dict,
     return True
 
 
+def _corp_rights(c, account_id: str, ex_date: str, symbol: str, ev: dict,
+                 now: str, out: dict) -> bool:
+    """配股处理（spec-01 §6.6）：默认放弃；participate=True 按存量 lot remaining ×
+    ratio × price 扣现金缴款并新增配股 lot（T+1 后卖出），现金不足 → 自动放弃并审计
+    declined_insufficient；缴款额以负 cash_credit 计入守恒式一。
+    """
+    try:
+        r = Decimal(str(ev.get("ratio") or "0"))
+        p = Decimal(str(ev.get("price") or "0"))
+    except Exception as exc:
+        raise EngineError(f"corp_action {symbol} rights ratio/price 非法: {exc}") from exc
+    if r <= 0 or p < 0:
+        raise EngineError(f"corp_action {symbol} rights 须 ratio > 0 且 price >= 0")
+    rows = c.execute(
+        """
+        SELECT l.id, l.buy_date, l.remaining, l.corp_action_flags,
+               h.id AS holding_id
+          FROM lots l JOIN holdings h ON h.id = l.holding_id
+         WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+           AND l.remaining > 0
+         ORDER BY l.buy_date ASC, l.id ASC
+        """,
+        (account_id, symbol, ex_date),
+    ).fetchall()
+    if not rows:
+        return False                       # 无存量持仓：无配股权
+    tag = f"rights:{ex_date}:{symbol}"
+    if any(tag in _flags_tags(r["corp_action_flags"]) for r in rows):
+        return False                       # 幂等：同日同事件已处理 → 跳过
+    hid = rows[0]["holding_id"]
+    subscribe = bool(ev.get("participate"))
+    base = sum((_D(r["remaining"]) for r in rows), Decimal("0"))
+    sub_qty = (base * r).to_integral_value(rounding=ROUND_DOWN)
+    pay = (sub_qty * p).quantize(_MONEY, ROUND_HALF_UP)
+    if not subscribe or sub_qty <= 0:
+        result, detail = "waived", {
+            "symbol": symbol, "ex_date": ex_date, "ratio": _plain(r),
+            "price": _plain(p), "rights_base": _plain(base),
+            "participate": subscribe,
+            "note": "默认放弃配股（不缴款、不增股）",
+        }
+    else:
+        cash_now = c.execute(
+            "SELECT cash FROM accounts WHERE id=?", (account_id,)
+        ).fetchone()["cash"]
+        if _D(cash_now) < pay:
+            result = "declined_insufficient"
+            detail = {
+                "symbol": symbol, "ex_date": ex_date, "ratio": _plain(r),
+                "price": _plain(p), "rights_base": _plain(base),
+                "subscribe_qty": _plain(sub_qty), "payable": _plain(pay),
+                "cash": _plain(_D(cash_now)),
+                "note": "参与配股但现金不足 → 自动放弃（禁负现金红线）",
+            }
+        else:
+            out["cash_credit"] -= pay
+            lid = "l" + secrets.token_hex(10)
+            # 加权摊薄：含费旧成本 × 旧量 + 缴款额，除以新总量（配股缴款不另收佣金）
+            hrow = c.execute(
+                "SELECT quantity, avg_cost FROM holdings WHERE id=?", (hid,)
+            ).fetchone()
+            q_old = _D(hrow["quantity"])
+            avg_old = _D(hrow["avg_cost"])
+            q_new = q_old + sub_qty
+            avg_new = ((avg_old * q_old + pay) / q_new).quantize(_COST, ROUND_HALF_UP)
+            c.execute(
+                "UPDATE holdings SET quantity=?, avg_cost=?, updated_ts=? WHERE id=?",
+                (_q(q_new), _q(avg_new), now, hid),
+            )
+            c.execute(
+                "INSERT INTO lots(id, account_id, holding_id, buy_trade_id, buy_date,"
+                " buy_price, quantity, remaining, strategy_version_no, corp_action_flags)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (lid, account_id, hid, "", ex_date, _q(p.quantize(_COST, ROUND_HALF_UP)),
+                 _q(sub_qty), _q(sub_qty), "", f'["{tag}"]'),
+            )
+            result = "paid"
+            detail = {
+                "symbol": symbol, "ex_date": ex_date, "ratio": _plain(r),
+                "price": _plain(p), "rights_base": _plain(base),
+                "subscribe_qty": _plain(sub_qty), "payable": _plain(pay),
+                "lot_id": lid, "note": "参与配股：现金缴款、新增配股 lot（T+1 后可卖）",
+            }
+    # 幂等锚：无论放弃/不足/参与，存量 lot 统一标记"该 rights 事件已处理"（_append_flag 去重）
+    for r2 in rows:
+        c.execute(
+            "UPDATE lots SET corp_action_flags=? WHERE id=?",
+            (_append_flag(r2["corp_action_flags"], tag), r2["id"]),
+        )
+    c.execute(
+        "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+        " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+        (now, account_id, "corp_action.rights", "holding", hid, result,
+         json.dumps(detail, ensure_ascii=False), ""),
+    )
+    return True
+
+
 def settle_account(
     state,
     account_id: str,
@@ -705,13 +813,16 @@ def settle_account(
     复牌，#54）：其订单不参与判定——today 单到期 expired（当日无成交窗口，公平口径）、
     long/until 单保持 active 待复牌日恢复判定；持仓按停牌估值价并入 close_map 估值与对账
     守恒（非虚构替代价）。其余票缺当日序列仍显式 EngineError（数据缺口，不误判停牌）。
-    corp_events[symbol] = 当日公司行动事件（spec-01 §6.6）：{"kind": "split", "ratio": s}
-    送转除权——结算事务首步对 buy_date < 当日 的存量 lot 同步重写（数量×股、成本摊薄、
-    holdings 重建、审计留痕、幂等 tag），当日新买入 lot 不受影响；{"kind": "dividend",
+    corp_events[symbol] = 当日公司行动事件（spec-01 §6.6），单 dict 或多事件 dict 列表
+    （列表序=应用序，供同日"送转+派息"等并行）：{"kind": "split", "ratio": s} 送转除权
+    ——结算事务首步对 buy_date < 当日 的存量 lot 同步重写（数量×股、成本摊薄、holdings
+    重建、审计留痕、幂等 tag），当日新买入 lot 不受影响；{"kind": "dividend",
     "cash_per_share": dps, "tax": bool} 现金分红——按存量 lot 入账净额（tax=True 按 §6.4
-    简化档红利税逐 lot 计税，默认不计），成本与数量不变，净额注入当日现金并计入守恒式一。
-    其他 kind（rights/delist…）未实现 → EngineGapError（不静默虚构）。默认缺省不传 → 无
-    公司行动行为。
+    简化档红利税逐 lot 计税，默认不计），成本与数量不变；{"kind": "rights", "ratio": r,
+    "price": p, "participate": bool} 配股——默认放弃（审计），participate=True 现金缴款
+    并新增配股 lot（T+1 后可卖），现金不足自动放弃（declined_insufficient）。split 外
+    现金变动（分红净额/配股缴款）经 corp_cash 注入当日现金并计入守恒式一。其他 kind
+    （delist…）未实现 → EngineGapError（不静默虚构）。默认缺省不传 → 无公司行动行为。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -824,8 +935,13 @@ def settle_account(
         ).fetchone():
             return {"already_settled": True, "account_id": account_id, "trade_date": trade_date}
 
-        # ---- 除权日公司行动：送转/分红事务首步应用（§2.2/§6.6；撮合/对账之前，事务内）----
+        # ---- 除权日公司行动：送转/分红/配股事务首步应用（§2.2/§6.6；撮合/对账之前，事务内）----
         corp_out = {"applied": 0, "symbols": [], "cash_credit": Decimal("0")}
+        # 期初持仓快照须在 corp 应用前取——当日送转×股/配股新增股份不计入期初估值（§6.1）
+        opening_rows = c.execute(
+            "SELECT symbol, quantity FROM holdings WHERE account_id=? AND quantity > 0",
+            (account_id,),
+        ).fetchall()
         if corp_events:
             corp_out = apply_corp_actions(c, account_id, trade_date, corp_events, now)
 
@@ -1598,8 +1714,8 @@ def settle_account(
         equity = final_cash
         for symbol, qty in held_qty.items():
             equity += qty * require_close(symbol)
-        init_hold_value = Decimal("0")               # 期初持仓按前收估值
-        for row in held_init:
+        init_hold_value = Decimal("0")               # 期初持仓按前收估值（corp 前快照，不含当日送转/配股）
+        for row in opening_rows:
             q = _D(row["quantity"])
             if q <= 0:
                 continue

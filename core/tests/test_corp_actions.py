@@ -303,3 +303,111 @@ def test_corp_dividend_run_day_passthrough(authed_client):
         (DEMO, ex_day)).fetchone()[0]
     assert n == 0                                              # 无成交、纯现金事件
 
+
+
+def test_corp_rights_default_waived(authed_client):
+    """配股默认放弃：不动现金/持仓，仅审计留痕 + 幂等 tag。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 10.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "rights", "ratio": 0.5, "price": 8.0}},
+    )
+    assert r["corp_applied"] == 1 and r["corp_symbols"] == ["600000"]
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash - (100000.0 - 10005.1)) < 0.01        # 未缴款
+    h = conn.execute(
+        "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'",
+        (DEMO,)).fetchone()
+    assert h["quantity"] == 1000                          # 未增股
+    au = conn.execute(
+        "SELECT result FROM audit_logs WHERE action='corp_action.rights'").fetchone()
+    assert au["result"] == "waived"
+
+
+def test_corp_rights_participate_pays_and_creates_lot(authed_client):
+    """配股参与：现金缴款、新增配股 lot（buy_date=ex，T+1 后可卖）、avg 加权摊薄。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 10.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "rights", "ratio": 0.5, "price": 8.0,
+                                "participate": True}},
+    )
+    assert r["corp_applied"] == 1
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash - (100000.0 - 10005.1 - 4000.0)) < 0.01   # 缴款 500 股 × 8
+    h = conn.execute(
+        "SELECT quantity, avg_cost FROM holdings WHERE account_id=? AND symbol='600000'",
+        (DEMO,)).fetchone()
+    assert h["quantity"] == 1500
+    # avg = (10.0051×1000 + 4000) / 1500 ≈ 9.3367
+    assert abs(h["avg_cost"] - (10.0051 * 1000 + 4000) / 1500) < 1e-3
+    rlot = conn.execute(
+        "SELECT * FROM lots WHERE account_id=? AND buy_date=? AND buy_trade_id=''",
+        (DEMO, ex)).fetchone()
+    assert rlot["quantity"] == 500 and rlot["remaining"] == 500 and rlot["buy_price"] == 8.0
+    assert json.loads(rlot["corp_action_flags"]) == [f"rights:{ex}:600000"]
+    au = conn.execute(
+        "SELECT result, detail FROM audit_logs WHERE action='corp_action.rights'").fetchone()
+    assert au["result"] == "paid"
+    assert json.loads(au["detail"])["subscribe_qty"] == "500"
+    assert json.loads(au["detail"])["payable"] == "4000"
+
+
+def test_corp_rights_participate_insufficient_auto_waive(authed_client):
+    """参与配股但现金不足 → 自动放弃（declined_insufficient），不产生负现金。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 10.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "rights", "ratio": 10.0, "price": 50.0,
+                                "participate": True}},   # 需缴 10000 股 ×50 ≫ 现金
+    )
+    assert r["corp_applied"] == 1
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert cash >= 0 and abs(cash - (100000.0 - 10005.1)) < 0.01   # 未扣款
+    h = conn.execute(
+        "SELECT quantity FROM holdings WHERE account_id=? AND symbol='600000'",
+        (DEMO,)).fetchone()
+    assert h["quantity"] == 1000                                # 未增股
+    au = conn.execute(
+        "SELECT result, detail FROM audit_logs WHERE action='corp_action.rights'").fetchone()
+    assert au["result"] == "declined_insufficient"
+    assert "禁负现金" in json.loads(au["detail"])["note"]
+
+
+def test_corp_multi_event_same_day_split_and_dividend(authed_client):
+    """同票同日多事件（列表序应用）：先派息后送转——红利按登记日原持股 1000 计，再送转 ×2。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 5.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": [
+            {"kind": "dividend", "cash_per_share": 0.5},     # 1000 股 → 500
+            {"kind": "split", "ratio": 1},                    # 之后 2000 股 @5
+        ]},
+    )
+    assert not r["already_settled"]
+    assert r["corp_applied"] == 2 and r["corp_symbols"] == ["600000"]
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash - (100000.0 - 10005.1 + 500.0)) < 0.01    # 派息按送转前 1000 股
+    lot = conn.execute(
+        "SELECT * FROM lots WHERE account_id=? AND buy_date='2026-09-07'",
+        (DEMO,)).fetchone()
+    assert lot["quantity"] == 2000 and lot["remaining"] == 2000 and lot["buy_price"] == 5.0
+    tags = set(json.loads(lot["corp_action_flags"]))
+    assert tags == {f"dividend:{ex}:600000", f"split:{ex}:600000"}
+    au = conn.execute(
+        "SELECT action, COUNT(*) AS n FROM audit_logs WHERE action LIKE 'corp_action.%'"
+        " GROUP BY action ORDER BY action").fetchall()
+    assert {(a["action"], a["n"]) for a in au} == \
+        {("corp_action.dividend", 1), ("corp_action.split", 1)}
