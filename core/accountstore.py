@@ -221,6 +221,47 @@ def add_trial_session(state, agent_id: str, trade_date: str) -> dict:
     return trial_replay(state, agent_id)
 
 
+def control_agent(state, *, agent_id: str, op: str,
+                  operator: str = "user") -> dict:
+    """用户直控（spec-06 §6.3 → spec-01 直控接口）：主账户状态即时切换，秒级生效。
+
+    op ∈ pause_buy（冻结买入：保留卖出与风控）/ halt（冻结证券/熔断，买卖全停）/
+    resume（解除冻结恢复 normal）。Agent 保持 running 不断结算；撮合闸门按账户
+    status + 订单 direction 判定（冻结买入期间 direction=sell 仍可成交，见 orderstore）。
+    仅运行中的策略 Agent 可操作；审计由路由层落 account.control_*。
+    """
+    if op not in ("pause_buy", "halt", "resume"):
+        raise LookupError(f"未知直控操作: {op}（仅 pause_buy/halt/resume）")
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        agent = c.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None:
+            raise LookupError(f"Agent {agent_id} 不存在")
+        if agent["role"] != "strategy":
+            raise LookupError(f"Agent {agent_id} 为非策略 Agent，无交易账户可直控")
+        main = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='main'", (agent_id,)
+        ).fetchone()
+        if main is None:
+            raise LookupError(f"Agent {agent_id} 无主账户（可能未开通）")
+        if agent["status"] != "running":
+            raise LookupError(
+                f"Agent {agent_id} 不在运行期（status={agent['status']}），仅运行中可直控")
+        cur = main["status"]
+        target = {
+            "pause_buy": "paused_buy", "halt": "halted",
+        }.get(op, "normal")
+        if cur == target:
+            raise LookupError(f"账户已是 {cur}，无变更（重复直控幂等拒绝）")
+        ts = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+        c.execute(
+            f"UPDATE accounts SET status=?, updated_ts={ts} WHERE id=?",
+            (target, main["id"]))
+    updated = get_account(state, main["id"])
+    return {"agent_id": agent_id, "op": op, "account": updated,
+            "from": cur, "to": updated["status"]}
+
+
 def trial_progress(state, agent_id: str) -> dict | None:
     """试运行验收进度（spec-05 §6.1 门槛预览，供 UI 验收看板）。
 

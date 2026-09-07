@@ -157,6 +157,34 @@ export function finishTrial(
   });
 }
 
+// ---------- 用户直控（spec-06 §6.3 → spec-01 直控接口） ----------
+
+export type ControlOp = "pause_buy" | "halt" | "resume";
+
+export interface ControlResult {
+  agent_id: string;
+  op: ControlOp;
+  account: AccountInfo;
+  from: string;
+  to: string;
+}
+
+export interface EmergencySellResult {
+  agent_id: string;
+  account_id: string;
+  holdings: number;
+  orders: { symbol: string; qty: number; id: string }[];
+  blocked_halted: boolean;
+}
+
+export function controlAgent(agentId: string, op: ControlOp): Promise<ControlResult> {
+  return apiPatch(`/api/agents/${encodeURIComponent(agentId)}/control`, { op });
+}
+
+export function emergencySellAll(agentId: string): Promise<EmergencySellResult> {
+  return apiPost(`/api/agents/${encodeURIComponent(agentId)}/control/sell-all`);
+}
+
 export function listConversations(): Promise<{ conversations: ConversationInfo[] }> {
   return apiGet("/api/conversations");
 }
@@ -192,6 +220,8 @@ export function sendMessage(convId: string, body: string): Promise<{ message: Me
 export interface AccountInfo {
   id: string;
   agent_id: string;
+  role: "main" | "trial" | "validation";
+  parent_agent_id: string;
   agent_name: string;
   agent_role: string;
   agent_status: string;

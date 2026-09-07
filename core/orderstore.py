@@ -14,7 +14,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from core.db import state_conn, write_txn
+from core.db import read_txn, state_conn, write_txn
 
 _SYMBOL_RE = re.compile(r"^\d{6}$")
 _BJT = timezone(timedelta(hours=8))
@@ -193,11 +193,17 @@ def place_order(
             raise OrderError("账户不存在（仅策略 Agent 拥有模拟账户）")
         if row["agent_role"] != "strategy":
             raise OrderError("管理 Agent 非交易账户，不能下单")
-        # 下单资格（#63 双账户）：主账户 normal 由 running Agent 交易；trial 账户
-        # status=trial 由试运行期 Agent 交易（回放期下单）；其余状态组合拒绝
+        # 下单资格（#63 双账户 + §6.3 直控）：主账户 normal 由 running Agent 交易；
+        # 直控冻结买入（acct=paused_buy）保留卖出与风控 → direction=sell 仍放行；
+        # trial 账户 status=trial 由试运行期 Agent 交易（回放期下单）；其余组合拒绝
+        sell_only_frozen = (
+            row["agent_status"] == "running"
+            and row["acct_status"] == "paused_buy"
+            and direction == "sell"
+        )
         allowed = (
             row["agent_status"] == "running" and row["acct_status"] == "normal"
-        ) or (
+        ) or sell_only_frozen or (
             row["agent_status"] == "trial" and row["acct_status"] == "trial"
         )
         if not allowed:
@@ -222,3 +228,50 @@ def place_order(
     return {"id": oid, "account_id": account_id, "symbol": symbol,
             "order_type": order_type, "direction": direction, "qty": qty,
             "price_type": price_type, "status": "active"}
+
+
+def emergency_sell_all(state, *, agent_id: str,
+                       reason: str = "紧急清仓（用户直控）") -> dict:
+    """紧急清仓（spec-06 §6.3）：主账户全部持仓逐票挂市价卖出条件单，即时生成。
+
+    读出即下、秒级生效（不经 LLM）；卖单经 place_order 闸门——冻结买入（paused_buy）
+    下 direction=sell 仍放行，熔断全停（halted）时卖出同样被闸门拦截并在回执明示。
+    返回 {agent_id, account_id, orders:[{symbol,qty,id}], blocked_halted:bool}。
+    """
+    conn = state_conn(state)
+    with read_txn(conn) as c:
+        agent = c.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None:
+            raise OrderError(f"Agent {agent_id} 不存在")
+        if agent["role"] != "strategy":
+            raise OrderError(f"Agent {agent_id} 为非策略 Agent")
+        main = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='main'", (agent_id,)
+        ).fetchone()
+        if main is None:
+            raise OrderError(f"Agent {agent_id} 无主账户")
+        rows = c.execute(
+            """
+            SELECT symbol, SUM(quantity) AS qty FROM holdings
+             WHERE account_id=? AND quantity > 0
+             GROUP BY symbol ORDER BY symbol
+            """,
+            (main["id"],),
+        ).fetchall()
+    orders: list[dict] = []
+    blocked = main["status"] == "halted"
+    for r in rows:
+        if blocked:
+            break
+        try:
+            placed = place_order(
+                state, account_id=main["id"], creator="user", direction="sell",
+                order_type="sell_open_board", symbol=r["symbol"], qty=r["qty"],
+                reason=reason, basis="intraday",
+            )
+        except OrderError as e:
+            continue
+        orders.append({"symbol": r["symbol"], "qty": r["qty"], "id": placed["id"]})
+    return {"agent_id": agent_id, "account_id": main["id"],
+            "holdings": len(rows), "orders": orders,
+            "blocked_halted": blocked}

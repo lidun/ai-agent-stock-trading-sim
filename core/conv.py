@@ -14,7 +14,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from core import accountstore, chatstore, engine
+from core import accountstore, chatstore, engine, orderstore
 from core.auth import audit, get_request_context, require_session
 from core.ws import broadcast
 
@@ -36,6 +36,10 @@ class AgentCreateIn(BaseModel):
 class TrialFinishIn(BaseModel):
     decision: str = Field(pattern="^(launch|reject)$")
     verdict: str = Field(default="", max_length=500)
+
+
+class ControlIn(BaseModel):
+    op: str = Field(pattern="^(pause_buy|halt|resume)$")
 
 
 class MessageSendIn(BaseModel):
@@ -75,6 +79,43 @@ def trial_progress(agent_id: str, request: Request, session: SessionDep):
     if progress is None:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} 不存在")
     return progress
+
+
+@router.patch("/agents/{agent_id}/control")
+def control_agent(agent_id: str, payload: ControlIn,
+                  request: Request, session: SessionDep):
+    """用户直控（spec-06 §6.3）：冻结买入/熔断冻结/解除恢复，秒级生效、审计留痕。"""
+    label = {"pause_buy": "冻结买入（保留卖出与风控）",
+             "halt": "熔断冻结（买卖全停）",
+             "resume": "解除冻结恢复"}[payload.op]
+    try:
+        result = accountstore.control_agent(
+            request.app.state, agent_id=agent_id, op=payload.op)
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          f"account.control_{payload.op}", result="ok",
+          object_type="account", object_id=result["account"]["id"],
+          detail=f"直控 {label}：账户状态 {result['from']} → {result['to']}",
+          ctx=get_request_context(request))
+    return result
+
+
+@router.post("/agents/{agent_id}/control/sell-all")
+def emergency_sell_all(agent_id: str, request: Request, session: SessionDep):
+    """紧急清仓（spec-06 §6.3）：逐票市价卖出条件单即时生成，不经 LLM。"""
+    try:
+        result = orderstore.emergency_sell_all(
+            request.app.state, agent_id=agent_id)
+    except orderstore.OrderError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          "account.emergency_sell", result="ok",
+          object_type="account", object_id=result["account_id"],
+          detail=f"紧急清仓：生成卖出条件单 {len(result['orders'])} 张"
+                 f"（持仓 {result['holdings']} 只）",
+          ctx=get_request_context(request))
+    return result
 
 
 @router.post("/agents/{agent_id}/trial/finish")

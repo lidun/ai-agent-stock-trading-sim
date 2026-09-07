@@ -6,7 +6,10 @@ import {
   Badge,
   Button,
   Card,
+  Dropdown,
   Empty,
+  Input,
+  Modal,
   Skeleton,
   Space,
   Tag,
@@ -15,19 +18,27 @@ import {
   theme as antTheme,
 } from "antd";
 import {
+  CaretRightOutlined,
+  ControlOutlined,
+  ClearOutlined,
   CrownOutlined,
   ExperimentOutlined,
   LoadingOutlined,
   MessageOutlined,
+  PauseCircleOutlined,
   RobotOutlined,
+  StopOutlined,
 } from "@ant-design/icons";
 import {
+  controlAgent,
+  emergencySellAll,
   listAccounts,
   listAgents,
   listConversations,
   type AccountInfo,
   type AgentInfo,
   type ConversationInfo,
+  type ControlOp,
 } from "../../api/endpoints";
 import { useConnection } from "../../connection";
 import { daySeparator, fmtBeijing, fmtBeijingTime } from "../../utils/time";
@@ -93,7 +104,7 @@ function Metric({ label, value, color }: { label: string; value: string; color?:
 export default function AgentsPage() {
   const navigate = useNavigate();
   const { token } = antTheme.useToken();
-  const { message } = AntApp.useApp();
+  const { message, modal } = AntApp.useApp();
   const { subscribe } = useConnection();
 
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -151,9 +162,71 @@ export default function AgentsPage() {
 
   const accountByAgent = useMemo(() => {
     const m = new Map<string, AccountInfo>();
-    accounts.forEach((a) => m.set(a.agent_id, a));
+    accounts
+      .filter((a) => a.role === "main")
+      .forEach((a) => m.set(a.agent_id, a));
     return m;
   }, [accounts]);
+
+  const [clearAgent, setClearAgent] = useState<AgentInfo | null>(null);
+  const [clearConfirm, setClearConfirm] = useState("");
+  const [clearing, setClearing] = useState(false);
+
+  const runControl = (agent: AgentInfo, op: ControlOp) => {
+    const meta = {
+      pause_buy: {
+        title: "冻结买入？",
+        text: "冻结后该 Agent 的买入类订单即时被引擎拦截（秒级生效）；卖出与风控单保留可继续执行；解除冻结随时可恢复。",
+        ok: "确认冻结",
+      },
+      halt: {
+        title: "熔断冻结该 Agent？",
+        text: "熔断后买卖全停、任何订单即时被引擎拦截（秒级生效）；保留结算与风控评估。",
+        ok: "确认熔断",
+      },
+      resume: {
+        title: "解除冻结并恢复？",
+        text: "账户将恢复 normal 状态，买入/卖出信号恢复可下单。",
+        ok: "恢复运行",
+      },
+    }[op];
+    modal.confirm({
+      title: meta.title,
+      content: <Typography.Text type="secondary">{meta.text}</Typography.Text>,
+      okText: meta.ok,
+      okButtonProps: { type: op === "resume" ? "primary" : "default", danger: op !== "resume" },
+      cancelText: "取消",
+      onOk: async () => {
+        try {
+          await controlAgent(agent.id, op);
+          message.success(op === "resume" ? "已解除冻结并恢复" : "已即时生效（引擎闸门秒级拦截）");
+          void reload();
+        } catch (e) {
+          message.error((e as Error).message ?? "直控操作失败");
+        }
+      },
+    });
+  };
+
+  const doEmergencyClear = async () => {
+    if (!clearAgent || clearConfirm.trim() !== "清仓") return;
+    setClearing(true);
+    try {
+      const r = await emergencySellAll(clearAgent.id);
+      if (r.blocked_halted) {
+        message.warning("账户处于熔断冻结态，卖出被闸门拦截——请先解除熔断再清仓");
+      } else {
+        message.success(r.holdings === 0 ? "当前无持仓，无需清仓" : `已生成卖出条件单 ${r.orders.length} 张`);
+      }
+      setClearAgent(null);
+      setClearConfirm("");
+      void reload();
+    } catch (e) {
+      message.error((e as Error).message ?? "紧急清仓失败");
+    } finally {
+      setClearing(false);
+    }
+  };
 
   const sorted = useMemo(() => {
     const order = (a: AgentInfo) =>
@@ -216,6 +289,32 @@ export default function AgentsPage() {
             const isManager = agent.role === "manager";
             const sm = STATUS_META[agent.status] ?? { color: "default", text: agent.status };
             const acc = accountByAgent.get(agent.id) ?? null;
+            const frozen = acc?.status === "paused_buy" || acc?.status === "halted";
+            const controlMenu =
+              agent.status === "running" && !isManager
+                ? [
+                    ...(frozen
+                      ? [{
+                          key: "resume", icon: <CaretRightOutlined />,
+                          label: "解除冻结 / 恢复",
+                        }]
+                      : [
+                          {
+                            key: "pause_buy", icon: <PauseCircleOutlined />,
+                            label: "冻结买入（保留卖出与风控）",
+                          },
+                          {
+                            key: "halt", icon: <StopOutlined />,
+                            label: "熔断冻结（买卖全停）",
+                          },
+                        ]),
+                    { type: "divider" as const },
+                    {
+                      key: "clear", icon: <ClearOutlined />, danger: true,
+                      label: "紧急清仓",
+                    },
+                  ]
+                : null;
             return (
               <Card
                 key={agent.id}
@@ -240,6 +339,14 @@ export default function AgentsPage() {
                       <Tag color={sm.color} style={{ marginInlineEnd: 0 }}>
                         {sm.text}
                       </Tag>
+                      {frozen && (
+                        <Tag
+                          color={acc?.status === "paused_buy" ? "orange" : "red"}
+                          style={{ marginInlineEnd: 0 }}
+                        >
+                          {acc?.status === "paused_buy" ? "冻结买入（保留卖出）" : "熔断冻结"}
+                        </Tag>
+                      )}
                       {busy && (
                         <Tag color="processing" icon={<LoadingOutlined />} style={{ marginInlineEnd: 0 }}>
                           处理中
@@ -326,6 +433,26 @@ export default function AgentsPage() {
                     </Typography.Text>
                   </div>
                   <Space size={6}>
+                    {controlMenu && (
+                      <Dropdown
+                        trigger={["click"]}
+                        menu={{
+                          items: controlMenu,
+                          onClick: ({ key }) => {
+                            if (key === "clear") {
+                              setClearConfirm("");
+                              setClearAgent(agent);
+                              return;
+                            }
+                            runControl(agent, key as ControlOp);
+                          },
+                        }}
+                      >
+                        <Button size="small" icon={<ControlOutlined />} onClick={(e) => e.stopPropagation()}>
+                          直控
+                        </Button>
+                      </Dropdown>
+                    )}
                     {agent.status === "trial" && (
                       <Tooltip title="试运行验收：门槛预览 + 上线/否决决策留证（spec-05 §6）">
                         <Button
@@ -373,6 +500,30 @@ export default function AgentsPage() {
           }}
         />
       )}
+
+      <Modal
+        title="紧急清仓（需输入确认）"
+        open={clearAgent !== null}
+        onCancel={() => {
+          setClearAgent(null);
+          setClearConfirm("");
+        }}
+        onOk={() => void doEmergencyClear()}
+        confirmLoading={clearing}
+        okText="确认清仓"
+        okButtonProps={{ danger: true, disabled: clearConfirm.trim() !== "清仓" }}
+      >
+        <Typography.Paragraph type="secondary" style={{ fontSize: 13 }}>
+          将为该 Agent 主账户全部持仓逐票生成市价卖出条件单，不经 LLM、即时生效。
+          熔断冻结期间卖出同样被闸门拦截（需先解除）。
+        </Typography.Paragraph>
+        <Input
+          placeholder="请输入“清仓”以确认本次高危操作"
+          value={clearConfirm}
+          onChange={(e) => setClearConfirm(e.target.value)}
+          maxLength={16}
+        />
+      </Modal>
     </div>
   );
 }
