@@ -191,6 +191,32 @@ def test_finish_trial_idempotency_conflict(authed_client):
     assert conn.execute("SELECT COUNT(*) FROM trial_archives").fetchone()[0] == 1
 
 
+def test_trial_progress_reports_gates(authed_client):
+    """验收看板进度：门槛逐步变绿，理由随之清空；未知 Agent 404。"""
+    st = authed_client.app.state
+    agent_id, trial_id, _ = _mk_trial_with_order(authed_client, "进度看板用例", order=True)
+    got = authed_client.get(f"/api/agents/{agent_id}/trial/progress").json()
+    assert got["agent_status"] == "trial" and got["window_days"] == 5
+    assert got["condition_orders"] == 1
+    assert got["gates"] == {"window_ok": False, "attempt_ok": True, "abnormal_ok": True}
+    assert any("未满 5" in r and "已回放 0" in r for r in got["reasons"])
+    # 补满回放窗口（有挂单无当日结算异常）→ 三门槛全绿
+    _fill_replay(st, agent_id)
+    got2 = authed_client.get(f"/api/agents/{agent_id}/trial/progress").json()
+    assert got2["sessions_done"] == 5 and got2["settle_days"] == 0
+    assert got2["gates"] == {"window_ok": True, "attempt_ok": True, "abnormal_ok": True}
+    assert got2["reasons"] == []
+    # launch 硬门槛实际放行（决定时刻复核一致）
+    r = authed_client.post(
+        f"/api/agents/{agent_id}/trial/finish",
+        json={"decision": "launch", "verdict": "看板演示验收通过"},
+        headers=csrf_headers(authed_client))
+    assert r.status_code == 200 and r.json()["agent"]["status"] == "running"
+    # 未知 Agent → 404
+    miss = authed_client.get("/api/agents/agent-nope/trial/progress")
+    assert miss.status_code == 404
+
+
 def test_finish_trial_bad_decision_rejected(authed_client):
     agent_id, _, _ = _mk_trial_with_order(authed_client, "非法决策用例", order=False)
     r = authed_client.post(f"/api/agents/{agent_id}/trial/finish",

@@ -68,6 +68,15 @@ def create_trial_agent(payload: AgentCreateIn, request: Request, session: Sessio
     return created
 
 
+@router.get("/agents/{agent_id}/trial/progress")
+def trial_progress(agent_id: str, request: Request, session: SessionDep):
+    """试运行验收进度（spec-05 §6.1 门槛预览，spec-06 §6.4 试运行态展示）。"""
+    progress = accountstore.trial_progress(request.app.state, agent_id)
+    if progress is None:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id} 不存在")
+    return progress
+
+
 @router.post("/agents/{agent_id}/trial/finish")
 def finish_trial(agent_id: str, payload: TrialFinishIn,
                  request: Request, session: SessionDep):

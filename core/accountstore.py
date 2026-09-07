@@ -221,6 +221,85 @@ def add_trial_session(state, agent_id: str, trade_date: str) -> dict:
     return trial_replay(state, agent_id)
 
 
+def trial_progress(state, agent_id: str) -> dict | None:
+    """试运行验收进度（spec-05 §6.1 门槛预览，供 UI 验收看板）。
+
+    与 finish_trial 同口径的只读快照：窗口回放数/挂单尝试/结算异常日 + 三门槛
+    ok/reason。决定时刻仍以 finish_trial 内复核为准（单写事务，不双源裁决）。
+    """
+    conn = state_conn(state)
+    with read_txn(conn) as c:
+        agent = c.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None:
+            return None
+        replay = c.execute(
+            "SELECT * FROM trial_replays WHERE agent_id=?", (agent_id,)
+        ).fetchone()
+        trial = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='trial'", (agent_id,)
+        ).fetchone()
+
+        def _n(sql: str, acc_id: str) -> int:
+            return c.execute(sql, (acc_id,)).fetchone()[0]
+
+        replay_dates = [
+            r[0] for r in c.execute(
+                "SELECT trade_date FROM replay_sessions WHERE agent_id=?"
+                " ORDER BY trade_date", (agent_id,)).fetchall()
+        ]
+        settle_dates = [
+            r[0] for r in c.execute(
+                "SELECT trade_date FROM settlement_log WHERE account_id=?"
+                " ORDER BY trade_date", (trial["id"],)).fetchall()
+        ] if trial else []
+        cond_orders = _n(
+            "SELECT COUNT(*) FROM condition_orders WHERE account_id=?", trial["id"]
+        ) if trial else 0
+        abnormal = [
+            d for d in replay_dates
+            if trial and c.execute(
+                "SELECT 1 FROM condition_orders WHERE account_id=?"
+                " AND substr(created_at, 1, 10)=? LIMIT 1",
+                (trial["id"], d)).fetchone()
+            and not c.execute(
+                "SELECT 1 FROM settlement_log WHERE account_id=? AND trade_date=?",
+                (trial["id"], d)).fetchone()
+        ]
+    if replay is None or trial is None:
+        replay = None
+    window_days = replay["window_days"] if replay else 5
+    sessions_done = len(replay_dates)
+    window_ok = bool(replay and replay["status"] == "done") and sessions_done >= window_days
+    attempt_ok = cond_orders >= 1
+    abnormal_ok = not abnormal
+    reasons: list[str] = []
+    if not window_ok:
+        reasons.append(
+            f"试运行回放未满 {window_days} 个交易日（已回放 {sessions_done}）")
+    if not attempt_ok:
+        reasons.append("试运行期无任何条件单尝试")
+    if not abnormal_ok:
+        reasons.append(
+            "存在结算异常日：" + "、".join(abnormal[:5])
+            + (f" 等 {len(abnormal)} 日" if len(abnormal) > 5 else "")
+            + "（有订单但当日结算未落账）")
+    return {
+        "agent_id": agent_id,
+        "agent_status": agent["status"],
+        "trial_status": trial["status"] if trial else None,
+        "window_days": window_days,
+        "replay_status": replay["status"] if replay else "",
+        "sessions": replay_dates,
+        "sessions_done": sessions_done,
+        "settle_days": len(settle_dates),
+        "condition_orders": cond_orders,
+        "abnormal_dates": abnormal,
+        "gates": {"window_ok": window_ok, "attempt_ok": attempt_ok,
+                  "abnormal_ok": abnormal_ok},
+        "reasons": reasons,
+    }
+
+
 def finish_trial(state, *, agent_id: str, decision: str,
                  verdict: str = "") -> dict:
     """试运行验收归档留证（spec-05 §6.2/#63）：launch 通过 / reject 否决。

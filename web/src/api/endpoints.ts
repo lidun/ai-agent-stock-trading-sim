@@ -116,8 +116,45 @@ export interface MessageInfo {
   ts: string;
 }
 
+export interface TrialProgress {
+  agent_id: string;
+  agent_status: string;
+  trial_status: string | null;
+  window_days: number;
+  replay_status: string;
+  sessions: string[];
+  sessions_done: number;
+  settle_days: number;
+  condition_orders: number;
+  abnormal_dates: string[];
+  gates: { window_ok: boolean; attempt_ok: boolean; abnormal_ok: boolean };
+  reasons: string[];
+}
+
+export interface TrialFinishResult {
+  archive_id: string;
+  agent: { id: string; name: string; role: string; status: string };
+  trial_account_id: string;
+  snapshot: Record<string, unknown>;
+}
+
 export function listAgents(): Promise<{ agents: AgentInfo[] }> {
   return apiGet("/api/agents");
+}
+
+export function trialProgress(agentId: string): Promise<TrialProgress> {
+  return apiGet(`/api/agents/${encodeURIComponent(agentId)}/trial/progress`);
+}
+
+export function finishTrial(
+  agentId: string,
+  decision: "launch" | "reject",
+  verdict: string,
+): Promise<TrialFinishResult> {
+  return apiPost(`/api/agents/${encodeURIComponent(agentId)}/trial/finish`, {
+    decision,
+    verdict,
+  });
 }
 
 export function listConversations(): Promise<{ conversations: ConversationInfo[] }> {

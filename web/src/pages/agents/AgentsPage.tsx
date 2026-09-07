@@ -8,6 +8,7 @@ import {
   Card,
   Empty,
   Skeleton,
+  Space,
   Tag,
   Tooltip,
   Typography,
@@ -15,6 +16,7 @@ import {
 } from "antd";
 import {
   CrownOutlined,
+  ExperimentOutlined,
   LoadingOutlined,
   MessageOutlined,
   RobotOutlined,
@@ -29,6 +31,7 @@ import {
 } from "../../api/endpoints";
 import { useConnection } from "../../connection";
 import { daySeparator, fmtBeijing, fmtBeijingTime } from "../../utils/time";
+import TrialAcceptance from "./TrialAcceptance";
 
 const ROLE_LABEL: Record<string, string> = {
   manager: "管理 Agent · 需求 / 策略评估 / 审批",
@@ -97,6 +100,7 @@ export default function AgentsPage() {
   const [convs, setConvs] = useState<ConversationInfo[]>([]);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [trialAgent, setTrialAgent] = useState<AgentInfo | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -321,25 +325,53 @@ export default function AgentsPage() {
                       创建于 {fmtBeijing(agent.created_ts)}
                     </Typography.Text>
                   </div>
-                  <Tooltip title={conv ? "进入该 Agent 的对话" : "发送第一条消息以创建会话"}>
-                    <Button
-                      type="primary"
-                      size="small"
-                      ghost={!conv}
-                      icon={<MessageOutlined />}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        enter(agent);
-                      }}
-                    >
-                      {conv ? "进入对话" : "开始对话"}
-                    </Button>
-                  </Tooltip>
+                  <Space size={6}>
+                    {agent.status === "trial" && (
+                      <Tooltip title="试运行验收：门槛预览 + 上线/否决决策留证（spec-05 §6）">
+                        <Button
+                          size="small"
+                          icon={<ExperimentOutlined />}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setTrialAgent(agent);
+                          }}
+                        >
+                          验收
+                        </Button>
+                      </Tooltip>
+                    )}
+                    <Tooltip title={conv ? "进入该 Agent 的对话" : "发送第一条消息以创建会话"}>
+                      <Button
+                        type="primary"
+                        size="small"
+                        ghost={!conv}
+                        icon={<MessageOutlined />}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          enter(agent);
+                        }}
+                      >
+                        {conv ? "进入对话" : "开始对话"}
+                      </Button>
+                    </Tooltip>
+                  </Space>
                 </div>
               </Card>
             );
           })}
         </div>
+      )}
+
+      {trialAgent && (
+        <TrialAcceptance
+          agent={trialAgent}
+          open={trialAgent !== null}
+          onClose={() => setTrialAgent(null)}
+          onDone={() => {
+            setTrialAgent(null);
+            void reload();
+          }}
+        />
       )}
     </div>
   );
