@@ -238,3 +238,48 @@ def test_report_direct_skips_trial_agent(authed_client):
     assert state_conn(st).execute(
         "SELECT COUNT(*) FROM conversations WHERE agent_id='agent-trial-xyz'"
     ).fetchone()[0] == 0                              # 连会话都不建（零轰炸）
+
+
+def test_daily_summary_deterministic_pushed_to_manager(authed_client):
+    """§5.4 每日总汇报（确定性拼接版）→ 管理 Agent 会话；幂等；无日报日不生成。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    body = reporting.build_daily_summary_body(st, "2026-09-04")
+    assert body is not None and "# 每日总汇报 · 2026-09-04" in body
+    assert "确定性拼接版" in body
+    assert "| 低波红利" in body and "| 正常 | 89994.9" in body
+    assert "今日无结算/推送异常" in body
+    msg = reporting.push_daily_summary(st, "2026-09-04")
+    assert msg is not None
+    assert msg["msg_type"] == "daily_summary" and msg["direction"] == "agent"
+    assert msg["status"] == "delivered"
+    conv = state_conn(st).execute(
+        "SELECT id FROM conversations WHERE agent_id=? AND conv_type='user_chat'",
+        ("agent-manager",)).fetchone()
+    assert conv is not None and conv["id"] == msg["conv_id"]
+    # 幂等：同日重试不重复推送
+    assert reporting.push_daily_summary(st, "2026-09-04") is None
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE msg_type='daily_summary'"
+    ).fetchone()[0] == 1
+    # 无日报日期（周末/空日）→ 不生成
+    assert reporting.push_daily_summary(st, "2026-09-05") is None
+
+
+def test_monthly_report_deterministic_and_guard(authed_client):
+    """§5.5 月度《策略体检报告》确定性版：净值/回撤与健康度字段；空月不生成；幂等。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04", qty=1000, price=10.0)
+    body = reporting.build_monthly_report_body(st, 2026, 9)
+    assert body is not None and "# 月度《策略体检报告》· 2026-09" in body
+    assert "①净值（份额法口径）" in body and "回撤" in body
+    assert "③健康度" in body
+    msg = reporting.push_monthly_report(st, 2026, 9)
+    assert msg is not None and msg["msg_type"] == "monthly_report"
+    assert reporting.push_monthly_report(st, 2026, 9) is None     # 幂等
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE msg_type='monthly_report'"
+    ).fetchone()[0] == 1
+    # 无数据月（2026-08 无 main 日报）→ 不生成不推送
+    assert reporting.build_monthly_report_body(st, 2026, 8) is None
+    assert reporting.push_monthly_report(st, 2026, 8) is None

@@ -444,6 +444,24 @@ class EodSettleTrigger:
             except Exception:  # noqa: BLE001
                 log.debug("日报消息 WS 广播失败：%s", m.get("id"))
 
+    async def _evening_summaries(self, now: datetime) -> None:
+        """§5.4/§5.5 夜间汇报（BJ 20:00 后每个 tick 收敛一次，幂等）：当日每日总汇报
+        （确定性拼接版）＋上月月度《策略体检报告》（与总汇报同批推送语义的简化落地）。"""
+        if now.time() < time(20, 0):
+            return
+        prev = (now.date().replace(day=1) - timedelta(days=1))
+        pushed: list[dict] = []
+        try:
+            ds = reporting.push_daily_summary(self.state, now.date().isoformat())
+            if ds:
+                pushed.append(ds)
+            mr = reporting.push_monthly_report(self.state, prev.year, prev.month)
+            if mr:
+                pushed.append(mr)
+        except Exception:  # noqa: BLE001
+            log.exception("夜间汇报生成失败（幂等，下个 tick 重试）")
+        await self._notify_report_pushes(pushed)
+
     async def run_forever(self, tick_s: int) -> None:
         """每分钟 tick 循环（core 常驻内唯一结算触发点；操作全幂等）。"""
         while True:
@@ -461,6 +479,7 @@ class EodSettleTrigger:
                          outcome["date"], outcome["status"], len(pushed))
                 self.run_trial_backfill()
                 await self._notify_report_pushes(pushed)
+                await self._evening_summaries(bjt_now())
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001

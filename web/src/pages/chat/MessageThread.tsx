@@ -13,6 +13,7 @@ const AGENT_TYPE_LABEL: Record<string, string> = {
   abnormal_report: "异常上报",
   approval_receipt: "审批回执",
   daily_summary: "总汇报",
+  monthly_report: "月度体检报告",
   system_event: "系统事件",
 };
 

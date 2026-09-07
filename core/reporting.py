@@ -563,3 +563,214 @@ def push_pending_report_deliveries(state, trade_date: str) -> list[dict]:
             pass
         pushed.append(msg)
     return pushed
+
+
+# ---------------- 每日总汇报 / 月度策略体检报告（spec-04 §5.4/§5.5 确定性版） ----------------
+
+_MANAGER_AGENT = "agent-manager"
+_STATUS_LABEL = {"normal": "正常", "absent": "缺勤", "resend": "修订"}
+
+
+def _main_accounts(state, conn) -> list[str]:
+    """main 策略账户（非试运行/退役），日报系汇报的对象集。"""
+    return [r["id"] for r in conn.execute(
+        "SELECT a.id FROM accounts a JOIN agents ag ON ag.id=a.agent_id"
+        " WHERE a.role='main' AND ag.status NOT IN ('trial','archived')"
+        " ORDER BY a.id").fetchall()]
+
+
+def _latest_rows_by_account(conn, *, trade_date=None, month=None) -> list[dict]:
+    """每 main 账户某日/某月各交易日最新一版日报（过滤后按 account,date 升序）。"""
+    cond, params = [], []
+    if trade_date:
+        cond.append("dr.trade_date = ?")
+        params.append(trade_date)
+    if month:
+        cond.append("dr.trade_date LIKE ?")
+        params.append(month + "%")
+    where = " AND ".join(cond) or "1=1"
+    return [dict(r) for r in conn.execute(
+        f"""
+        SELECT ac.id AS account_id, ag.name AS agent_name, dr.trade_date, dr.status,
+               dr.narrative, dr.data_section
+          FROM daily_reports dr
+          JOIN accounts ac ON ac.id = dr.agent_id AND ac.role = 'main'
+          JOIN agents ag ON ag.id = ac.agent_id
+           AND ag.status NOT IN ('trial', 'archived')
+         WHERE {where}
+           AND dr.version = (SELECT MAX(dr2.version) FROM daily_reports dr2
+                              WHERE dr2.agent_id = dr.agent_id
+                                AND dr2.trade_date = dr.trade_date)
+         ORDER BY dr.agent_id, dr.trade_date
+        """, params).fetchall()]
+
+
+def _summarize_row(row: dict) -> tuple[dict, str]:
+    """抽取确定性摘要字段与叙述预览。"""
+    try:
+        ds = json.loads(row["data_section"] or "{}")
+    except (TypeError, ValueError):
+        ds = {}
+    smy = ds.get("summary") or {}
+    narrative = (row["narrative"] or "").strip()
+    return smy, narrative
+
+
+def build_daily_summary_body(state, trade_date: str) -> str | None:
+    """§5.4 每日总汇报（确定性拼接版，纯数据无叙述）：各策略 Agent 当日日报汇总 +
+    缺勤清单 + 当日结算/推送异常。管理 Agent LLM 点评接入前始终以本版兜底。"""
+    conn = state_conn(state)
+    rows = _latest_rows_by_account(conn, trade_date=trade_date)
+    if not rows:
+        return None
+    lines = [
+        f"# 每日总汇报 · {trade_date}",
+        "",
+        "> 确定性拼接版（纯数据汇总，spec-04 §5.4）：管理 Agent LLM 点评未接入，"
+        "下一自然日 20:00 重试前以此为准，不静默缺失。",
+        "",
+        "## 一、策略账户日报",
+        "",
+        "| Agent | 状态 | 现金 | 净值 | 当日盈亏 | 累计盈亏 | 叙述 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    absent_acc: list[str] = []
+    for r in rows:
+        smy, narrative = _summarize_row(r)
+        preview = ""
+        if narrative:
+            preview = narrative if len(narrative) <= 20 else narrative[:20] + "…"
+        if r["status"] == "absent":
+            absent_acc.append(f"{r['agent_name']}({r['account_id']})")
+        lines.append(
+            f'| {r["agent_name"]} | {_STATUS_LABEL.get(r["status"], r["status"])} '
+            f'| {smy.get("cash")} | {smy.get("nav")} | {smy.get("today_pnl")} '
+            f'| {smy.get("total_pnl")} | {preview} |')
+    if absent_acc:
+        lines += ["", "## 二、缺勤与异常"]
+        lines.append(f"- 缺勤：{'、'.join(absent_acc)}（当日结算缺口，数据段为可得部分）。")
+    errs = conn.execute(
+        "SELECT COUNT(*) n FROM audit_logs"
+        " WHERE ts LIKE ? AND action IN ('report.absent_auto','trade.eod_settle_auto',"
+        " 'trade.eod_catchup_auto','trade.corp_provider_gap') AND result != 'ok'",
+        (trade_date + "%",),
+    ).fetchone()["n"]
+    if errs:
+        lines.append(f"- 结算/推送异常事件 {errs} 起（详见审计）。")
+    else:
+        lines.append("- 今日无结算/推送异常。")
+    lines += ["", "## 三、待办", "- 审批待办：无（P1 审批流转未启用）。"]
+    return "\n".join(lines)
+
+
+def build_monthly_report_body(state, year: int, month: int) -> str | None:
+    """§5.5 月度《策略体检报告》（确定性 ①净值/回撤 ③健康度；②/④待 spec-05/02
+    供给，⑤ LLM 点评占位）。month=自然月；月内无 main 账户日报 → None。"""
+    mkey = f"{year:04d}-{month:02d}"
+    conn = state_conn(state)
+    rows = _latest_rows_by_account(conn, month=mkey)
+    if not rows:
+        return None
+    lines = [
+        f"# 月度《策略体检报告》· {mkey}",
+        "",
+        "> 确定性生成（spec-04 §5.5：①-③零 token 直接拼装；②概念验证进度待 spec-05"
+        " 供给、④费用月报待 spec-02 消费留痕、⑤下一步建议待管理 Agent LLM——均占位）。",
+        "",
+    ]
+    per_acc: dict[str, list[dict]] = {}
+    absent_days: dict[str, set] = {}
+    for r in rows:
+        per_acc.setdefault(r["account_id"], []).append(r)
+        if r["status"] == "absent":
+            absent_days.setdefault(r["account_id"], set()).add(r["trade_date"])
+    for aid in sorted(per_acc):
+        acc_rows = per_acc[aid]
+        name = acc_rows[0]["agent_name"]
+        navs = []
+        first = last = peak = 0.0
+        dd = None
+        for r in acc_rows:
+            smy, _ = _summarize_row(r)
+            try:
+                nav = float(smy.get("nav"))
+            except (TypeError, ValueError):
+                continue
+            navs.append(nav)
+        if navs:
+            first, last = navs[0], navs[-1]
+            peak = max(navs)
+            dd = (peak - last) / peak * 100.0 if peak else 0.0
+        sessions = len(acc_rows)
+        a_days = len(absent_days.get(aid, set()))
+        lines.append(f"### {name}（{aid}）")
+        lines += [
+            f"- ①净值（份额法口径）：月初/月末 {_plain(first) if first else '-'} / "
+            f"{_plain(last) if last else '-'}，月内最高 {_plain(peak) if peak else '-'}"
+            f"｜相对月内高点的当前回撤 {round(dd, 2) if dd is not None else '-'}%",
+            f"- ③健康度：{mkey} 内日报 {sessions} 个交易日版本，缺勤 {a_days} 日。",
+            "",
+        ]
+    errs = conn.execute(
+        "SELECT actor, COUNT(*) n FROM audit_logs"
+        " WHERE ts LIKE ? AND action LIKE 'trade.%' AND result IN ('error','partial')"
+        " GROUP BY actor ORDER BY actor", (mkey + "%",),
+    ).fetchall()
+    if errs:
+        lines.append("- 结算/数据异常审计（trade.* error|partial）："
+                     + "；".join(f"{e['actor']}×{e['n']}" for e in errs))
+    else:
+        lines.append("- 结算/数据异常审计：本月无。")
+    lines += [
+        "- ②概念验证进度：待 spec-05 供给（试运行验证统计）。",
+        "- ④费用月报：待 spec-02 §11 消费留痕接入。",
+        "- ⑤下一步建议：待管理 Agent LLM 撰写（P1 占位）。",
+    ]
+    return "\n".join(lines)
+
+
+def _push_to_manager(state, *, kind: str, scope_key: str, msg_type: str,
+                     body: str, detail: str) -> dict | None:
+    """确定性汇报正文送入管理 Agent 用户会话（幂等：同 kind+scope 已推则跳过）。"""
+    from core import chatstore  # noqa: PLC0415
+    if body is None:
+        return None
+    payload = json.dumps({"kind": kind, "scope": scope_key},
+                         ensure_ascii=False, sort_keys=True)
+    try:
+        conv = chatstore.ensure_user_chat(state, _MANAGER_AGENT)
+    except LookupError:
+        return None
+    conn = state_conn(state)
+    if conn.execute(
+        "SELECT 1 FROM messages WHERE conv_id=? AND payload_ref=? LIMIT 1",
+        (conv["id"], payload),
+    ).fetchone():
+        return None
+    msg = chatstore.insert_message(
+        state, conv_id=conv["id"], agent_id=_MANAGER_AGENT, direction="agent",
+        msg_type=msg_type, body=body, payload_ref=payload,
+        status="delivered", delivered_via="web")
+    try:
+        audit(state, _MANAGER_AGENT, "report.push", result="ok",
+              object_type="message", object_id=msg["id"], detail=detail)
+    except Exception:  # noqa: BLE001
+        pass
+    return msg
+
+
+def push_daily_summary(state, trade_date: str) -> dict | None:
+    """§5.4 每日总汇报（20:00，次月首交易日前每日生成）；幂等。"""
+    return _push_to_manager(
+        state, kind="daily_summary", scope_key=trade_date, msg_type="daily_summary",
+        body=build_daily_summary_body(state, trade_date),
+        detail=f"{trade_date} 每日总汇报（确定性拼接版）→ 管理 Agent 会话")
+
+
+def push_monthly_report(state, year: int, month: int) -> dict | None:
+    """§5.5 月度策略体检报告（次月首交易日 20:00 与总汇报同批，简化：次日滚动夜间重试）；幂等。"""
+    mkey = f"{year:04d}-{month:02d}"
+    return _push_to_manager(
+        state, kind="monthly_report", scope_key=mkey, msg_type="monthly_report",
+        body=build_monthly_report_body(state, year, month),
+        detail=f"{mkey} 月度策略体检报告（确定性版）→ 管理 Agent 会话")
