@@ -3,6 +3,7 @@ import type { RouteObject } from "react-router-dom";
 import SettingsPage from "../pages/Settings";
 import ChatPage from "../pages/chat/ChatPage";
 import AgentsPage from "../pages/agents/AgentsPage";
+import ReportsPage from "../pages/reports/ReportsPage";
 import TradingPage from "../pages/trading/TradingPage";
 import { ModulePlaceholder } from "../pages/Placeholder";
 import { NAV_ITEMS } from "../config/nav";
@@ -19,6 +20,8 @@ export const protectedChildren: RouteObject[] = [
         <AgentsPage />
       ) : n.key === "trading" ? (
         <TradingPage />
+      ) : n.key === "reports" ? (
+        <ReportsPage />
       ) : (
         <ModulePlaceholder nav={n} />
       ),

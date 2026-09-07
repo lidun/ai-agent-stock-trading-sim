@@ -290,3 +290,65 @@ export function listAccountSettlements(
 ): Promise<{ account_id: string; settlements: SettlementInfo[] }> {
   return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/settlements`);
 }
+
+// ---------- 日报域（spec-04 §5.2 daily_reports / spec-06 §6.6 日报中心数据源） ----------
+
+export interface ReportTimelineEntry {
+  trade_date: string;
+  latest_version: number;
+  status: "normal" | "absent" | "resend";
+  latest_created_ts: string;
+}
+
+export interface ReportDataSectionSummary {
+  cash: string | null;
+  nav: string | null;
+  total_pnl: string | null;
+  today_pnl: string | null;
+}
+
+export interface ReportDataSectionSettlement {
+  done: boolean;
+  status: string | null;
+  granularity_used: Record<string, string>;
+}
+
+export interface ReportDataSectionAnnotations {
+  degraded: string[];
+  unsettled: boolean;
+  notes: string[];
+}
+
+/** data_section 只读视图（快照/事件明细以 merged_markdown 为准渲染；本类型按需取摘要角标） */
+export interface ReportDataSection {
+  schema_version: string;
+  account_id: string;
+  trade_date: string;
+  summary: ReportDataSectionSummary;
+  settlement: ReportDataSectionSettlement;
+  annotations: ReportDataSectionAnnotations;
+}
+
+export interface ReportVersion {
+  id: string;
+  trade_date: string;
+  version: number;
+  status: "normal" | "absent" | "resend";
+  narrative: string;
+  merged_markdown: string;
+  data_section: ReportDataSection;
+  created_ts: string;
+}
+
+export function listReportTimeline(
+  agentId: string,
+): Promise<{ account_id: string; reports: ReportTimelineEntry[] }> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/reports`);
+}
+
+export function fetchReportVersions(
+  agentId: string,
+  tradeDate: string,
+): Promise<{ account_id: string; trade_date: string; versions: ReportVersion[] }> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}`);
+}

@@ -72,8 +72,8 @@ export const NAV_ITEMS: NavItem[] = [
     key: "reports",
     label: "日报中心",
     icon: <FileTextOutlined />,
-    eta: "P2",
-    desc: "日报生成链路：Agent 提交 → 双重审核 → 签发归档（spec-01 §6）",
+    eta: "P1",
+    desc: "引擎数据段日报时间线与阅读（spec-04 §5.2/§5.3：数据段零 token、缺勤/修订版本切换；spec-06 §6.6）",
   },
   {
     path: "/knowledge",
