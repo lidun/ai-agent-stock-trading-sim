@@ -311,6 +311,25 @@ def store_engine_report(state, account_id: str, trade_date: str, *,
             "version": version, "status": status}
 
 
+def list_report_dates(state, account_id: str, conn=None) -> list[dict]:
+    """日报时间线（spec-06 §6.6 数据源）：每日最新版本概览，新→旧。"""
+    c = conn or state_conn(state)
+    rows = c.execute(
+        "SELECT trade_date, version, status, created_ts FROM daily_reports"
+        " WHERE agent_id=? ORDER BY trade_date DESC, version DESC",
+        (account_id,),
+    ).fetchall()
+    seen: dict[str, dict] = {}
+    for r in rows:
+        seen.setdefault(r["trade_date"], {
+            "trade_date": r["trade_date"],
+            "latest_version": r["version"],
+            "status": r["status"],
+            "latest_created_ts": r["created_ts"],
+        })
+    return [seen[d] for d in sorted(seen, reverse=True)]
+
+
 def list_engine_reports(state, account_id: str, trade_date: str | None = None,
                         conn=None) -> list[dict]:
     """读 daily_reports 全部版本（新→旧）。data_section 已解析为 dict，供日报中心/API。"""
