@@ -20,7 +20,7 @@ import logging
 from datetime import date, datetime, time, timedelta, timezone
 from time import monotonic
 
-from core import accountstore, eodengine, quotes_tencent, settle_day
+from core import accountstore, eodengine, quotes_tencent, reporting, settle_day
 from core.auth import audit
 from core.db import state_conn
 
@@ -61,6 +61,7 @@ class EodSettleTrigger:
         self.corp_events = corp_events or {}
         self.corp_provider = corp_provider
         self._done_dates: set[str] = set()
+        self._gap_accounts: dict[str, list[dict] | None] = {}
         self._probe_cache: dict = {"at": 0.0, "day": None}
 
     def _corp_events_for(self, trade_date: str) -> dict:
@@ -162,8 +163,13 @@ class EodSettleTrigger:
         return {"tracked_accounts": len(accounts), "closed": closed, "updated": updated}
 
     def settle_once(self, now: datetime | None = None) -> dict:
-        """单次判定+触发。返回轻量状态机结果，供循环/测试消费。"""
-        now = now or bjt_now()
+        """单次判定+触发（含当日缺口账户记账，供 close_day_gaps 窗口关闭后补缺勤）。"""
+        outcome = self._settle_once(now or bjt_now())
+        self._record_gap_outcome(outcome)
+        return outcome
+
+    def _settle_once(self, now: datetime) -> dict:
+        """单次判定+触发（窗口探测/结算本体，无记账副作用）。返回轻量状态机结果。"""
         day = now.date()
         dstr = day.isoformat()
         clock = now.time()
@@ -255,11 +261,81 @@ class EodSettleTrigger:
                           "accounts": accts})
             if acct_errs:
                 errs.append({"date": d, "errors": acct_errs})
+                self._fill_catchup_absent(d, acct_errs)
             self._done_dates.add(d)
         self._audit("trade.eod_catchup_auto", "ok" if not errs else "partial",
                     f"快进回放 {len(trading)} 个会话日（{trading[0]}..{trading[-1]}），"
                     f"缺口会话 {len(errs)} 个")
         return {**base, "trading_dates": trading, "dates": dates, "errors": errs}
+
+    def _record_gap_outcome(self, outcome: dict) -> None:
+        """跟踪当日缺口账户（进程内）：结算落定/无错误 → 清标记；缺口 → 记原因。"""
+        dstr = outcome.get("date")
+        if not dstr:
+            return
+        errors = outcome.get("errors") or []
+        if not errors:
+            self._gap_accounts.pop(dstr, None)
+            return
+        self._gap_accounts[dstr] = [{
+            "account_id": a.get("account_id"),
+            "reason": (a.get("reason") or "结算缺口（行情/引擎数据供给拒绝）")[:12000],
+        } for a in errors if a.get("account_id")]
+
+    def close_day_gaps(self, now: datetime | None = None) -> dict:
+        """当日结算缺口在触发窗口结束后补生成缺勤日报（spec-04 §5.3，P1 最小实现）。
+
+        进程内记账的缺口账户（settle_once retry_gap 回报的 error 账户），于两种情况
+        视为窗口关闭：昨日及更早日期（settle_once 只处理“今天”，历史缺口由本方法收敛），
+        或今日已过 retry_until。届时账户仍无 settlement_log/daily_reports → 落
+        status=absent 日报（数据段=可得部分，叙述=缺口原因）；已有日报则幂等跳过。
+        跨进程恢复由 catchup_missed 兜底：启动重跑失败缺口日在同函数内直接补 absent。
+        """
+        now = now or bjt_now()
+        today = now.date().isoformat()
+        closed: list[dict] = []
+        for dstr, gaps in list(self._gap_accounts.items()):
+            if gaps is None:
+                continue
+            if dstr == today and now.time() < self.retry_until:
+                continue                     # 窗口仍开：留给窗口内续试，不提前缺勤
+            for g in gaps:
+                try:
+                    r = reporting.fill_absent_report(
+                        self.state, g["account_id"], dstr,
+                        f"结算任务未完成（{dstr}）：{g['reason']}")
+                except Exception:  # noqa: BLE001
+                    log.exception("缺勤日报补生成失败 %s %s", dstr, g["account_id"])
+                    continue
+                if not r["skipped"]:
+                    closed.append({"account_id": g["account_id"],
+                                   "trade_date": dstr,
+                                   "report": r["report"]})
+            self._gap_accounts[dstr] = None  # 该日缺口已收敛（成功/缺勤/幂等均视为已处理）
+        if closed:
+            self._audit("report.absent_auto", "ok",
+                        f"窗口关闭补缺勤日报 {len(closed)} 份："
+                        + "；".join(f"{c['account_id']}@{c['trade_date']}"
+                                   for c in closed))
+        return {"date": today, "absent": closed}
+
+    def _fill_catchup_absent(self, trade_date: str, acct_errs: list[dict]) -> list[dict]:
+        """快进回放某日存在缺口账户 → 补缺勤日报（幂等：已存在则跳过，原因以当日为准）。"""
+        made: list[dict] = []
+        for a in acct_errs:
+            aid = a.get("account_id")
+            if not aid:
+                continue
+            try:
+                r = reporting.fill_absent_report(
+                    self.state, aid, trade_date,
+                    f"结算任务未完成（{trade_date}）：{a.get('reason') or '数据供给缺口'}")
+            except Exception:  # noqa: BLE001
+                log.exception("缺勤日报补生成失败 %s %s", trade_date, aid)
+                continue
+            if not r["skipped"]:
+                made.append({"account_id": aid, "report": r["report"]})
+        return made
 
     def run_trial_backfill(self, *, now: datetime | None = None,
                            start: date | None = None) -> dict:
@@ -349,6 +425,7 @@ class EodSettleTrigger:
         while True:
             try:
                 outcome = self.settle_once()
+                self.close_day_gaps()
                 log.info("EOD 结算触发：%s %s", outcome["date"], outcome["status"])
                 self.run_trial_backfill()
             except asyncio.CancelledError:

@@ -153,3 +153,31 @@ def test_daily_report_status_guard(authed_client):
     else:
         raise AssertionError("status 校验未生效")
     assert len(reporting.list_engine_reports(st, DEMO, "2026-09-04")) == 1
+
+
+def test_fill_absent_report_backfills_data_and_guards(authed_client):
+    """缺勤日报补生成（spec-04 §5.3）：未结算日可得部分数据段 + 叙述=原因；幂等护栏，
+    结算成功后续版本照常补发。"""
+    st = authed_client.app.state
+    r = reporting.fill_absent_report(st, DEMO, "2026-09-08",
+                                     reason="行情分钟档未就绪，结算任务未完成")
+    assert r["skipped"] is False
+    assert r["report"]["status"] == "absent" and r["report"]["version"] == 1
+    row = reporting.list_engine_reports(st, DEMO, "2026-09-08")[0]
+    assert row["status"] == "absent"
+    assert row["narrative"] == "行情分钟档未就绪，结算任务未完成"
+    ds = row["data_section"]
+    assert ds["settlement"]["done"] is False and ds["annotations"]["unsettled"] is True
+    assert ds["summary"]["cash"] == "100000"           # 账户现值 = 可得部分口径
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='report.absent_auto'"
+    ).fetchone()[0] == 1
+    again = reporting.fill_absent_report(st, DEMO, "2026-09-08", reason="仍缺口")
+    assert again["skipped"] is True
+    assert len(reporting.list_engine_reports(st, DEMO, "2026-09-08")) == 1
+    _buy(st, day="2026-09-08", price=10.0)
+    tl = reporting.list_report_dates(st, DEMO)
+    assert tl[0]["trade_date"] == "2026-09-08"
+    assert tl[0]["latest_version"] == 2 and tl[0]["status"] == "normal"
+    late = reporting.fill_absent_report(st, DEMO, "2026-09-08", reason="X")
+    assert late["skipped"] is True

@@ -303,3 +303,63 @@ def test_settle_once_corp_delist_single_day_delivered(authed_client):
                         (DEMO,)).fetchone()["n"] == 0
     assert conn.execute("SELECT COUNT(*) n FROM holdings WHERE account_id=?",
                         (DEMO,)).fetchone()["n"] == 0
+
+
+def _report_rows(st, day):
+    return state_conn(st).execute(
+        "SELECT status, narrative FROM daily_reports WHERE agent_id=? AND trade_date=?",
+        (DEMO, day)).fetchall()
+
+
+def test_window_close_backfills_absent_for_gap_account(authed_client):
+    """spec-04 §5.3：当日结算缺口账户在触发窗口结束后补生成缺勤日报（叙述=原因），幂等。"""
+    st = authed_client.app.state
+    _insert_buy_order(st, order_id="ats-abs")
+    trig = settle_scheduler.EodSettleTrigger(st, feed=GapReplayFeed())
+    out = trig.settle_once(_at("15:40"))
+    assert out["status"] == "retry_gap" and out["errors"]
+    # 窗口仍开（< retry_until）→ 不提前缺勤，留给窗口内续试
+    assert trig.close_day_gaps(_at("15:45"))["absent"] == []
+    # 16:41 已过 retry_until → 缺口账户补 absent
+    r = trig.close_day_gaps(_at("16:41"))
+    assert len(r["absent"]) == 1 and r["absent"][0]["account_id"] == DEMO
+    assert r["absent"][0]["report"]["status"] == "absent"
+    rows = _report_rows(st, DATE)
+    assert len(rows) == 1 and rows[0]["status"] == "absent"
+    assert rows[0]["narrative"].startswith(f"结算任务未完成（{DATE}）：")
+    # 重复收敛 → 幂等不再新增
+    assert trig.close_day_gaps(_at("16:42"))["absent"] == []
+    assert len(_report_rows(st, DATE)) == 1
+
+
+class GapMinuteFeed(DayRowsFeed):
+    """交易日轴齐备但分钟/日线估值档缺口（历史回放的数据缺口日场景）。"""
+
+    def replay_day(self, symbol, trade_date):
+        from core import quotes_tencent as q
+        raise q.QuoteGapError(f"{symbol} {trade_date} 分钟档未就绪")
+
+    def daily_pair(self, symbol, trade_date):
+        from core import quotes_tencent as q
+        raise q.QuoteGapError(f"{symbol} {trade_date} 日线对未就绪")
+
+
+def test_catchup_gap_day_backfills_absent_report(authed_client):
+    """快进回放中某日账户结算缺口 → 当日补缺勤日报；幂等（重跑不重复补），无缺口日不动。"""
+    st = authed_client.app.state
+    _insert_buy_order(st, order_id="ats-cgap", qty=100,
+                      created="2026-09-03T09:00:00")
+    trig = settle_scheduler.EodSettleTrigger(st, feed=GapMinuteFeed())
+    out = trig.catchup_missed(now=datetime.fromisoformat("2026-09-05T08:00:00"))
+    assert [e["date"] for e in out["errors"]] == ["2026-09-03"]
+    rows = _report_rows(st, "2026-09-03")
+    assert len(rows) == 1 and rows[0]["status"] == "absent"
+    assert rows[0]["narrative"].startswith("结算任务未完成（2026-09-03）：")
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='report.absent_auto'"
+    ).fetchone()[0] == 1
+    # 幂等：新实例再次回放 → 不再新增 absent 行
+    again = settle_scheduler.EodSettleTrigger(st, feed=GapMinuteFeed())
+    out2 = again.catchup_missed(now=datetime.fromisoformat("2026-09-05T08:05:00"))
+    assert [e["date"] for e in out2["errors"]] == ["2026-09-03"]
+    assert len(_report_rows(st, "2026-09-03")) == 1

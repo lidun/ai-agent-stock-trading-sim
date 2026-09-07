@@ -311,6 +311,55 @@ def store_engine_report(state, account_id: str, trade_date: str, *,
             "version": version, "status": status}
 
 
+def fill_absent_report(state, account_id: str, trade_date: str, reason: str,
+                       *, actor: str = "scheduler", conn=None) -> dict:
+    """缺勤日报补生成（spec-04 §5.3）：结算任务未完成/缺口 → status=absent 落库。
+
+    数据段照常补齐"可得部分"（账户当前现值口径 + annotations.unsettled 角标），叙述段
+    = 原因说明。幂等护栏：该 (account_id, trade_date) 已有任意版本日报 → 直接返回
+    skipped（结算成功后由后续版本补发，同日不再叠加 absent 行）。返回：
+    {"skipped": True, "reason": reason} 或 {"skipped": False, "report": {…}}。"""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("缺勤日报须提供原因说明")
+    reason = reason.strip()
+    c = conn or state_conn(state)
+    if c.execute(
+        "SELECT 1 FROM daily_reports WHERE agent_id=? AND trade_date=? LIMIT 1",
+        (account_id, trade_date),
+    ).fetchone():
+        return {"skipped": True, "reason": reason}
+    if conn is None:
+        from core.db import write_txn
+        with write_txn(c) as cw:
+            out = _insert_absent_locked(cw, account_id, trade_date, reason, actor)
+        return out
+    return _insert_absent_locked(c, account_id, trade_date, reason, actor)
+
+
+def _insert_absent_locked(c, account_id: str, trade_date: str, reason: str,
+                          actor: str) -> dict:
+    """事务连接内插入 absent 日报 + 审计（调用方已持有写事务/连接）。"""
+    ds = build_engine_data_section(None, account_id, trade_date, conn=c)
+    markdown = render_engine_data_markdown(ds)
+    rid = "dr" + secrets.token_hex(10)
+    c.execute(
+        "INSERT INTO daily_reports(id, agent_id, trade_date, version, data_section,"
+        " narrative, merged_markdown, status, created_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+        (rid, account_id, trade_date, 1, json.dumps(ds, ensure_ascii=False),
+         reason, markdown, "absent", _now_iso()),
+    )
+    c.execute(
+        "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+        " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+        (_now_iso(), actor, "report.absent_auto", "daily_reports", rid, "absent",
+         json.dumps({"trade_date": trade_date, "reason": reason[:400]},
+                    ensure_ascii=False), ""),
+    )
+    return {"skipped": False,
+            "report": {"id": rid, "account_id": account_id,
+                       "trade_date": trade_date, "version": 1, "status": "absent"}}
+
+
 def list_report_dates(state, account_id: str, conn=None) -> list[dict]:
     """日报时间线（spec-06 §6.6 数据源）：每日最新版本概览，新→旧。"""
     c = conn or state_conn(state)
