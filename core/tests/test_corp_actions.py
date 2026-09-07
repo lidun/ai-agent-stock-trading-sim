@@ -411,3 +411,104 @@ def test_corp_multi_event_same_day_split_and_dividend(authed_client):
         " GROUP BY action ORDER BY action").fetchall()
     assert {(a["action"], a["n"]) for a in au} == \
         {("corp_action.dividend", 1), ("corp_action.split", 1)}
+
+
+def test_corp_delist_arrange_force_clear(authed_client):
+    """退市整理期首日：按当日官方收盘价自动清仓（收卖出规费），持仓/流水清空、审计留痕。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 9.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "delist", "delist_type": "整理",
+                                "price": 9.0, "note": "进入退市整理期首日，按官方收盘清仓"}},
+    )
+    assert not r["already_settled"]
+    assert r["corp_applied"] == 1 and r["corp_symbols"] == ["600000"]
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    # 卖 9000：佣金5 + 印花4.5 + 过户0.09 = 9.59 → 净 8990.41
+    assert abs(cash - (100000.0 - 10005.1 + 8990.41)) < 0.01
+    assert conn.execute("SELECT COUNT(*) n FROM holdings WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM lots WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM trades WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 1      # 仅原买单流水，清仓不入流水
+    au = conn.execute(
+        "SELECT result, detail FROM audit_logs WHERE action='corp_action.delist'").fetchone()
+    d = json.loads(au["detail"])
+    assert au["result"] == "cleared:1000"
+    assert d["price"] == "9" and d["net_credit"] == "8990.41" and d["quality"] == "official_close"
+
+
+def test_corp_delist_direct_stale_price(authed_client):
+    """直接退市：按停牌末价核销（stale 标注），无当日行情需求。"""
+    st = authed_client.app.state
+    _buy(st, qty=500, price=12.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={}, prev_close_map={"600000": 12.0},   # 无当日 close：退市票不参与估值
+        corp_events={"600000": {"kind": "delist", "delist_type": "直接",
+                                "price": 7.2, "stale": True,
+                                "note": "直接退市按停牌末价核销"}},
+    )
+    assert r["corp_applied"] == 1
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    # 买 500@12 费 5.06；卖 3600：佣金5 + 印花1.8 + 过户0.04 = 6.84 → 净 3593.16
+    assert abs(cash - (100000.0 - 6005.06 + 3593.16)) < 0.01
+    au = conn.execute(
+        "SELECT result, detail FROM audit_logs WHERE action='corp_action.delist'").fetchone()
+    d = json.loads(au["detail"])
+    assert au["result"] == "cleared:500"
+    assert d["quality"] == "stale" and d["price"] == "7.2"
+
+
+def test_corp_delist_zero_settlement(authed_client):
+    """整理期最后交易日跌停封死：零值核销，现金零入账、持仓清空、审计 zeroed。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={}, prev_close_map={"600000": 1.0},
+        corp_events={"600000": {"kind": "delist", "delist_type": "整理",
+                                "settle": "zero",
+                                "note": "整理期最后交易日跌停封死无法成交"}},
+    )
+    assert r["corp_applied"] == 1
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash - (100000.0 - 10005.1)) < 0.01       # 零入账
+    assert conn.execute("SELECT COUNT(*) n FROM holdings WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
+    au = conn.execute(
+        "SELECT result, detail FROM audit_logs WHERE action='corp_action.delist'").fetchone()
+    assert au["result"] == "zeroed:1000"
+    assert json.loads(au["detail"])["settle"] == "zero"
+
+
+def test_corp_delist_day_orders_invalid(authed_client):
+    """退市当日该票 active 买单/卖单 → invalid delisted（防同日二次卖出/买入悖论）。"""
+    st = authed_client.app.state
+    _buy(st, qty=1000, price=10.0)
+    _insert_order(st, order_id="D-SEL", order_type="sell_take_profit", direction="sell",
+                  qty=1000, trigger={"op": "ge", "price": 9.5}, day="2026-09-08")
+    _insert_order(st, order_id="D-BUY", order_type="buy", direction="buy",
+                  qty=100, trigger={"op": "le", "price": 8.8}, day="2026-09-08")
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, series_map={"600000": [(f"{ex}T09:31:00", 9.0),
+                                             (f"{ex}T09:32:00", 9.0)]},
+        close_map={"600000": 9.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "delist", "delist_type": "整理", "price": 9.0}},
+    )
+    assert r["corp_applied"] == 1
+    conn = state_conn(st)
+    rows = conn.execute(
+        "SELECT id, status, invalid_reason FROM condition_orders "
+        "WHERE id IN ('D-SEL','D-BUY') ORDER BY id").fetchall()
+    assert [(x["id"], x["status"], x["invalid_reason"]) for x in rows] == \
+        [("D-BUY", "invalid", "delisted"), ("D-SEL", "invalid", "delisted")]
+    assert conn.execute("SELECT COUNT(*) n FROM trades WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 1      # 无二次成交

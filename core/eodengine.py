@@ -491,7 +491,7 @@ def _dividend_tax_rate(buy_date: str, ex_date: str) -> Decimal:
 
 
 def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
-                       now: str) -> dict:
+                       now: str, fee: dict | None = None) -> dict:
     """除权日公司行动（spec-01 §2.2/§6.6；结算事务内首步调用，按事件 kind 分派）。
 
     events[symbol] 可为单个事件 dict，也可为事件 dict 列表（同票同日多事件，如
@@ -507,8 +507,16 @@ def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
     放弃（不动现金/持仓，仅审计）；participate=True 时按存量 lot remaining × r × p
     扣现金缴款并新增配股 lot（配股价成本、buy_date=ex_date，T+1 后才可卖，当日新增
     lot 不参与本日卖出），现金不足以缴款 → 自动放弃并审计（declined_insufficient）。
-    配股缴款额经返回 cash_credit（负值）纳入守恒式一。
-    其他 kind（delist…）未实现 → EngineGapError（不静默、不虚构入账，归 §6.6 后续切片）。
+     配股缴款额经返回 cash_credit（负值）纳入守恒式一。
+     其他 kind → EngineGapError（不静默、不虚构入账）。
+     {"kind": "delist", "delist_type": "整理|直接", "price": p, "stale": bool,
+     "note": str}——退市处理（spec-01 §6.6，数据供给在参考/行情侧确证后注入：
+     整理期首日按当日官方收盘价、直接退市按停牌末价等真实历史价，防引擎虚构估值）：
+     存量持仓按官方价自动清仓（价格必给，另收卖出规费，净额经返回 cash_credit 正注入
+     ——该虚拟清仓不写 trades 流水，证据全量落审计 corp_action.delist），当日该票
+     订单随后由结算标记 invalid（delisted，防同日二次卖出）；整理期最后一交易日跌停封死
+     无法成交 → 数据供给注入 {"kind": "delist", "settle": "zero", ...}，引擎按零值
+     核销（现金零入账、持仓清空、审计 zeroed）。
     """
     out = {"applied": 0, "symbols": [], "cash_credit": Decimal("0")}
     for symbol in sorted(events):
@@ -522,6 +530,8 @@ def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
                 applied = _corp_dividend(c, account_id, ex_date, symbol, ev, now, out)
             elif kind == "rights":
                 applied = _corp_rights(c, account_id, ex_date, symbol, ev, now, out)
+            elif kind == "delist":
+                applied = _corp_delist(c, account_id, ex_date, symbol, ev, now, out, fee)
             else:
                 raise EngineGapError(
                     f"corp_action kind={kind}（{symbol}）引擎侧未支持（spec-01 §6.6 后续切片）"
@@ -769,6 +779,90 @@ def _corp_rights(c, account_id: str, ex_date: str, symbol: str, ev: dict,
     return True
 
 
+def _corp_delist(c, account_id: str, ex_date: str, symbol: str, ev: dict,
+                 now: str, out: dict, fee: dict | None = None) -> bool:
+    """退市处理（spec-01 §6.6）：引擎不虚构退市成交价，价格/零值由数据供给确证后注入。
+
+    - settle='zero'：整理期最后交易日跌停封死无法成交 → 按零值核销（现金零入账，
+      持仓清空、审计 zeroed）。
+    - 否则须给 price（整理期首日官方收盘 / 直接退市停牌末价等真实历史价）：按该价
+      自动清仓存量持仓，另收卖出规费（账户费率透传，默认 FEES），净额经 out 现金路径
+      注入（虚拟清仓不写 trades 流水，证据全量落审计，避免守恒式一重复计流）。
+    幂等：corp 已应用过的同日事件由调用方 settle_key 保护；本函数仍以无存量持仓为
+    no-op（当日无对象）。当日该票订单由结算 delisted 标记统一 invalid（防双卖）。
+    """
+    f = {k: Decimal(str(v)) for k, v in (fee or FEES).items()}
+    zero_mode = str(ev.get("settle") or "").lower() == "zero"
+    price = Decimal("0")
+    if not zero_mode:
+        try:
+            price = Decimal(str(ev.get("price") or "0"))
+        except Exception as exc:
+            raise EngineError(f"corp_action {symbol} delist price 非法: {exc}") from exc
+        if price <= 0:
+            raise EngineError(f"corp_action {symbol} delist 须 price > 0（防虚构估值）")
+    rows = c.execute(
+        """
+        SELECT l.id, l.buy_date, l.quantity, l.remaining, l.buy_price, l.corp_action_flags,
+               h.id AS holding_id
+          FROM lots l JOIN holdings h ON h.id = l.holding_id
+         WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+           AND l.remaining > 0
+         ORDER BY l.buy_date ASC, l.id ASC
+        """,
+        (account_id, symbol, ex_date),
+    ).fetchall()
+    if not rows:
+        return False                       # 无存量持仓：无对象可核销/清仓
+    hid = rows[0]["holding_id"]
+    lots = [{"id": r["id"], "buy_date": r["buy_date"],
+             "quantity": _plain(_D(r["quantity"])),
+             "remaining": _plain(_D(r["remaining"])),
+             "buy_price": _plain(_D(r["buy_price"]))} for r in rows]
+    qty = sum((_D(r["remaining"]) for r in rows), Decimal("0"))
+    fee_bits: dict[str, Decimal] = {}
+    net = Decimal("0")
+    if zero_mode:
+        result = f"zeroed:{_plain(qty)}"
+        detail = {
+            "symbol": symbol, "ex_date": ex_date, "settle": "zero",
+            "quantity": _plain(qty), "proceeds": "0",
+            "delist_type": str(ev.get("delist_type") or "整理"),
+            "note": str(ev.get("note") or "整理期最后交易日跌停封死无法成交 → 零值核销"),
+        }
+    else:
+        amount = (qty * price).quantize(_MONEY, ROUND_HALF_UP)
+        fee_bits = _fees(amount, side="sell", fee=f)
+        net = (amount - fee_bits["total"]).quantize(_MONEY, ROUND_HALF_UP)
+        out["cash_credit"] += net
+        result = f"cleared:{_plain(qty)}"
+        detail = {
+            "symbol": symbol, "ex_date": ex_date, "delist_type":
+                str(ev.get("delist_type") or "退市整理"),
+            "price": _plain(price), "quantity": _plain(qty),
+            "gross_proceeds": _plain(amount), "fees": {k: _plain(v) for k, v in fee_bits.items()},
+            "net_credit": _plain(net),
+            "quality": "stale" if bool(ev.get("stale")) else "official_close",
+            "note": str(ev.get("note") or "按官方收盘/停牌末价自动清仓"),
+        }
+    # 清仓落库：删除该票存量 lots 与 holdings（当日该票订单随后 invalid delisted）
+    c.execute(
+        "DELETE FROM lots WHERE account_id=? AND holding_id=?",
+        (account_id, hid),
+    )
+    c.execute(
+        "DELETE FROM holdings WHERE account_id=? AND symbol=?",
+        (account_id, symbol),
+    )
+    c.execute(
+        "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+        " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+        (now, account_id, "corp_action.delist", "holding", hid, result,
+         json.dumps({"lots": lots, **detail}, ensure_ascii=False), ""),
+    )
+    return True
+
+
 def settle_account(
     state,
     account_id: str,
@@ -821,9 +915,13 @@ def settle_account(
     简化档红利税逐 lot 计税，默认不计），成本与数量不变；{"kind": "rights", "ratio": r,
     "price": p, "participate": bool} 配股——默认放弃（审计），participate=True 现金缴款
     并新增配股 lot（T+1 后可卖），现金不足自动放弃（declined_insufficient）。split 外
-    现金变动（分红净额/配股缴款）经 corp_cash 注入当日现金并计入守恒式一。其他 kind
-    （delist…）未实现 → EngineGapError（不静默虚构）。默认缺省不传 → 无公司行动行为。
-    """
+     现金变动（分红净额/配股缴款/退市清仓净额）经 corp_cash 注入当日现金并计入守恒式一。
+     {"kind": "delist", "delist_type": "整理|直接", "price": p, "stale": bool} 退市——存量
+     持仓按官方收盘/停牌末价自动清仓（price 必给、防虚构；另收卖出规费，虚拟清仓不写 trades
+     流水、证据落审计），当日该票订单统一 invalid（delisted）；{"kind": "delist",
+     "settle": "zero", ...} 整理期最后交易日跌停封死 → 零值核销。其他 kind → EngineGapError
+     （不静默虚构）。默认缺省不传 → 无公司行动行为。
+     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
     l2_map = l2_map or {}
@@ -943,7 +1041,7 @@ def settle_account(
             (account_id,),
         ).fetchall()
         if corp_events:
-            corp_out = apply_corp_actions(c, account_id, trade_date, corp_events, now)
+            corp_out = apply_corp_actions(c, account_id, trade_date, corp_events, now, fee=f)
 
         orders = c.execute(
             """
@@ -994,6 +1092,19 @@ def settle_account(
             if toks:
                 o["status"] = "invalid"
                 o["invalid_reason"] = "restricted_buy:" + ",".join(sorted(toks))
+
+        # 当日退市票（corp delist）：自动清仓已按官方价成交 → 该票当日订单统一 invalid
+        # （delisted，防同日二次卖出/买入悖论；整理期/直接退市后无正常成交窗口）
+        delisted_syms: set[str] = set()
+        if corp_events:
+            for _sym, _raw in corp_events.items():
+                _evs = _raw if isinstance(_raw, list) else [_raw]
+                if any(str(_e.get("kind")) == "delist" for _e in (_evs or [])):
+                    delisted_syms.add(_sym)
+        for o in active:
+            if o["symbol"] in delisted_syms:
+                o["status"] = "invalid"
+                o["invalid_reason"] = "delisted"
 
         granularity_used: dict[str, str] = {}
 
