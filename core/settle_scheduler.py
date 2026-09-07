@@ -20,7 +20,7 @@ import logging
 from datetime import date, datetime, time, timedelta, timezone
 from time import monotonic
 
-from core import accountstore, eodengine, quotes_tencent, reporting, settle_day
+from core import accountstore, approval, eodengine, quotes_tencent, reporting, settle_day
 from core.auth import audit
 from core.db import state_conn
 
@@ -478,6 +478,12 @@ class EodSettleTrigger:
                 log.info("EOD 结算触发：%s %s（日报直达推送 %s 条）",
                          outcome["date"], outcome["status"], len(pushed))
                 self.run_trial_backfill()
+                try:
+                    expired = approval.expire_overdue(self.state)
+                    if expired:
+                        log.info("审批单过期清扫：%s 件（spec-04 §4.4）", expired)
+                except Exception:  # noqa: BLE001
+                    log.exception("审批单过期清扫失败（下个 tick 重试）")
                 await self._notify_report_pushes(pushed)
                 await self._evening_summaries(bjt_now())
             except asyncio.CancelledError:

@@ -537,6 +537,39 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE agents ADD COLUMN notify_daily INTEGER NOT NULL DEFAULT 1;
         """,
     ),
+    (
+        17,
+        """
+        -- 审批单（spec-04 §4.1 approval_requests，独立成表 + 确定性短路 §4.2）。
+        -- type 覆盖五类 + launch（v0.4）；本阶段实现 risk/exemption 豁免类效果器（§4.1），
+        -- 其余 type 先走通用待办/过期/审计流程（效果器按 type 注册，未注册 type 通过后仅留痕）。
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            id             TEXT PRIMARY KEY,
+            type           TEXT NOT NULL
+                           CHECK (type IN ('task', 'granularity', 'capability',
+                                           'risk', 'exemption', 'launch')),
+            agent_id       TEXT NOT NULL REFERENCES agents(id),
+            payload        TEXT NOT NULL DEFAULT '{}',
+            content_hash   TEXT NOT NULL DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending', 'approved', 'rejected',
+                                             'expired', 'withdrawn')),
+            decided_by     TEXT NOT NULL DEFAULT '',
+            decided_ts     TEXT NOT NULL DEFAULT '',
+            reason         TEXT NOT NULL DEFAULT '',
+            expires_ts     TEXT NOT NULL,
+            close_note     TEXT NOT NULL DEFAULT '',
+            result_ref     TEXT NOT NULL DEFAULT '',
+            created_ts     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_status_expires
+            ON approval_requests(status, expires_ts);
+        CREATE INDEX IF NOT EXISTS idx_approval_hash
+            ON approval_requests(content_hash);
+        CREATE INDEX IF NOT EXISTS idx_approval_agent_type
+            ON approval_requests(agent_id, type, status);
+        """,
+    ),
 ]
 
 
