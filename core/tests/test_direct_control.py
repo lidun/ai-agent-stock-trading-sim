@@ -118,6 +118,30 @@ def test_freeze_security_gate_and_unfreeze(authed_client):
     assert mgr.status_code == 409
 
 
+def test_control_notify_in_conversation(authed_client):
+    """直控干预自动通知子 Agent：消息出现在对话面板（未读角标联动）。"""
+    h = csrf_headers(authed_client)
+    fr = authed_client.post(f"/api/agents/{DEMO}/frozen",
+                            json={"symbol": "600519", "reason": "通知验证"},
+                            headers=h)
+    assert fr.status_code == 200
+    un = authed_client.delete(f"/api/agents/{DEMO}/frozen/600519", headers=h)
+    assert un.status_code == 200
+    convs = authed_client.get("/api/conversations").json()["conversations"]
+    conv = next(c for c in convs if c["agent_id"] == DEMO and c["conv_type"] == "user_chat")
+    assert conv["unread"] == 2
+    assert conv["last_message"]["msg_type"] == "control"
+    assert conv["last_message"]["body"].startswith("## 直控干预")
+    # 读消息面板可拉取两条 control 回执
+    msgs = authed_client.get(
+        f"/api/conversations/{conv['id']}/messages").json()["messages"]
+    control_msgs = [m for m in msgs if m["msg_type"] == "control"]
+    assert len(control_msgs) == 2
+    bodies = {m["body"] for m in control_msgs}
+    assert any(b.startswith("## 直控干预 · 冻结证券 600519") for b in bodies)
+    assert any("已恢复买入" in b for b in bodies)
+
+
 def test_control_guards(authed_client):
     # 管理 Agent 无交易账户
     mgr = authed_client.patch(f"/api/agents/{MANAGER}/control",

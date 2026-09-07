@@ -16,6 +16,7 @@ const AGENT_TYPE_LABEL: Record<string, string> = {
   daily_summary: "总汇报",
   monthly_report: "月度体检报告",
   system_event: "系统事件",
+  control: "直控干预",
 };
 
 const STATUS_LABEL: Record<string, { text: string; color?: string }> = {

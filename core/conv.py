@@ -25,6 +25,19 @@ SessionDep = Annotated[dict, Depends(require_session)]
 MSG_LIMIT = 50
 
 
+def _notify_control(state, agent_id: str, body: str) -> dict | None:
+    """直控干预自动通知子 Agent 纳入复盘（spec-06 §6.3：消息出现在对话面板）。"""
+    try:
+        conv = chatstore.ensure_user_chat(state, agent_id)
+    except LookupError:
+        return None
+    return chatstore.insert_message(
+        state, conv_id=conv["id"], agent_id=agent_id,
+        direction="agent", msg_type="control", body=body,
+        status="delivered", delivered_via="system",
+    )
+
+
 class ConversationCreateIn(BaseModel):
     agent_id: str = Field(min_length=1, max_length=128)
 
@@ -108,6 +121,10 @@ def freeze_security(agent_id: str, payload: FrozenIn,
           object_type="account", object_id=result["account_id"],
           detail=f"冻结证券 {payload.symbol}：取消该票买入单 {result['cancelled_buy_orders']} 张",
           ctx=get_request_context(request))
+    _notify_control(request.app.state, agent_id,
+                    f"## 直控干预 · 冻结证券 {payload.symbol}\n"
+                    f"- 取消该票买入条件单 {result['cancelled_buy_orders']} 张（保留卖出与风控）\n"
+                    f"- 生效：即时；请将本次干预纳入复盘")
     return result
 
 
@@ -126,6 +143,10 @@ def unfreeze_security(agent_id: str, symbol: str,
           object_type="account", object_id=result["agent_id"],
           detail=f"解除冻结证券 {symbol}",
           ctx=get_request_context(request))
+    _notify_control(request.app.state, agent_id,
+                    f"## 直控干预 · 解除冻结 {symbol}\n"
+                    f"- 已恢复买入（此前被取消的单据不自动重建）\n"
+                    f"- 生效：即时；请将本次干预纳入复盘")
     return result
 
 
@@ -146,6 +167,11 @@ def control_agent(agent_id: str, payload: ControlIn,
           object_type="account", object_id=result["account"]["id"],
           detail=f"直控 {label}：账户状态 {result['from']} → {result['to']}",
           ctx=get_request_context(request))
+    _notify_control(request.app.state, agent_id,
+                    f"## 直控干预 · {label}\n"
+                    f"- 账户状态：{result['from']} → {result['to']}\n"
+                    f"- 生效：即时（引擎闸门秒级拦截）\n"
+                    f"- 请将本次干预纳入复盘（审计 account.control_{payload.op} 已留痕）")
     return result
 
 
@@ -163,6 +189,15 @@ def emergency_sell_all(agent_id: str, request: Request, session: SessionDep):
           detail=f"紧急清仓：生成卖出条件单 {len(result['orders'])} 张"
                  f"（持仓 {result['holdings']} 只）",
           ctx=get_request_context(request))
+    if result["blocked_halted"]:
+        note = "账户处于熔断冻结态，卖出被闸门拦截，本次清仓未生成任何条件单"
+    else:
+        note = f"已为 {result['holdings']} 只持仓生成 {len(result['orders'])} 张市价卖出条件单"
+    _notify_control(request.app.state, agent_id,
+                    f"## 直控干预 · 紧急清仓\n"
+                    f"- {note}\n"
+                    f"- 生效：即时（不经 LLM）\n"
+                    f"- 请将本次干预纳入复盘（审计 account.emergency_sell 已留痕）")
     return result
 
 
