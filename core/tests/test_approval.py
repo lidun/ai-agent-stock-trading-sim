@@ -150,3 +150,72 @@ def test_list_approvals_filter_and_default_status(authed_client):
     assert len(approval.list_approvals(st, status="approved")) == 0
     assert len(approval.list_approvals(st, agent_id=DEMO, status="pending")) == 1
     assert approval.list_approvals(st, agent_id="no-such") == []
+
+
+# ---------------- 审批域 API（spec-06 §6.10 审批中心数据源） ----------------
+
+def _csrf(client):
+    client.get("/api/auth/csrf")
+    from conftest import csrf_headers
+    return csrf_headers(client)
+
+
+def _post(client, url, body):
+    return client.post(url, json=body, headers=_csrf(client))
+
+
+def _patch(client, url, body):
+    return client.patch(url, json=body, headers=_csrf(client))
+
+
+def test_approval_api_end_to_end(authed_client):
+    """审批中心 API：提交→列表待办→通过生效 buy_exempt→二次决退回；审计留痕。"""
+    st = authed_client.app.state
+    r = _post(authed_client, "/api/approvals", {
+        "type": "exemption", "agent_id": DEMO,
+        "payload": {"tokens": ["st"]}, "reason": "拟布局 ST 摘帽",
+    })
+    assert r.status_code == 200 and r.json()["ok"] is True
+    ap_id = r.json()["approval"]["id"]
+    listing = authed_client.get("/api/approvals?status=pending").json()
+    assert any(a["id"] == ap_id for a in listing["approvals"])
+    detail = authed_client.get(f"/api/approvals/{ap_id}").json()["approval"]
+    assert detail["status"] == "pending" and detail["type_label"] == "豁免"
+    decided = _patch(authed_client, f"/api/approvals/{ap_id}/decision",
+                     {"decision": "approved", "reason": "风控口径可接受"})
+    assert decided.status_code == 200 and decided.json()["approval"]["status"] == "approved"
+    acc = state_conn(st).execute(
+        "SELECT buy_exempt FROM accounts WHERE id=?", (DEMO,)).fetchone()
+    assert json.loads(acc["buy_exempt"]) == ["st"]
+    # 二次决 → 200 + ok:false（迟到/重复仅留痕）
+    again = _patch(authed_client, f"/api/approvals/{ap_id}/decision",
+                   {"decision": "rejected"})
+    assert again.json()["ok"] is False and again.json()["reason"] == "already"
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='approval.decide'"
+    ).fetchone()[0] == 2   # 通过 + 重复决定留痕
+
+
+def test_approval_api_requires_session(client):
+    """未登录一律 401（含 GET/POST/PATCH）。"""
+    assert client.get("/api/approvals").status_code == 401
+    assert client.get("/api/approvals?status=pending").status_code == 401
+    assert client.get("/api/approvals/no-such").status_code == 401
+    assert client.post("/api/approvals", json={}).status_code == 401
+    assert client.patch("/api/approvals/no-such/decision",
+                        json={"decision": "approved"}).status_code == 401
+
+
+def test_approval_api_guards(authed_client):
+    """守卫：未知 Agent/审批单 404、非法 type/状态过滤 400。"""
+    assert authed_client.get("/api/approvals").status_code == 200
+    assert _post(authed_client, "/api/approvals", {
+        "type": "exemption", "agent_id": "no-such-agent",
+        "payload": {"tokens": ["st"]}, "reason": "x"}).status_code == 404
+    assert _post(authed_client, "/api/approvals", {
+        "type": "bogus", "agent_id": DEMO,
+        "payload": {"tokens": ["st"]}, "reason": "x"}).status_code == 400
+    assert _patch(authed_client, "/api/approvals/no-such/decision",
+                  {"decision": "approved"}).status_code == 404
+    assert authed_client.get("/api/approvals?status=bogus").status_code == 400
+    assert authed_client.get("/api/approvals/no-such").status_code == 404

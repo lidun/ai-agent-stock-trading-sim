@@ -13,8 +13,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core import __version__
-from core.api import CsrfMiddleware, SecurityHeadersMiddleware, api
 from core.account_routes import router as account_router
+from core.api import CsrfMiddleware, SecurityHeadersMiddleware, api
+from core.approval_routes import router as approval_router
 from core.auth import router as auth_router
 from core.conv import router as conv_router
 from core.config import Settings, settings_from_override
@@ -92,6 +93,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(conv_router)
     app.include_router(account_router)
     app.include_router(report_router)
+    app.include_router(approval_router)
 
     if settings.eod_auto_settle:
         # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点
