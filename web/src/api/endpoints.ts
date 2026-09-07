@@ -385,3 +385,61 @@ export function updatePushSettings(
     notify_daily: notifyDaily,
   });
 }
+
+// ---------- 审批域（spec-04 §4 / spec-06 §6.10 审批中心） ----------
+
+export interface ApprovalInfo {
+  id: string;
+  type: string;
+  type_label: string;
+  agent_id: string;
+  payload: Record<string, unknown>;
+  content_hash: string;
+  status: "pending" | "approved" | "rejected" | "expired" | "withdrawn";
+  status_label: string;
+  decided_by: string;
+  decided_ts: string;
+  reason: string;
+  expires_ts: string;
+  close_note: string;
+  result_ref: string;
+  created_ts: string;
+}
+
+export function listApprovals(params: {
+  agentId?: string;
+  status?: string;
+  limit?: number;
+}): Promise<{ approvals: ApprovalInfo[] }> {
+  const q = new URLSearchParams();
+  if (params.agentId) q.set("agent_id", params.agentId);
+  if (params.status) q.set("status", params.status);
+  if (params.limit) q.set("limit", String(params.limit));
+  const s = q.toString();
+  return apiGet(`/api/approvals${s ? `?${s}` : ""}`);
+}
+
+export function fetchApproval(approvalId: string): Promise<{ approval: ApprovalInfo }> {
+  return apiGet(`/api/approvals/${encodeURIComponent(approvalId)}`);
+}
+
+export function submitApproval(body: {
+  type: string;
+  agent_id: string;
+  payload: Record<string, unknown>;
+  reason: string;
+  cooldown_exempt?: boolean;
+}): Promise<{ ok: boolean; reason?: string; detail?: string; approval?: ApprovalInfo }> {
+  return apiPost("/api/approvals", body);
+}
+
+export function decideApproval(
+  approvalId: string,
+  decision: "approved" | "rejected",
+  reason?: string,
+): Promise<{ ok: boolean; reason?: string; detail?: string; approval?: ApprovalInfo }> {
+  return apiPatch(`/api/approvals/${encodeURIComponent(approvalId)}/decision`, {
+    decision,
+    reason: reason ?? "",
+  });
+}

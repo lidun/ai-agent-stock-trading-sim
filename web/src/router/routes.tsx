@@ -5,6 +5,7 @@ import ChatPage from "../pages/chat/ChatPage";
 import AgentsPage from "../pages/agents/AgentsPage";
 import ReportsPage from "../pages/reports/ReportsPage";
 import TradingPage from "../pages/trading/TradingPage";
+import ApprovalCenterPage from "../pages/approvals/ApprovalCenter";
 import { ModulePlaceholder } from "../pages/Placeholder";
 import { NAV_ITEMS } from "../config/nav";
 
@@ -22,6 +23,8 @@ export const protectedChildren: RouteObject[] = [
         <TradingPage />
       ) : n.key === "reports" ? (
         <ReportsPage />
+      ) : n.key === "approvals" ? (
+        <ApprovalCenterPage />
       ) : (
         <ModulePlaceholder nav={n} />
       ),
