@@ -74,6 +74,14 @@ Entries discovered by the Agent during task execution should follow this format:
   - 仓库为 PRIVATE（已私有化）；原 test 仓库残留的 PR #1 与 pr/smol-dev/zrye5w 分支已清理（closed，refs/pull/1/head 属正常残留可忽略）。
 
 [Project Knowledge Summary]
+- Date: 2026-09-07
+- Context: Discovered by Agent while running core/tests/test_reproducibility.py 脚本调试金标准 diff
+- Category: Troubleshooting & Debugging / Environment Configuration
+- Instructions:
+  - 不要在开发服运行期间用裸 `python3` 直接 import/执行 core/tests 下测试模块：`core/app.py` 模块级 `app = create_app()` 会撞默认库 core/data 的单实例锁并 sys.exit(1)；必须用 `python3 -m pytest`（conftest 会在 import 前覆写 CORE_DATA_DIR/CORE_SINGLE_INSTANCE_LOCK=0 等）。若确需脚本方式，先设 `CORE_DATA_DIR=<tmp> CORE_SINGLE_INSTANCE_LOCK=0`。
+  - 结算日报引擎数据段以 settlement_log.positions_snapshot 为唯一数据源（spec-04 §5.2 零 token 直读）；结算/快照 schema 变更后须 `UPDATE_GOLDEN=1 python3 -m pytest core/tests/test_reproducibility.py` 重写 core/tests/golden/repro_full_normalized.txt 并人工审阅 diff 后随代码一起提交。
+
+[Project Knowledge Summary]
 - Date: 2026-09-06
 - Context: Discovered by Agent while debugging ST/新股拦截引擎测试（eodengine.py 快速多次源码修改后出现"修改不生效"假象）
 - Category: Troubleshooting & Debugging / Testing Methods

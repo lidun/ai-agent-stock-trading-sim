@@ -492,6 +492,15 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON replay_sessions(agent_id, trade_date);
         """,
     ),
+    (
+        14,
+        """
+        -- 结算持仓估值快照（spec-04 §5.2 日报引擎数据段数据源，spec-01 结算产物归档）：
+        -- 闭市后最终持仓按当日收盘/停牌估值价归档为 JSON，供日报/UI 还原当日市值，
+        -- 无需再拉行情、不虚构价格。既有行按 NULL 处理（旧库无快照 → 数据段标欠档）。
+        ALTER TABLE settlement_log ADD COLUMN positions_snapshot TEXT;
+        """,
+    ),
 ]
 
 

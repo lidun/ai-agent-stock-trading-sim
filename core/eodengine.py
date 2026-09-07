@@ -1845,12 +1845,28 @@ def settle_account(
             "UPDATE accounts SET cash=?, nav=?, total_pnl=?, today_pnl=?, updated_ts=? WHERE id=?",
             (_q(final_cash), _q(nav), _q(total_pnl), _q(today_pnl), now, account_id),
         )
+        # 结算持仓估值快照归档（spec-04 §5.2 日报数据段数据源；收盘口径 close_map，
+        # 含停牌估值价，非虚构）——日报/UI 还原当日市值无需再拉行情
+        pos_rows = c.execute(
+            "SELECT symbol, quantity, avg_cost FROM holdings"
+            " WHERE account_id=? AND quantity > 0 ORDER BY symbol",
+            (account_id,),
+        ).fetchall()
+        positions_snapshot = [{
+            "symbol": r["symbol"],
+            "quantity": _plain(_D(r["quantity"])),
+            "avg_cost": _plain(_D(r["avg_cost"])),
+            "close": _plain(require_close(r["symbol"])),
+            "market_value": _plain((_D(r["quantity"]) * require_close(r["symbol"]))
+                                   .quantize(_MONEY, ROUND_HALF_UP)),
+        } for r in pos_rows]
         c.execute(
-            "INSERT INTO settlement_log(id, settle_key, trade_date, account_id, granularity_used, status, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO settlement_log(id, settle_key, trade_date, account_id, granularity_used,"
+            " status, created_at, positions_snapshot) VALUES (?,?,?,?,?,?,?,?)",
             (
                 "sl" + secrets.token_hex(10), settle_key, trade_date, account_id,
                 json.dumps(granularity_used, ensure_ascii=False), "done", now,
+                json.dumps(positions_snapshot, ensure_ascii=False),
             ),
         )
         summary = {
