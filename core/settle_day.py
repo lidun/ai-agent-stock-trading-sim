@@ -92,7 +92,8 @@ def pending_any(state, trade_date: str) -> bool:
                EXISTS (
                    SELECT 1 FROM condition_orders co
                     WHERE co.account_id = a.id AND co.status = 'active'
-                      AND co.created_at LIKE ?
+                      AND (co.created_at LIKE ?
+                           OR (co.created_at < ? AND co.validity IN ('long', 'until')))
                )
                OR EXISTS (
                    SELECT 1 FROM holdings h
@@ -101,20 +102,27 @@ def pending_any(state, trade_date: str) -> bool:
            )
          LIMIT 1
         """,
-        (trade_date + "%",),
+        (trade_date + "%", trade_date),
     ).fetchone()
     return row is not None
 
 
 def _orders_for(state, account_id: str, trade_date: str) -> list[dict]:
+    """当日结算待判定订单：当日新建的 active 条件单 + 跨日 resting 的长期单
+    （validity in long/until）——引擎对 long/until 单每个会话日都恢复判定（spec-01
+    §3.3 停牌挂起/复牌口径），其当日序列同样须供给，否则引擎显式 gap 而非静默。"""
     conn = state_conn(state)
     return [
         dict(r)
         for r in conn.execute(
-            "SELECT * FROM condition_orders"
-            " WHERE account_id=? AND status='active' AND created_at LIKE ?"
-            " ORDER BY created_at ASC, id ASC",
-            (account_id, trade_date + "%"),
+            """
+            SELECT * FROM condition_orders
+             WHERE account_id=? AND status='active'
+               AND (created_at LIKE ?
+                    OR (created_at < ? AND validity IN ('long', 'until')))
+             ORDER BY created_at ASC, id ASC
+            """,
+            (account_id, trade_date + "%", trade_date),
         ).fetchall()
     ]
 

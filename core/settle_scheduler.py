@@ -50,14 +50,38 @@ class EodSettleTrigger:
     def __init__(self, state, *, feed=DEFAULT_FEED,
                  earliest: time = time(15, 35),
                  retry_until: time = time(16, 35),
-                 probe_ttl_s: int = PROBE_TTL_S):
+                 probe_ttl_s: int = PROBE_TTL_S,
+                 corp_events: dict[str, dict] | None = None,
+                 corp_provider=None):
         self.state = state
         self.feed = feed
         self.earliest = earliest
         self.retry_until = retry_until
         self.probe_ttl_s = probe_ttl_s
+        self.corp_events = corp_events or {}
+        self.corp_provider = corp_provider
         self._done_dates: set[str] = set()
         self._probe_cache: dict = {"at": 0.0, "day": None}
+
+    def _corp_events_for(self, trade_date: str) -> dict:
+        """按交易日解析当日公司行动/退市事件（spec-01 §6.6 数据/参考侧按 ex_date 供给）。
+
+        corp_provider(trade_date) -> dict（同 eodengine.settle_account corp_events 结构，
+        供单日会话与跨日快进/回放统一注入，保证 delist 等事件落在正确 ex_date 而非被
+        截断）；未配置 provider 时回退静态 corp_events（单日运行用）。provider 拉取异常
+        → 记录告警审计并按当日无公司行动处理（当日数据缺口以审计留痕，下轮由 settle_key
+        幂等补齐，不虚构事件）。
+        """
+        if self.corp_provider is None:
+            return self.corp_events
+        try:
+            ev = self.corp_provider(trade_date) or {}
+        except Exception:  # noqa: BLE001
+            log.exception("公司行动/退市事件拉取失败 %s（按当日无公司行动处理）", trade_date)
+            self._audit("trade.corp_provider_gap", "error",
+                        f"{trade_date} 公司行动事件源异常 → 当日按无事件结算，待数据侧补齐")
+            return {}
+        return ev
 
     def _probe_trade_date(self) -> date | None:
         now = monotonic()
@@ -175,7 +199,8 @@ class EodSettleTrigger:
         accounts, _ = self._tracking_state(dstr)
         if accounts:
             exits = self._advance_exits(dstr)
-        report = settle_day.run_day(self.state, dstr, feed=self.feed)
+        report = settle_day.run_day(self.state, dstr, feed=self.feed,
+                                    corp_events=self._corp_events_for(dstr))
         accounts_r = report.get("accounts", [])
         errors = [a for a in accounts_r if a.get("error")]
         if not errors:
@@ -222,7 +247,8 @@ class EodSettleTrigger:
             if self._tracking_state(d)[0]:
                 exits = self._advance_exits(d)
             report = settle_day.run_day(self.state, d, feed=self.feed,
-                                        account_ids=account_ids)
+                                        account_ids=account_ids,
+                                        corp_events=self._corp_events_for(d))
             accts = report.get("accounts", [])
             acct_errs = [a for a in accts if a.get("error")]
             dates.append({"date": d, "exits": exits, "error": bool(acct_errs),
@@ -286,7 +312,8 @@ class EodSettleTrigger:
                     exits = self._advance_exits(d)
                 report = settle_day.run_day(
                     self.state, d, feed=self.feed,
-                    account_ids=[rec["trial_account_id"]], mode="replay")
+                    account_ids=[rec["trial_account_id"]], mode="replay",
+                    corp_events=self._corp_events_for(d))
                 accts = report.get("accounts", [])
                 errors = [a for a in accts if a.get("error")]
                 if errors:

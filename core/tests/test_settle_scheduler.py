@@ -1,11 +1,12 @@
 """EOD 结算自动触发测试：窗口判定/交易日探测/缺口重试/幂等/卖出跟踪推进（feed 全注入，零网络）。"""
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from core import eodengine, settle_scheduler
-from core.db import state_conn
-from _feedkit import DATE, ReadySessionFeed
+from core.db import state_conn, write_txn
+from _feedkit import DATE, MultiDayL2Feed, ReadySessionFeed
 from test_settle_day import DEMO, _insert_buy_order
 
 
@@ -200,3 +201,105 @@ def test_catchup_fast_forwards_missed_trading_days(authed_client):
     assert state_conn(st).execute(
         "SELECT sessions_done FROM exit_trackings WHERE account_id=?", (DEMO,)
     ).fetchone()["sessions_done"] == 2
+
+
+class LiveL2Feed(MultiDayL2Feed):
+    """多日 L2 供给 + 快照日期指向 fixture 交易日（自动触发单日会话探测通过）。"""
+
+    def realtime_batch(self, symbols):
+        return {"600000": {"ts": "20260904153500"}}
+
+
+def _insert_long_hold(state, *, order_id, trigger_price, created):
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        c.execute(
+            """
+            INSERT INTO condition_orders(id, account_id, order_type, direction, scope,
+                symbol, trigger, basis, price_ref, qty, price_type, validity, priority,
+                status, created_at, creator, reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (order_id, DEMO, "buy", "buy", "single", "600000",
+             json.dumps({"op": "le", "price": trigger_price}), "replay_l0",
+             "absolute", 300, "limit", "long", 0, "active", created,
+             "agent-demo-001", "跨日退市事件流测试"),
+        )
+
+
+def test_catchup_corp_delist_stream_across_days(authed_client):
+    """快进回放跨多日：delist 事件落在正确 ex_date 被应用、当日订单失效、后续交易日
+    无残留复活（事件流不被截断/提前/延后）。"""
+    st = authed_client.app.state
+    # 09-02 建仓成交 + 一条长期 resting 买单（触发价 9.0 低于 09-02 低点 9.25，当日不成交）
+    _insert_buy_order(st, order_id="buy-0902", qty=1000,
+                      trigger={"op": "le", "price": 9.28},
+                      created="2026-09-02T09:00:00")
+    _insert_long_hold(st, order_id="long-hold",
+                      trigger_price=9.0, created="2026-09-02T09:30:00")
+
+    def provider(d):
+        return {"600000": {"kind": "delist", "delist_type": "整理",
+                           "price": 9.27}} if d == "2026-09-03" else {}
+
+    trigger = settle_scheduler.EodSettleTrigger(st, feed=MultiDayL2Feed(),
+                                                corp_provider=provider)
+    out = trigger.catchup_missed(now=datetime.fromisoformat("2026-09-05T08:00:00"))
+    assert not out["errors"]
+    conn = state_conn(st)
+    # 事件流落在 09-03：结算日志恰 09-02（建仓）与 09-03（退市清仓）两日，其余空日跳过
+    dates = [r["trade_date"] for r in conn.execute(
+        "SELECT trade_date FROM settlement_log WHERE account_id=? ORDER BY trade_date",
+        (DEMO,)).fetchall()]
+    assert dates == ["2026-09-02", "2026-09-03"]
+    # 09-03 按当日官方收盘 9.27 清仓：持仓清零、现金=买费后+卖净额
+    assert conn.execute("SELECT COUNT(*) n FROM holdings WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM lots WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash - (100000.0 - 9285.09 + 9260.27)) < 0.01
+    au = conn.execute(
+        "SELECT result, detail FROM audit_logs WHERE action='corp_action.delist'").fetchone()
+    assert au["result"] == "cleared:1000"
+    assert json.loads(au["detail"])["price"] == "9.27"
+    assert conn.execute("SELECT COUNT(*) n FROM trades WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 1       # 仅建仓流水；虚拟清仓不入流水
+    # 09-03 当日该票长期买单 → invalid delisted（不随后续交易日复活）
+    o = conn.execute(
+        "SELECT status, invalid_reason FROM condition_orders WHERE id='long-hold'"
+    ).fetchone()
+    assert (o["status"], o["invalid_reason"]) == ("invalid", "delisted")
+    assert conn.execute("SELECT status, settled_on FROM condition_orders WHERE id='buy-0902'"
+                        ).fetchone()["status"] == "filled"
+    # 幂等重放：delist 只清一次，事件不重复结算
+    again = settle_scheduler.EodSettleTrigger(st, feed=MultiDayL2Feed(),
+                                              corp_provider=provider)
+    out2 = again.catchup_missed(now=datetime.fromisoformat("2026-09-05T08:05:00"))
+    assert not out2["errors"]
+    assert conn.execute("SELECT COUNT(*) n FROM audit_logs"
+                        " WHERE action='corp_action.delist'").fetchone()["n"] == 1
+    assert abs(conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+               - cash) < 1e-9
+
+
+def test_settle_once_corp_delist_single_day_delivered(authed_client):
+    """实盘会话当日：settle_once 将 corp_events 注入当日结算（当日退市票买单失效）。"""
+    st = authed_client.app.state
+    _insert_buy_order(st, order_id="buy-live", qty=1000,
+                      trigger={"op": "le", "price": 100.0},
+                      created="2026-09-04T09:00:00")
+    trigger = settle_scheduler.EodSettleTrigger(
+        st, feed=LiveL2Feed(),
+        corp_events={"600000": {"kind": "delist", "delist_type": "整理",
+                                "price": 9.43}})
+    out = trigger.settle_once(datetime.fromisoformat("2026-09-04T15:36:00"))
+    assert out["status"] == "settled"
+    conn = state_conn(st)
+    o = conn.execute(
+        "SELECT status, invalid_reason FROM condition_orders WHERE id='buy-live'").fetchone()
+    assert (o["status"], o["invalid_reason"]) == ("invalid", "delisted")
+    assert conn.execute("SELECT COUNT(*) n FROM trades WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM holdings WHERE account_id=?",
+                        (DEMO,)).fetchone()["n"] == 0
