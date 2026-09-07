@@ -82,3 +82,51 @@ class AxisFeed(FakeFeed):
         if symbol != SYMBOL:
             raise q.QuoteGapError(f"{symbol} 无日线轴 fixture")
         return q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
+
+
+class MultiDayL2Feed(FakeFeed):
+    """历史多日 L2 供给：replay_day 显式缺口 → 全走日线 L2 档（试运行历史回放用）。
+
+    供 fixture 全部交易日任意一日：replay_l2/daily_pair 返回该日 official_close/prev_close
+    （prev 取更早最近交易日），replay_day 恒缺口驱动 L2 回退。"""
+
+    def __init__(self, dates: set[str] | None = None):
+        rows = q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
+        rows = sorted(rows, key=lambda r: r["date"])
+        self._rows = rows
+        self._dates = dates or {str(r["date"]) for r in rows}
+
+    def _idx(self, trade_date: str) -> int | None:
+        for i, r in enumerate(self._rows):
+            if str(r["date"]) == trade_date:
+                return i
+        return None
+
+    def _pair(self, symbol, trade_date):
+        if symbol != SYMBOL or trade_date not in self._dates:
+            raise q.QuoteGapError(f"{symbol} {trade_date} 超出多日 L2 fixture 供给范围")
+        i = self._idx(trade_date)
+        assert i is not None
+        on = self._rows[i]
+        prev = self._rows[i - 1]["close"] if i >= 1 else on["close"]
+        return {"close": float(on["close"]), "prev": float(prev),
+                "high": float(on["high"]), "low": float(on["low"])}
+
+    def replay_day(self, symbol, trade_date):
+        raise q.QuoteGapError(f"{symbol} {trade_date} 历史日无分钟档（L2 档回放）")
+
+    def replay_l2(self, symbol, trade_date):
+        p = self._pair(symbol, trade_date)
+        return {"level": "l2", "high": p["high"], "low": p["low"],
+                "official_close": p["close"], "prev_close": p["prev"],
+                "session_date": trade_date, "source": "tencent"}
+
+    def daily_pair(self, symbol, trade_date):
+        p = self._pair(symbol, trade_date)
+        return {"official_close": p["close"], "prev_close": p["prev"],
+                "session_date": trade_date, "source": "tencent"}
+
+    def day_rows(self, symbol, start, end):
+        if symbol != SYMBOL:
+            raise q.QuoteGapError(f"{symbol} 无日线轴 fixture")
+        return [r for r in self._rows if str(r["date"]) in self._dates]

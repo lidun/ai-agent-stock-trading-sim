@@ -1,16 +1,24 @@
 """试运行历史回放切片（spec-05 §6.2）：窗口台账 / 会话记账 / 结算隔离 / 最近 N 回放。"""
 from __future__ import annotations
 
-from datetime import date, datetime
+import json
+from datetime import datetime
 
 from core import accountstore, orderstore, settle_day
-from core.db import state_conn
+from core.db import state_conn, write_txn
+from core.quotes_tencent import parse_day_rows
 from core.settle_scheduler import EodSettleTrigger
 from conftest import csrf_headers
 
-from _feedkit import AxisFeed
+from _feedkit import AxisFeed, FIX, MultiDayL2Feed
 
 NOW = datetime(2026, 9, 5, 15, 40)
+PICKS = ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+
+
+def _row(d: str) -> dict:
+    rows = parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
+    return next(r for r in rows if str(r["date"]) == d)
 
 
 def _mk_agent(authed_client, name, window=5):
@@ -133,7 +141,6 @@ def test_run_trial_backfill_recent_sessions_then_done(authed_client):
 
 def test_run_trial_backfill_honors_window_lower_bound(authed_client):
     """最近优先选取且不越过 today：回放终点恒为 <today 的最近会话日。"""
-    from datetime import timedelta
     st = authed_client.app.state
     agent_id, _ = _mk_agent(authed_client, "窗口下限用例")
     trigger = EodSettleTrigger(st, feed=AxisFeed())
@@ -143,3 +150,73 @@ def test_run_trial_backfill_honors_window_lower_bound(authed_client):
     entry = out["replayed"][0]
     assert len(entry["days"]) == 5
     assert entry["days"][-1]["date"] < "2026-09-01"
+
+
+def _insert_hist_order(state, *, order_id, account_id, d, qty=100):
+    low = float(_row(d)["low"])
+    with write_txn(state_conn(state)) as c:
+        c.execute(
+            """
+            INSERT INTO condition_orders(id, account_id, order_type, direction, scope, symbol,
+                trigger, basis, price_ref, qty, price_type, validity, priority, status,
+                created_at, creator, reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                order_id, account_id, "buy", "buy", "single", "600000",
+                json.dumps({"op": "le", "price": low}), "replay_l0",
+                "absolute", qty, "limit", "today", 0, "active",
+                f"{d}T09:00:00", account_id, "试运行历史回放下单",
+            ),
+        )
+
+
+def test_trial_replay_fills_historical_l2_e2e(authed_client):
+    """5 日回放窗口逐日真实成交（历史日无分钟档 → L2 官方收盘），主账户零污染，验收归档含证据。"""
+    st = authed_client.app.state
+    created = accountstore.create_trial_agent(st, agent_id="agent-rp-e2e",
+                                              name="回放成交闭环", window_days=5)
+    trial_id = {a["role"]: a for a in created["accounts"]}["trial"]["id"]
+    for i, d in enumerate(PICKS):
+        _insert_hist_order(st, order_id=f"tr-{i}", account_id=trial_id, d=d)
+
+    trigger = EodSettleTrigger(st, feed=MultiDayL2Feed())
+    out = trigger.run_trial_backfill(now=NOW)
+    assert len(out["replayed"]) == 1
+    assert all(not d2["error"] for d2 in out["replayed"][0]["days"])
+    replay = accountstore.trial_replay(st, agent_id="agent-rp-e2e")
+    assert replay["status"] == "done"
+    assert replay["sessions"] == PICKS
+
+    conn = state_conn(st)
+    debit = 0.0
+    for i, d in enumerate(PICKS):
+        tr = conn.execute("SELECT * FROM trades WHERE order_id=?", (f"tr-{i}",)).fetchone()
+        assert tr is not None, f"{d} 应有成交"
+        assert tr["settle_date"] == d and tr["basis_used"] == "l2"
+        close = float(_row(d)["close"])
+        assert abs(tr["price"] - close) < 1e-6
+        assert tr["trade_time"] == f"{d}T15:00:00"     # L2 近似：官方收盘时点
+        debit += tr["amount"] + tr["fee_total"]
+    # settlement_log 5 个回放日；成交额=各日官方收盘×100，现金=初始−Σ(成交额+费用)
+    days = [r[0] for r in conn.execute(
+        "SELECT DISTINCT trade_date FROM settlement_log WHERE account_id=? ORDER BY trade_date",
+        (trial_id,)).fetchall()]
+    assert days == PICKS
+    holding = conn.execute(
+        "SELECT symbol, quantity FROM holdings WHERE account_id=?", (trial_id,)).fetchone()
+    assert holding["quantity"] == 500
+    trial = accountstore.get_account(st, trial_id)
+    assert abs(float(trial["cash"]) - round(100000.0 - debit, 2)) < 0.01
+    # 幂等：重放不重复成交/记账
+    assert trigger.run_trial_backfill(now=NOW)["replayed"] == []
+    assert conn.execute("SELECT COUNT(*) FROM trades WHERE account_id=?", (trial_id,)
+                        ).fetchone()[0] == 5
+    # 验收归档：快照完整携带回放证据（结算 5 日/成交 5/挂单 5/回放 5 会话）
+    archived = accountstore.finish_trial(st, agent_id="agent-rp-e2e",
+                                         decision="launch", verdict="L2 历史回放验收通过")
+    snap = archived["snapshot"]
+    assert snap["replay"]["sessions"] == 5 and snap["counts"]["settle_days"] == 5
+    assert snap["counts"]["trades"] == 5 and snap["counts"]["orders"] == 5
+    main = accountstore.get_account(st, "agent-rp-e2e")
+    assert main["cash"] == "100000.00" and main["status"] == "normal"
