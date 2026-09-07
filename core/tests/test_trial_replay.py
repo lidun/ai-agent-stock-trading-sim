@@ -59,7 +59,12 @@ def test_auto_settlement_frozen_during_trial_main_clean(authed_client):
     assert by_role["main"]["id"] not in auto
     assert by_role["trial"]["id"] not in auto
     assert not settle_day.pending_any(st, "2026-09-04")
-    # launch 验收后：trial 归档、主账户恢复 auto 参与
+    # launch 验收后：trial 归档、主账户恢复 auto 参与（launch 需过 §6.1 硬门槛）
+    orderstore.place_order(st, account_id=by_role["trial"]["id"], creator=agent_id,
+                           symbol="600000", qty=100, price_type="market",
+                           reason="冻结用例挂单")
+    for d in ("2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-31"):
+        accountstore.add_trial_session(st, agent_id, d)
     r = authed_client.post(f"/api/agents/{agent_id}/trial/finish",
                            json={"decision": "launch"}, headers=csrf_headers(authed_client))
     assert r.status_code == 200
@@ -220,3 +225,38 @@ def test_trial_replay_fills_historical_l2_e2e(authed_client):
     assert snap["counts"]["trades"] == 5 and snap["counts"]["orders"] == 5
     main = accountstore.get_account(st, "agent-rp-e2e")
     assert main["cash"] == "100000.00" and main["status"] == "normal"
+
+
+def test_finish_launch_hard_gates_reject_immature(authed_client):
+    """spec-05 §6.1 launch 硬门槛：回放窗口未满 / 无任何条件单尝试 → 拒绝（reject 无门槛）。"""
+    st = authed_client.app.state
+
+    def _expect(agent_id, msg, decision="launch"):
+        try:
+            accountstore.finish_trial(st, agent_id=agent_id, decision=decision)
+        except LookupError as e:
+            assert msg in str(e)
+        else:
+            raise AssertionError(f"{agent_id} {decision} 应当被拒绝")
+
+    # ① 有订单但窗口只回放 3 日 → 不可 launch
+    a1 = accountstore.create_trial_agent(st, agent_id="gate-under-window",
+                                         name="窗口未满", window_days=5)
+    t1 = {a["role"]: a for a in a1["accounts"]}["trial"]["id"]
+    orderstore.place_order(st, account_id=t1, creator="gate-under-window",
+                           symbol="600000", qty=100, price_type="market",
+                           reason="窗口未满用例")
+    for d in ("2026-08-26", "2026-08-27", "2026-08-28"):
+        accountstore.add_trial_session(st, "gate-under-window", d)
+    _expect("gate-under-window", "回放未满")
+
+    # ② 窗口满但零条件单尝试 → 不可 launch
+    a2 = accountstore.create_trial_agent(st, agent_id="gate-no-order",
+                                         name="无下单尝试", window_days=5)
+    for d in ("2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-31"):
+        accountstore.add_trial_session(st, "gate-no-order", d)
+    _expect("gate-no-order", "无任何条件单尝试")
+
+    # ③ 同上场景 reject 无门槛放行（否定留证）
+    rejected = accountstore.finish_trial(st, agent_id="gate-no-order", decision="reject")
+    assert rejected["agent"]["status"] == "archived"

@@ -228,6 +228,7 @@ def finish_trial(state, *, agent_id: str, decision: str,
     决策后 trial 账户整体归档为不可变证据：settlement_log 结算日 + 订单/成交/持仓/底仓
     计数快照写入 trial_archives（一次写入，不再变更），trial 账户转 archived 停止参与
     结算；主账户零污染不动（launch→agent running，reject→agent archived）。整体单事务。
+    launch 需通过 §6.1 硬门槛：回放窗口满（N≥5 交易日）且 ≥1 次条件单尝试；reject 无门槛。
     """
     if decision not in ("launch", "reject"):
         raise LookupError(f"未知验收决策: {decision}（仅 launch/reject）")
@@ -265,6 +266,18 @@ def finish_trial(state, *, agent_id: str, decision: str,
                 "SELECT trade_date FROM replay_sessions WHERE agent_id=?"
                 " ORDER BY trade_date", (agent_id,)).fetchall()
         ]
+        if decision == "launch":
+            # spec-05 §6.1 硬门槛（确定性）：回放窗口满（N≥5）且含 ≥1 次条件单尝试。
+            # 窗口上限由 create_trial_agent 约束 5-20，故满窗口即满足 N≥5。
+            if replay is None or replay["status"] != "done":
+                want = replay["window_days"] if replay else 5
+                raise LookupError(
+                    f"Agent {agent_id} 试运行回放未满 {want} 个交易日"
+                    f"（已回放 {len(replay_dates)}，spec-05 §6.1 N≥5 硬门槛），不可 launch")
+            if _n("SELECT COUNT(*) FROM condition_orders WHERE account_id=?") < 1:
+                raise LookupError(
+                    f"Agent {agent_id} 试运行期无任何条件单尝试"
+                    "（spec-05 §6.1 硬门槛），不可 launch")
         snapshot = {
             "decision": decision,
             "verdict": verdict.strip(),

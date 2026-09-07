@@ -120,9 +120,20 @@ def _archive_row(st, archive_id):
     return dict(row) if row else None
 
 
+_FILL_DATES = ["2026-08-25", "2026-08-26", "2026-08-27",
+               "2026-08-28", "2026-08-31"]
+
+
+def _fill_replay(st, agent_id, dates=_FILL_DATES):
+    """回放会话记账补满窗口（launch 硬门槛：N≥5 交易日）。"""
+    for d in dates:
+        accountstore.add_trial_session(st, agent_id, d)
+
+
 def test_finish_trial_launch_archives_evidence_keeps_main_clean(authed_client):
     st = authed_client.app.state
     agent_id, trial_id, main_id = _mk_trial_with_order(authed_client, "归档留证用例")
+    _fill_replay(st, agent_id)
     r = authed_client.post(
         f"/api/agents/{agent_id}/trial/finish",
         json={"decision": "launch", "verdict": "试运行回放通过，验收合格"},
@@ -165,7 +176,8 @@ def test_finish_trial_reject_archives_agent(authed_client):
 def test_finish_trial_idempotency_conflict(authed_client):
     """重复归档/二次决策 → 409（留证不可变更改）。"""
     st = authed_client.app.state
-    agent_id, _, _ = _mk_trial_with_order(authed_client, "幂等冲突用例", order=False)
+    agent_id, _, _ = _mk_trial_with_order(authed_client, "幂等冲突用例", order=True)
+    _fill_replay(st, agent_id)
     h = csrf_headers(authed_client)
     first = authed_client.post(f"/api/agents/{agent_id}/trial/finish",
                                json={"decision": "launch"}, headers=h)
