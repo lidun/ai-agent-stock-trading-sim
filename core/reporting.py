@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from core.auth import audit
 from core.db import state_conn, write_txn
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -467,3 +468,98 @@ def export_markdown(state, account_id: str, trade_date: str,
         parts += ["", "---", "## 叙述段", "", row["narrative"]]
     parts += ["", f"---", f"_版本 v{row['version']}（{row['status']}）· {account_id} · 确定性引擎数据段（spec-04 §5.2）_"]
     return "\n".join(parts)
+
+
+# ---------------- 日报直达站内推送（spec-04 §6.2 事件→站内通知 web，P1 单通道） ----------------
+
+_PUSH_STATUS_LABEL = {
+    "normal": "结算日报",
+    "absent": "缺勤日报（当日结算缺口，数据段为可得部分）",
+    "resend": "修订补发",
+}
+
+
+def push_report_body(account_id: str, report: dict) -> str:
+    """日报直达推送正文：确定性摘要（账户现值 + 叙述首段），纯文本无 LLM。"""
+    status = report.get("status", "")
+    header = f"【{report['trade_date']} · v{report.get('version')}】" \
+             f"{_PUSH_STATUS_LABEL.get(status, status)}"
+    lines = [header, ""]
+    try:
+        ds = json.loads(report.get("data_section") or "{}")
+    except (TypeError, ValueError):
+        ds = {}
+    s = ds.get("summary") or {}
+    lines.append(
+        f"- 现金 {s.get('cash')} ｜ 净值 {s.get('nav')} ｜ "
+        f"累计盈亏 {s.get('total_pnl')} ｜ 当日盈亏 {s.get('today_pnl')}"
+    )
+    narrative = (report.get("narrative") or "").strip()
+    if narrative:
+        preview = narrative if len(narrative) <= 160 else narrative[:160] + "…"
+        lines += ["", f"> {preview}"]
+    lines += ["", "详细数据段与历史版本请到「日报中心」查看。"]
+    return "\n".join(lines)
+
+
+def push_pending_report_deliveries(state, trade_date: str) -> list[dict]:
+    """将该交易日最新一版结算日报/缺勤日报作为“日报直达”消息推送进用户会话
+    （spec-04 §6.1 联系人式直达，非中转）；幂等：同 payload 已推送过则跳过。
+
+    推送范围：main 策略账户（试运行/退役 Agent 全程不推，spec-04 §6.2 v0.6）；
+    仅首版（version=1）normal/absent 直达——修订/补发以 v+1 留痕由日报中心承载，
+    不重复轰炸；同一交易日已存在更高版本（后到补发）时首版也不再补推。返回新推送的
+    messages（serialize 形态，含 conv_id，供 WS 广播）。
+    """
+    from core import chatstore  # noqa: PLC0415
+    conn = state_conn(state)
+    rows = conn.execute(
+        """
+        SELECT dr.agent_id, dr.trade_date, dr.version, dr.status, dr.narrative,
+               dr.data_section
+          FROM daily_reports dr
+          JOIN accounts ac ON ac.id = dr.agent_id AND ac.role = 'main'
+          JOIN agents ag ON ag.id = ac.agent_id
+           AND ag.status NOT IN ('trial', 'archived')
+         WHERE dr.trade_date = ?
+           AND dr.status IN ('normal', 'absent')
+           AND dr.version = 1
+           AND NOT EXISTS (
+               SELECT 1 FROM daily_reports dr3
+                WHERE dr3.agent_id = dr.agent_id
+                  AND dr3.trade_date = dr.trade_date
+                  AND dr3.version > 1)
+         ORDER BY dr.agent_id, dr.version
+        """,
+        (trade_date,),
+    ).fetchall()
+    pushed: list[dict] = []
+    for r in rows:
+        account_id = r["agent_id"]
+        payload = json.dumps({
+            "account_id": account_id,
+            "trade_date": trade_date,
+            "version": r["version"],
+            "status": r["status"],
+        }, ensure_ascii=False, sort_keys=True)
+        try:
+            conv = chatstore.ensure_user_chat(state, account_id)
+        except LookupError:  # noqa: PERF203
+            continue
+        if conn.execute(
+            "SELECT 1 FROM messages WHERE conv_id=? AND payload_ref=? LIMIT 1",
+            (conv["id"], payload),
+        ).fetchone():
+            continue
+        msg = chatstore.insert_message(
+            state, conv_id=conv["id"], agent_id=account_id, direction="agent",
+            msg_type="report", body=push_report_body(account_id, dict(r)),
+            payload_ref=payload, status="delivered", delivered_via="web")
+        try:
+            audit(state, account_id, "report.push", result="ok",
+                  object_type="message", object_id=msg["id"],
+                  detail=f"{trade_date} v{r['version']} {r['status']} 日报直达站内推送")
+        except Exception:  # noqa: BLE001
+            pass
+        pushed.append(msg)
+    return pushed

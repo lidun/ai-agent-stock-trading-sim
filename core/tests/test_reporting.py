@@ -181,3 +181,60 @@ def test_fill_absent_report_backfills_data_and_guards(authed_client):
     assert tl[0]["latest_version"] == 2 and tl[0]["status"] == "normal"
     late = reporting.fill_absent_report(st, DEMO, "2026-09-08", reason="X")
     assert late["skipped"] is True
+
+
+def test_report_direct_push_normal_first_version(authed_client):
+    """spec-04 §6.1/§6.2：结算日首版日报直达用户会话（联系人式，非中转），幂等不重推。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    pushed = reporting.push_pending_report_deliveries(st, "2026-09-04")
+    assert len(pushed) == 1
+    m = pushed[0]
+    assert m["direction"] == "agent" and m["msg_type"] == "report"
+    assert m["status"] == "delivered" and m["delivered_via"] == "web"
+    assert "【2026-09-04 · v1】结算日报" in m["body"]
+    assert "现金 89994.9" in m["body"]
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='report.push'"
+    ).fetchone()[0] == 1
+    # 会话存在（report_direct 消息落在该 Agent 的用户会话）且未读角标=1
+    conv = state_conn(st).execute(
+        "SELECT id FROM conversations WHERE agent_id=? AND conv_type='user_chat'",
+        (DEMO,)).fetchone()
+    assert conv is not None
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE conv_id=? AND direction='agent'"
+        " AND status='delivered' AND read_ts=''", (conv["id"],)).fetchone()[0] == 1
+    # 幂等：重扫（重启/重试）不重复推送
+    assert reporting.push_pending_report_deliveries(st, "2026-09-04") == []
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE msg_type='report'"
+    ).fetchone()[0] == 1
+
+
+def test_report_direct_absent_pushed_until_later_settle(authed_client):
+    """缺勤日报首版直达；同日后到结算补发 v2 → 不再重复推送（修订由日报中心留痕承载）。"""
+    st = authed_client.app.state
+    reporting.fill_absent_report(st, DEMO, "2026-09-08", reason="行情缺口未结算")
+    assert len(reporting.push_pending_report_deliveries(st, "2026-09-08")) == 1
+    assert "缺勤日报（当日结算缺口" in state_conn(st).execute(
+        "SELECT body FROM messages WHERE msg_type='report'").fetchone()[0]
+    _buy(st, day="2026-09-08", price=10.0)          # 结算补发 → v2 normal
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE msg_type='report'").fetchone()[0] == 1
+
+
+def test_report_direct_skips_trial_agent(authed_client):
+    """试运行/退役 Agent 全程不推（spec-04 §6.2 v0.6，防历史回放日报轰炸用户会话）。"""
+    from test_settle_day import _seed_agent_account
+    st = authed_client.app.state
+    _seed_agent_account(st, "agent-trial-xyz")       # 默认 running；改 trial 以复现试运行
+    conn = state_conn(st)
+    with conn:
+        conn.execute("UPDATE agents SET status='trial' WHERE id='agent-trial-xyz'")
+    reporting.fill_absent_report(st, "agent-trial-xyz", "2026-09-08",
+                                 reason="试运行回放缺勤（不推）")
+    assert reporting.push_pending_report_deliveries(st, "2026-09-08") == []
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM conversations WHERE agent_id='agent-trial-xyz'"
+    ).fetchone()[0] == 0                              # 连会话都不建（零轰炸）

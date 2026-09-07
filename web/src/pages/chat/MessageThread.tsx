@@ -9,6 +9,7 @@ import { daySeparator, fmtBeijingTime, isSameBeijingDay } from "../../utils/time
 const AGENT_TYPE_LABEL: Record<string, string> = {
   reply: "提问回复",
   daily_report: "日报",
+  report: "日报直达",
   abnormal_report: "异常上报",
   approval_receipt: "审批回执",
   daily_summary: "总汇报",

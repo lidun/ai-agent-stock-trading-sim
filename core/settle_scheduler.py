@@ -262,6 +262,7 @@ class EodSettleTrigger:
             if acct_errs:
                 errs.append({"date": d, "errors": acct_errs})
                 self._fill_catchup_absent(d, acct_errs)
+            self._push_deliveries(d)
             self._done_dates.add(d)
         self._audit("trade.eod_catchup_auto", "ok" if not errs else "partial",
                     f"快进回放 {len(trading)} 个会话日（{trading[0]}..{trading[-1]}），"
@@ -420,14 +421,46 @@ class EodSettleTrigger:
                         "replay": replay})
         return {"replayed": out}
 
+    def _push_deliveries(self, trade_date: str) -> list[dict]:
+        """日报直达站内推送（spec-04 §6）：将 trade_date 首版结算/缺勤日报送入用户会话。
+        幂等（payload 判重），试运行/退役 Agent 在 reporting 内被过滤。返回新消息供广播。"""
+        try:
+            return reporting.push_pending_report_deliveries(self.state, trade_date)
+        except Exception:  # noqa: BLE001
+            log.exception("日报直达推送失败 %s（已落库的日报不受影响）", trade_date)
+            return []
+
+    async def _notify_report_pushes(self, pushed: list[dict]) -> None:
+        """WS 广播新推送的日报消息（有在线连接才发送，发送失败仅摘除该连接）。"""
+        if not pushed:
+            return
+        from core.ws import broadcast  # noqa: PLC0415
+        for m in pushed:
+            try:
+                await broadcast(self.state, {
+                    "type": "conv", "event": "message_new",
+                    "conv_id": m["conv_id"], "message": m,
+                })
+            except Exception:  # noqa: BLE001
+                log.debug("日报消息 WS 广播失败：%s", m.get("id"))
+
     async def run_forever(self, tick_s: int) -> None:
         """每分钟 tick 循环（core 常驻内唯一结算触发点；操作全幂等）。"""
         while True:
             try:
                 outcome = self.settle_once()
-                self.close_day_gaps()
-                log.info("EOD 结算触发：%s %s", outcome["date"], outcome["status"])
+                dates: set[str] = set()
+                if outcome.get("status") in ("settled", "retry_gap"):
+                    dates.add(outcome["date"])
+                closed = self.close_day_gaps()
+                dates.update(x["trade_date"] for x in closed.get("absent", []))
+                pushed: list[dict] = []
+                for d in sorted(dates):
+                    pushed += self._push_deliveries(d)
+                log.info("EOD 结算触发：%s %s（日报直达推送 %s 条）",
+                         outcome["date"], outcome["status"], len(pushed))
                 self.run_trial_backfill()
+                await self._notify_report_pushes(pushed)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
