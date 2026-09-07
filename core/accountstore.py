@@ -278,6 +278,25 @@ def finish_trial(state, *, agent_id: str, decision: str,
                 raise LookupError(
                     f"Agent {agent_id} 试运行期无任何条件单尝试"
                     "（spec-05 §6.1 硬门槛），不可 launch")
+            # spec-05 §6.1 规则级异常不允许上线：回放日当天有订单尝试却无 settlement_log
+            # （引擎对账不平/数据缺口 → 该日结算未落账）。日志缺失即异常日，点名并拒 launch。
+            abnormal = [
+                d for d in replay_dates
+                if c.execute(
+                    "SELECT 1 FROM condition_orders WHERE account_id=?"
+                    " AND substr(created_at, 1, 10)=? LIMIT 1",
+                    (trial["id"], d)).fetchone()
+                and not c.execute(
+                    "SELECT 1 FROM settlement_log WHERE account_id=? AND trade_date=?",
+                    (trial["id"], d)).fetchone()
+            ]
+            if abnormal:
+                listed = ",".join(abnormal[:5])
+                more = "" if len(abnormal) <= 5 else f" 等 {len(abnormal)} 日"
+                raise LookupError(
+                    f"Agent {agent_id} 试运行回放存在结算异常日 {listed}{more}"
+                    "（有订单但当日结算未落账——对账不平或数据缺口，"
+                    "spec-05 §6.1 规则级异常不允许上线）")
         snapshot = {
             "decision": decision,
             "verdict": verdict.strip(),

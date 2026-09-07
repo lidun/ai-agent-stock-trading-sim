@@ -289,8 +289,17 @@ class EodSettleTrigger:
                     account_ids=[rec["trial_account_id"]], mode="replay")
                 accts = report.get("accounts", [])
                 errors = [a for a in accts if a.get("error")]
+                if errors:
+                    # 对账不平/数据缺口：当日不记回放会话（窗口保持 in_progress 下轮重试，
+                    # 等价实盘“窗口内续试”；规则级异常日不允许计入合格回放）
+                    self._audit("trade.trial_replay_gap", "error",
+                                f"{agent_id} {d} 试运行回放结算异常："
+                                f"{errors[0].get('reason') or errors[0]}")
+                    days.append({"date": d, "exits": exits, "error": True,
+                                 "blocked": True, "accounts": accts})
+                    continue
                 accountstore.add_trial_session(self.state, agent_id, d)
-                days.append({"date": d, "exits": exits, "error": bool(errors),
+                days.append({"date": d, "exits": exits, "error": False,
                              "accounts": accts})
             replay = accountstore.trial_replay(self.state, agent_id)
             if replay and replay["status"] == "done":

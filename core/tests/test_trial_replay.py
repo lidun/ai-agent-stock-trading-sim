@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from core import accountstore, orderstore, settle_day
+from core import accountstore, orderstore, quotes_tencent as q, settle_day
 from core.db import state_conn, write_txn
 from core.quotes_tencent import parse_day_rows
 from core.settle_scheduler import EodSettleTrigger
@@ -260,3 +260,48 @@ def test_finish_launch_hard_gates_reject_immature(authed_client):
     # ③ 同上场景 reject 无门槛放行（否定留证）
     rejected = accountstore.finish_trial(st, agent_id="gate-no-order", decision="reject")
     assert rejected["agent"]["status"] == "archived"
+
+
+class _GapFeed(MultiDayL2Feed):
+    """单日缺口 feed：2026-09-02 L2 供给失败 → 该日结算异常。"""
+
+    def replay_l2(self, symbol, trade_date):
+        if trade_date == "2026-09-02":
+            raise q.QuoteGapError("2026-09-02 分钟/日线双缺口（测试注入）")
+        return super().replay_l2(symbol, trade_date)
+
+
+def test_finish_launch_rejects_settlement_abnormal_day(authed_client):
+    """spec-05 §6.1 规则级异常不允许上线：回放中存在“有订单却未落账”的异常日 → 拒 launch。
+
+    数据缺口日不计入合格回放（窗口保持 in_progress、审计 replay_gap）；即使事后人工补记
+    会话使窗口记满，缺结算日志的异常日仍拦截 launch。"""
+    st = authed_client.app.state
+    created = accountstore.create_trial_agent(st, agent_id="gate-abnormal",
+                                              name="结算异常守卫", window_days=5)
+    trial_id = {a["role"]: a for a in created["accounts"]}["trial"]["id"]
+    for i, d in enumerate(PICKS):
+        _insert_hist_order(st, order_id=f"ab-{i}", account_id=trial_id, d=d)
+
+    trigger = EodSettleTrigger(st, feed=_GapFeed())
+    out = trigger.run_trial_backfill(now=NOW)
+    entry = out["replayed"][0]
+    blocked = [d for d in entry["days"] if d.get("blocked")]
+    assert [d["date"] for d in blocked] == ["2026-09-02"]
+    # 缺口日不计数 → 窗口保持 in_progress（下轮重试）
+    replay = accountstore.trial_replay(st, agent_id="gate-abnormal")
+    assert replay["status"] == "in_progress" and replay["sessions_done"] == 4
+    kinds = {r[0] for r in state_conn(st).execute(
+        "SELECT DISTINCT action FROM audit_logs WHERE action='trade.trial_replay_gap'"
+    ).fetchall()}
+    assert "trade.trial_replay_gap" in kinds
+    # 手动补记会话使窗口记满（模拟数据补齐重试后账目齐备的场景）
+    accountstore.add_trial_session(st, "gate-abnormal", "2026-09-02")
+    replay = accountstore.trial_replay(st, agent_id="gate-abnormal")
+    assert replay["status"] == "done"
+    try:
+        accountstore.finish_trial(st, agent_id="gate-abnormal", decision="launch")
+    except LookupError as e:
+        assert "2026-09-02" in str(e) and "规则级异常" in str(e)
+    else:
+        raise AssertionError("存在结算异常日不应 launch")
