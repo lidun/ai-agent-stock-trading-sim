@@ -34,6 +34,11 @@ STATUS_LABEL = {
     "expired": "已过期", "withdrawn": "已撤回",
 }
 
+STATUS_MSG = {
+    "pending": "审批待办", "approved": "已通过", "rejected": "已驳回",
+    "expired": "已过期（24h 未决）",
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -41,6 +46,15 @@ def _now_iso() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _bj(iso: str) -> str:
+    """UTC ISO → 北京时间 'YYYY-MM-DD HH:MM'（阅读用）。"""
+    try:
+        dt = datetime.fromisoformat(iso)
+        return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso
 
 
 def content_hash_of(type_: str, agent_id: str, payload: dict) -> str:
@@ -192,7 +206,13 @@ def submit_approval(state, *, type_: str, agent_id: str, payload: dict,
                  ensure_ascii=False), ""),
         )
     row = c.execute("SELECT * FROM approval_requests WHERE id=?", (rid,)).fetchone()
-    return {"ok": True, "approval": _row_to_dict(row)}
+    ap_out = _row_to_dict(row)
+    try:
+        _notify_approval(state, kind="submit", approval=ap_out,
+                         detail=f"{type_} 审批单提交待决 → 该 Agent 用户会话")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "approval": ap_out}
 
 
 def decide_approval(state, approval_id: str, *, decision: str, reason: str = "",
@@ -237,8 +257,14 @@ def decide_approval(state, approval_id: str, *, decision: str, reason: str = "",
             )
         fresh = c.execute("SELECT * FROM approval_requests WHERE id=?",
                           (approval_id,)).fetchone()
+        ap_out = _row_to_dict(fresh)
+        try:
+            _notify_approval(state, kind="decide", approval=ap_out,
+                             detail="迟到决定：单已过期仅留痕（不生效）")
+        except Exception:  # noqa: BLE001
+            pass
         return {"ok": False, "reason": "expired",
-                "approval": _row_to_dict(fresh)}
+                "approval": ap_out}
 
     if decision == "approved":
         # 效果器与决定在同一写事务（读-改-写一致）
@@ -283,7 +309,13 @@ def decide_approval(state, approval_id: str, *, decision: str, reason: str = "",
             )
     fresh = c.execute("SELECT * FROM approval_requests WHERE id=?",
                       (approval_id,)).fetchone()
-    return {"ok": True, "approval": _row_to_dict(fresh)}
+    ap_out = _row_to_dict(fresh)
+    try:
+        _notify_approval(state, kind="decide", approval=ap_out,
+                         detail=f"审批决定：{ap_out['status']} → 该 Agent 用户会话回执")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "approval": ap_out}
 
 
 def expire_overdue(state, now=None) -> int:
@@ -334,3 +366,85 @@ def get_approval(state, approval_id: str, *, conn=None) -> dict | None:
     row = c.execute("SELECT * FROM approval_requests WHERE id=?",
                     (approval_id,)).fetchone()
     return _row_to_dict(row) if row else None
+
+
+# ---------------- 审批事件站内消息（spec-04 §6.0：审批待办/回执入该 Agent 用户会话） ----------------
+
+def _payload_snippet(payload: dict) -> str:
+    try:
+        s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        s = str(payload)
+    return s if len(s) <= 200 else s[:200] + "…"
+
+
+def _notify_approval(state, *, kind: str, approval: dict, detail: str) -> dict | None:
+    """把审批事件写成确定性 markdown 送入该 Agent 用户会话（联系人式直达）。
+
+    kind: submit（审批待办）/ decide（审批回执）；msg_type 分别为 approval /
+    approval_receipt。payload_ref 幂等键 = {kind, approval_id}，重跑零重复。
+    """
+    from core import chatstore  # noqa: PLC0415
+    a = approval
+    agent_name = ""
+    try:
+        agent = chatstore.get_agent(state, a["agent_id"])
+        agent_name = agent["name"] if agent else ""
+    except Exception:  # noqa: BLE001
+        agent_name = ""
+    if kind == "submit":
+        msg_type = "approval"
+        head = f"## 审批待办 · {a['type_label']}"
+        lines = [
+            head,
+            f"- 单号：{a['id']}",
+            f"- Agent：{agent_name or a['agent_id']}",
+            f"- 类型：{a['type_label']}",
+            f"- 内容：{_payload_snippet(a.get('payload') or {})}",
+            f"- 理由：{a.get('reason') or '—'}",
+            f"- 截止：{_bj(a['expires_ts'])}（24h 未决自动过期，spec-04 §4.4）",
+            "- 处理：审批中心 → 通过 / 驳回（人工评审，决定方=登录用户）",
+        ]
+    else:
+        msg_type = "approval_receipt"
+        st = a.get("status", "")
+        lines = [
+            f"## 审批回执 · {a['type_label']} · {STATUS_MSG.get(st, st)}",
+            f"- 单号：{a['id']}",
+            f"- Agent：{agent_name or a['agent_id']}",
+            f"- 决定方：{a.get('decided_by') or '—'} 于 "
+            f"{_bj(a.get('decided_ts') or '')}",
+            f"- 意见/说明：{a.get('reason') or a.get('close_note') or '—'}",
+        ]
+        if a.get("result_ref"):
+            lines.append(f"- 生效值：{a['result_ref'][:200]}")
+    body = "\n".join(lines)
+    payload = json.dumps({"kind": kind, "approval_id": a["id"]},
+                         ensure_ascii=False, sort_keys=True)
+    try:
+        conv = chatstore.ensure_user_chat(state, a["agent_id"])
+    except LookupError:
+        return None
+    conn = state_conn(state)
+    if conn.execute(
+        "SELECT 1 FROM messages WHERE conv_id=? AND payload_ref=? LIMIT 1",
+        (conv["id"], payload),
+    ).fetchone():
+        return None
+    msg = chatstore.insert_message(
+        state, conv_id=conv["id"], agent_id=a["agent_id"], direction="agent",
+        msg_type=msg_type, body=body, payload_ref=payload,
+        status="delivered", delivered_via="web")
+    try:
+        c = state_conn(state)
+        with write_txn(c) as cw:
+            cw.execute(
+                "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+                " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+                (_now_iso(), "scheduler" if kind == "decide" else "agent",
+                 "approval.notify", "message", msg["id"], "delivered",
+                 detail[:400], ""),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return msg

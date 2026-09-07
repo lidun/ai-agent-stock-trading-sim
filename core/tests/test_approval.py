@@ -196,6 +196,54 @@ def test_approval_api_end_to_end(authed_client):
     ).fetchone()[0] == 2   # 通过 + 重复决定留痕
 
 
+def test_approval_messaging_pending_and_receipt(authed_client):
+    """spec-04 §6.0：审批待办（approval）与回执（approval_receipt）入该 Agent 用户会话。"""
+    st = authed_client.app.state
+    r = approval.submit_approval(
+        st, type_="exemption", agent_id=DEMO, payload=_exemption_payload(["st"]),
+        reason="ST 豁免申请（消息化验证）")
+    assert r["ok"] is True
+    conv = state_conn(st).execute(
+        "SELECT id FROM conversations WHERE agent_id=? AND conv_type='user_chat'",
+        (DEMO,)).fetchone()
+    assert conv is not None
+    pending = state_conn(st).execute(
+        "SELECT * FROM messages WHERE conv_id=? AND msg_type='approval'",
+        (conv["id"],)).fetchone()
+    assert pending is not None
+    assert "审批待办" in pending["body"] and "ST 豁免申请（消息化验证）" in pending["body"]
+    assert pending["status"] == "delivered" and pending["read_ts"] == ""
+    # 决定 → 审批回执
+    approval.decide_approval(st, r["approval"]["id"], decision="approved",
+                             reason="通过（消息回执验证）", decided_by="user")
+    receipt = state_conn(st).execute(
+        "SELECT * FROM messages WHERE conv_id=? AND msg_type='approval_receipt'",
+        (conv["id"],)).fetchone()
+    assert receipt is not None
+    assert "已通过" in receipt["body"] and "通过（消息回执验证）" in receipt["body"]
+    # 未读角标 = 2（待办 + 回执），approval.notify 审计留痕
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE conv_id=? AND direction='agent'"
+        " AND status='delivered' AND read_ts=''", (conv["id"],)).fetchone()[0] == 2
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='approval.notify'"
+    ).fetchone()[0] == 2
+
+
+def test_approval_messaging_skips_unknown_agent_submit(authed_client):
+    """路由层已 404 拦截未知 Agent；模块层对不存在会话 Agent 的待办通知安全跳过。"""
+    st = authed_client.app.state
+    out = approval._notify_approval(
+        st, kind="submit",
+        approval={"id": "ap-x", "type_label": "风险", "type": "risk",
+                  "agent_id": "no-such-agent", "payload": {}, "reason": "x",
+                  "expires_ts": "2099-01-01T00:00:00Z",
+                  "status": "pending", "decided_by": "", "decided_ts": "",
+                  "close_note": "", "result_ref": ""},
+        detail="test")
+    assert out is None
+
+
 def test_approval_api_requires_session(client):
     """未登录一律 401（含 GET/POST/PATCH）。"""
     assert client.get("/api/approvals").status_code == 401

@@ -11,6 +11,7 @@ const AGENT_TYPE_LABEL: Record<string, string> = {
   daily_report: "日报",
   report: "日报直达",
   abnormal_report: "异常上报",
+  approval: "审批待办",
   approval_receipt: "审批回执",
   daily_summary: "总汇报",
   monthly_report: "月度体检报告",
