@@ -43,8 +43,9 @@
 
  未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/封板确认事件类（seal_confirm，
 需盘口/封单数据）、volume 量能类、signal_registry（候选/买入等信号注册需策略侧供给通道，
-本版未建）、公司行动除送转外（§6.6：送转 split 已支持——settle_account 收 corp_events 于
-事务首步确定性重写存量 lot；现金分红/配股/退市整理归 spec-01 §6.6 后续切片）。
+本版未建）、公司行动除送转/现金分红外（§6.6：送转 split、现金分红 dividend 已支持——
+settle_account 收 corp_events 于事务首步确定性应用，分红净额经 corp_cash 并入守恒式一，
+tax=True 启用 §6.4 简化档红利税；配股/退市整理归 spec-01 §6.6 后续切片）。
 
 卖出跟踪（§8.1）引擎侧已实现：卖出成交自动登记 exit_trackings；跟踪推进与结清由
 settle_exits 在结算日调用（N=10 交易日结清，确定性/零 token，停牌缺价→最近可得价 stale
@@ -62,6 +63,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+from datetime import date as _date
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
@@ -278,11 +280,13 @@ def _norm_l1(bars) -> list[tuple[str, Decimal | None, Decimal | None, Decimal | 
 
 def _audit_conservation(c, account_id: str, trade_date: str, *, cash_start: Decimal,
                         final_cash: Decimal, equity: Decimal, shares: Decimal, nav: Decimal,
-                        close_map: dict[str, float]) -> None:
+                        close_map: dict[str, float],
+                        corp_cash: Decimal = Decimal("0")) -> None:
     """§6.5 对账双守恒自检（D1=A，单事务内、落账前执行）。
 
     式一（金额守恒）：cash_start + Σ当日成交净流（卖出 amount−费用 / 买入 −(amount+费用)，全 Decimal）
-        == 期末现金，从 trades 逐笔独立推导，与引擎内存现金路径互相校验；
+        + corp_cash（当日除权现金入账，公司行动分红净额）== 期末现金，从 trades 逐笔独立
+        推导，与引擎内存现金路径互相校验；
     式二（NAV 守恒）：期末现金 + Σ期末持仓×官方收盘价（从 holdings 独立推导）== equity，
         且 equity/shares 与落账 NAV 舍入一致。任何不平 → EngineError → 整事务回滚（带病不落账）。
     """
@@ -296,10 +300,11 @@ def _audit_conservation(c, account_id: str, trade_date: str, *, cash_start: Deci
         amt = _D(r["amount"])
         fee = _D(r["fee_total"])
         flow += (amt - fee) if r["side"] == "sell" else -(amt + fee)
-    if cash_start + flow != final_cash:
+    if cash_start + flow + corp_cash != final_cash:
         raise EngineError(
             f"对账式一(金额守恒)不平 acct={account_id} {trade_date}: "
             f"期末现金 {final_cash} ≠ 期初 {cash_start} + 当日净流 {flow}"
+            f"{' + corp_cash ' + str(corp_cash) if corp_cash else ''}"
         )
     mv = Decimal("0")
     for h in c.execute(
@@ -470,96 +475,190 @@ def _plain(d: Decimal) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
+def _dividend_tax_rate(buy_date: str, ex_date: str) -> Decimal:
+    """红利税简化档（spec-01 §6.4，按持有自然日折算、常数可调）：
+    ≤30 日 ≈ 1 个月内 → 20%；31~365 日 ≈ 1 个月~1 年 → 10%；>365 日超 1 年 → 免。
+    以 buy_date 至 ex_date 的自然日数取档（确定性、零 token、Decimal 金额路径不变）。
+    """
+    b = _date(*[int(x) for x in buy_date.split("-")])
+    e = _date(*[int(x) for x in ex_date.split("-")])
+    days = (e - b).days
+    if days <= 30:
+        return Decimal("0.20")
+    if days <= 365:
+        return Decimal("0.10")
+    return Decimal("0")
+
+
 def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
                        now: str) -> dict:
-    """送转（split）除权日存量 lot 同步重写（spec-01 §2.2/§6.6；结算事务内首步调用）。
+    """除权日公司行动（spec-01 §2.2/§6.6；结算事务内首步调用，按事件 kind 分派）。
 
-    events[symbol] = {"kind": "split", "ratio": s}——每股送转 s 股（如 10 转 10 → ratio=1）。
-    buy_date < ex_date 的存量 lot（当日新买入价已含除权，不重写）：quantity/remaining
-    ×(1+s) 向下取整到股（股数尾差计入审计 detail）、buy_price ÷(1+s)（成本同比例摊薄，
-    舍入到成本位）；holdings.quantity 以 Σ remaining 重建、avg_cost ÷(1+s) 同步；lot 的
-    corp_action_flags 追加幂等 tag（同 tag 已存在 → 整事件跳过，防重试/重复调用重写）。
-    无存量 lot（当日才建仓/无持仓）→ 不动作也不报错。dividend/rights/delist 等 kind
-    未实现 → EngineGapError（不静默、不虚构入账，属 §6.6 后续切片）。
+    events[symbol] 支持两种 kind（同一事件表后续可多事件）：
+      {"kind": "split", "ratio": s}——送转：buy_date < ex_date 存量 lot 数量 ×(1+s)
+    向下取整到股（尾差审计）、buy_price ÷(1+s)（成本摊薄，舍入成本位）、holdings.
+    quantity/avg_cost 同步重建、lot 标幂等 tag；当日新买入 lot 不重写。
+      {"kind": "dividend", "cash_per_share": dps, "tax": bool}——现金分红：按各存量
+    lot remaining × dps 入账（默认不计税，tax=True 时按 §6.4 简化档红利税逐 lot 计税
+    分摊扣减）；成本与持仓数量不变；净额经返回 cash_credit 注入结算现金路径（并入
+    守恒式一）。当日无存量 lot（含当日才建仓）→ 该事件 no-op。
+    除 split/dividend 外的 kind（rights/delist…）未实现 → EngineGapError（不静默、
+    不虚构入账，归 §6.6 后续切片）。
     """
-    out = {"applied": 0, "symbols": []}
+    out = {"applied": 0, "symbols": [], "cash_credit": Decimal("0")}
     for symbol in sorted(events):
         ev = events[symbol] or {}
         kind = str(ev.get("kind") or "split")
-        if kind != "split":
+        if kind not in ("split", "dividend"):
             raise EngineGapError(
                 f"corp_action kind={kind}（{symbol}）引擎侧未支持（spec-01 §6.6 后续切片）"
             )
-        try:
-            s = Decimal(str(ev.get("ratio") or "0"))
-        except Exception as exc:
-            raise EngineError(f"corp_action {symbol} ratio 非法: {exc}") from exc
-        if s < 0:
-            raise EngineError(f"corp_action {symbol} ratio 须 >= 0")
-        one = _D("1") + s
-        rows = c.execute(
-            """
-            SELECT l.*, h.symbol, h.id AS holding_id
-              FROM lots l JOIN holdings h ON h.id = l.holding_id
-             WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
-               AND l.remaining > 0
-             ORDER BY l.buy_date ASC, l.id ASC
-            """,
-            (account_id, symbol, ex_date),
-        ).fetchall()
-        if not rows:
-            continue                       # 除权日当日无存量持仓：无对象可重写
-        tag = f"split:{ex_date}:{symbol}"
-        if any(tag in _flags_tags(r["corp_action_flags"]) for r in rows):
-            continue                       # 幂等：同日同事件已重写过 → 整事件跳过
-        lots = []
-        tail = Decimal("0")
-        hid = rows[0]["holding_id"]
-        for r in rows:
-            q_old = _D(r["quantity"])
-            rem_old = _D(r["remaining"])
-            p_old = _D(r["buy_price"])
-            q_new = (q_old * one).to_integral_value(rounding=ROUND_DOWN)
-            rem_new = (rem_old * one).to_integral_value(rounding=ROUND_DOWN)
-            tail += (rem_old * one) - rem_new
-            p_new = (p_old / one).quantize(_COST, ROUND_HALF_UP)
-            c.execute(
-                "UPDATE lots SET buy_price=?, quantity=?, remaining=?, corp_action_flags=? WHERE id=?",
-                (_q(p_new), _q(q_new), _q(rem_new),
-                 _append_flag(r["corp_action_flags"], tag), r["id"]),
-            )
-            lots.append({"id": r["id"], "buy_date": r["buy_date"],
-                         "qty": [_plain(q_old), _plain(q_new)],
-                         "remaining": [_plain(rem_old), _plain(rem_new)],
-                         "price": [_plain(p_old), _plain(p_new)]})
-        qty_sum = c.execute(
-            "SELECT COALESCE(SUM(remaining), 0) AS t FROM lots WHERE holding_id=?",
-            (hid,),
-        ).fetchone()["t"]
-        hrow = c.execute(
-            "SELECT quantity, avg_cost FROM holdings WHERE id=?", (hid,)
-        ).fetchone()
-        avg_old = _D(hrow["avg_cost"])
-        avg_new = (avg_old / one).quantize(_COST, ROUND_HALF_UP)
-        c.execute(
-            "UPDATE holdings SET quantity=?, avg_cost=?, updated_ts=? WHERE id=?",
-            (_q(_D(qty_sum)), _q(avg_new), now, hid),
-        )
-        c.execute(
-            "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
-            " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
-            (now, account_id, "corp_action.split", "holding", hid, "rewritten",
-             json.dumps({
-                 "symbol": symbol, "ex_date": ex_date, "ratio": str(s),
-                 "holding": {"quantity": [_plain(_D(hrow["quantity"])), _plain(_D(qty_sum))],
-                             "avg_cost": [_plain(avg_old), _plain(avg_new)]},
-                 "lots": lots,
-                 "qty_tail": _plain(tail),      # 向下取整丢弃的股数尾差（审计留痕）
-             }, ensure_ascii=False), ""),
-        )
-        out["applied"] += 1
-        out["symbols"].append(symbol)
+        if kind == "split":
+            applied = _corp_split(c, account_id, ex_date, symbol, ev, now)
+        else:
+            applied = _corp_dividend(c, account_id, ex_date, symbol, ev, now, out)
+        if applied:
+            out["applied"] += 1
+            out["symbols"].append(symbol)
     return out
+
+
+def _corp_split(c, account_id: str, ex_date: str, symbol: str, ev: dict,
+                now: str) -> bool:
+    """送转存量 lot 重写（逻辑见 apply_corp_actions split 分支）；返回是否执行。"""
+    try:
+        s = Decimal(str(ev.get("ratio") or "0"))
+    except Exception as exc:
+        raise EngineError(f"corp_action {symbol} ratio 非法: {exc}") from exc
+    if s < 0:
+        raise EngineError(f"corp_action {symbol} ratio 须 >= 0")
+    one = _D("1") + s
+    rows = c.execute(
+        """
+        SELECT l.*, h.symbol, h.id AS holding_id
+          FROM lots l JOIN holdings h ON h.id = l.holding_id
+         WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+           AND l.remaining > 0
+         ORDER BY l.buy_date ASC, l.id ASC
+        """,
+        (account_id, symbol, ex_date),
+    ).fetchall()
+    if not rows:
+        return False                       # 除权日当日无存量持仓：无对象可重写
+    tag = f"split:{ex_date}:{symbol}"
+    if any(tag in _flags_tags(r["corp_action_flags"]) for r in rows):
+        return False                       # 幂等：同日同事件已重写过 → 整事件跳过
+    lots = []
+    tail = Decimal("0")
+    hid = rows[0]["holding_id"]
+    for r in rows:
+        q_old = _D(r["quantity"])
+        rem_old = _D(r["remaining"])
+        p_old = _D(r["buy_price"])
+        q_new = (q_old * one).to_integral_value(rounding=ROUND_DOWN)
+        rem_new = (rem_old * one).to_integral_value(rounding=ROUND_DOWN)
+        tail += (rem_old * one) - rem_new
+        p_new = (p_old / one).quantize(_COST, ROUND_HALF_UP)
+        c.execute(
+            "UPDATE lots SET buy_price=?, quantity=?, remaining=?, corp_action_flags=? WHERE id=?",
+            (_q(p_new), _q(q_new), _q(rem_new),
+             _append_flag(r["corp_action_flags"], tag), r["id"]),
+        )
+        lots.append({"id": r["id"], "buy_date": r["buy_date"],
+                     "qty": [_plain(q_old), _plain(q_new)],
+                     "remaining": [_plain(rem_old), _plain(rem_new)],
+                     "price": [_plain(p_old), _plain(p_new)]})
+    qty_sum = c.execute(
+        "SELECT COALESCE(SUM(remaining), 0) AS t FROM lots WHERE holding_id=?",
+        (hid,),
+    ).fetchone()["t"]
+    hrow = c.execute(
+        "SELECT quantity, avg_cost FROM holdings WHERE id=?", (hid,)
+    ).fetchone()
+    avg_old = _D(hrow["avg_cost"])
+    avg_new = (avg_old / one).quantize(_COST, ROUND_HALF_UP)
+    c.execute(
+        "UPDATE holdings SET quantity=?, avg_cost=?, updated_ts=? WHERE id=?",
+        (_q(_D(qty_sum)), _q(avg_new), now, hid),
+    )
+    c.execute(
+        "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+        " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+        (now, account_id, "corp_action.split", "holding", hid, "rewritten",
+         json.dumps({
+             "symbol": symbol, "ex_date": ex_date, "ratio": str(s),
+             "holding": {"quantity": [_plain(_D(hrow["quantity"])), _plain(_D(qty_sum))],
+                         "avg_cost": [_plain(avg_old), _plain(avg_new)]},
+             "lots": lots,
+             "qty_tail": _plain(tail),      # 向下取整丢弃的股数尾差（审计留痕）
+         }, ensure_ascii=False), ""),
+    )
+    return True
+
+
+def _corp_dividend(c, account_id: str, ex_date: str, symbol: str, ev: dict,
+                   now: str, out: dict) -> bool:
+    """现金分红入账（spec-01 §6.6 + §6.4）：按存量 lot remaining × dps 计息，tax=True
+    时按持有期简化档逐 lot 计税分摊；成本与数量不变；净额累计进 out['cash_credit']。
+    """
+    try:
+        dps = Decimal(str(ev.get("cash_per_share") or "0"))
+    except Exception as exc:
+        raise EngineError(f"corp_action {symbol} cash_per_share 非法: {exc}") from exc
+    if dps < 0:
+        raise EngineError(f"corp_action {symbol} cash_per_share 须 >= 0")
+    tax_on = bool(ev.get("tax"))
+    rows = c.execute(
+        """
+        SELECT l.id, l.buy_date, l.remaining, l.corp_action_flags,
+               h.id AS holding_id
+          FROM lots l JOIN holdings h ON h.id = l.holding_id
+         WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+           AND l.remaining > 0
+         ORDER BY l.buy_date ASC, l.id ASC
+        """,
+        (account_id, symbol, ex_date),
+    ).fetchall()
+    if not rows:
+        return False                       # 无存量持仓：无可分红对象（当日新买不参与）
+    tag = f"dividend:{ex_date}:{symbol}"
+    if any(tag in _flags_tags(r["corp_action_flags"]) for r in rows):
+        return False                       # 幂等：同日同事件已入账 → 跳过
+    hid = rows[0]["holding_id"]
+    total = Decimal("0")
+    tax = Decimal("0")
+    lots = []
+    for r in rows:
+        rem = _D(r["remaining"])
+        amt = (dps * rem).quantize(_MONEY, ROUND_HALF_UP)
+        rate = _dividend_tax_rate(r["buy_date"], ex_date) if tax_on else Decimal("0")
+        tax_i = (amt * rate).quantize(_MONEY, ROUND_HALF_UP)
+        total += amt
+        tax += tax_i
+        c.execute(
+            "UPDATE lots SET corp_action_flags=? WHERE id=?",
+            (_append_flag(r["corp_action_flags"], tag), r["id"]),
+        )
+        lots.append({"id": r["id"], "buy_date": r["buy_date"],
+                     "remaining": _plain(rem), "dividend": _plain(amt),
+                     "tax_rate": _plain(rate), "tax": _plain(tax_i)})
+    net = (total - tax).quantize(_MONEY, ROUND_HALF_UP)
+    out["cash_credit"] += net
+    c.execute(
+        "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+        " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+        (now, account_id, "corp_action.dividend", "holding", hid,
+         f"credited:{_plain(net)}",
+         json.dumps({
+             "symbol": symbol, "ex_date": ex_date, "cash_per_share": _plain(dps),
+             "tax_enabled": tax_on,
+             "lots": lots,
+             "dividend_total": _plain(total),
+             "tax_total": _plain(tax),
+             "net_credit": _plain(net),
+         }, ensure_ascii=False), ""),
+    )
+    return True
 
 
 def settle_account(
@@ -608,8 +707,11 @@ def settle_account(
     守恒（非虚构替代价）。其余票缺当日序列仍显式 EngineError（数据缺口，不误判停牌）。
     corp_events[symbol] = 当日公司行动事件（spec-01 §6.6）：{"kind": "split", "ratio": s}
     送转除权——结算事务首步对 buy_date < 当日 的存量 lot 同步重写（数量×股、成本摊薄、
-    holdings 重建、审计留痕、幂等 tag），当日新买入 lot 不受影响；kind=dividend/rights
-    等未实现 → EngineGapError（不静默虚构）。默认缺省不传 → 无公司行动行为。
+    holdings 重建、审计留痕、幂等 tag），当日新买入 lot 不受影响；{"kind": "dividend",
+    "cash_per_share": dps, "tax": bool} 现金分红——按存量 lot 入账净额（tax=True 按 §6.4
+    简化档红利税逐 lot 计税，默认不计），成本与数量不变，净额注入当日现金并计入守恒式一。
+    其他 kind（rights/delist…）未实现 → EngineGapError（不静默虚构）。默认缺省不传 → 无
+    公司行动行为。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -722,8 +824,8 @@ def settle_account(
         ).fetchone():
             return {"already_settled": True, "account_id": account_id, "trade_date": trade_date}
 
-        # ---- 除权日公司行动：送转存量 lot 同步重写（§2.2/§6.6；撮合/对账之前，事务内）----
-        corp_out = {"applied": 0, "symbols": []}
+        # ---- 除权日公司行动：送转/分红事务首步应用（§2.2/§6.6；撮合/对账之前，事务内）----
+        corp_out = {"applied": 0, "symbols": [], "cash_credit": Decimal("0")}
         if corp_events:
             corp_out = apply_corp_actions(c, account_id, trade_date, corp_events, now)
 
@@ -752,8 +854,9 @@ def settle_account(
                 o["invalid_reason"] = "basis_requires_l0"
             active.append(o)
 
-        cash_start = _D(acct["cash"])    # 事务内期初快照（today_pnl 基准）
-        cash = cash_start
+        cash_start = _D(acct["cash"])    # 事务内期初快照（today_pnl 基准，不含公司行动现金）
+        corp_cash = _D(corp_out.get("cash_credit") or Decimal("0"))
+        cash = cash_start + corp_cash    # 除权现金（分红净额）先行注入当日资金池
         initial_capital = _D(acct["initial_capital"])
 
         # ---- 开盘前静态校验：买入数量规则 → invalid（qty_rule，§3.7）----
@@ -1508,7 +1611,7 @@ def settle_account(
         # 对账自检（§6.5 双守恒，D1=A）：任一不平 → 抛错 → 整事务回滚（带病不落账）
         _audit_conservation(c, account_id, trade_date, cash_start=cash_start,
                             final_cash=final_cash, equity=equity, shares=shares,
-                            nav=nav, close_map=close_map)
+                            nav=nav, close_map=close_map, corp_cash=corp_cash)
         total_pnl = (equity - initial_capital).quantize(_MONEY, ROUND_HALF_UP)
         today_pnl = (equity - start_equity).quantize(_MONEY, ROUND_HALF_UP)
         c.execute(

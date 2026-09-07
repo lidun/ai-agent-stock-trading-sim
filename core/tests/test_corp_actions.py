@@ -58,7 +58,7 @@ def _buy(state, *, day="2026-09-07", qty=1000, price=10.0):
     r = eodengine.settle_account(
         state, DEMO, day,
         series_map={"600000": [(f"{day}T09:31:00", price), (f"{day}T09:32:00", price)]},
-        close_map={"600000": price},
+        close_map={"600000": price}, prev_close_map={"600000": price},
     )
     assert not r["already_settled"]
 
@@ -175,24 +175,76 @@ def test_corp_split_ignores_ex_date_new_lot(authed_client):
     assert lot["corp_action_flags"] == "[]"
 
 
-def test_corp_dividend_unsupported_rolls_back(authed_client):
-    """dividend 未实现 → EngineGapError 且整事务回滚：无当日结算、成交与持仓原样。"""
+def test_corp_dividend_credit_cash_no_tax(authed_client):
+    """现金分红（默认不计税）：按存量 lot remaining × dps 净额入账，成本/数量不变。"""
     st = authed_client.app.state
-    _buy(st)
+    _buy(st, qty=1000, price=10.0)
     ex = "2026-09-08"
-    with pytest.raises(eodengine.EngineGapError):
-        eodengine.settle_account(
-            st, DEMO, ex, close_map={"600000": 5.0}, prev_close_map={"600000": 10.0},
-            corp_events={"600000": {"kind": "dividend", "cash_per_share": 0.5}},
-        )
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 10.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "dividend", "cash_per_share": 0.5}},
+    )
+    assert not r["already_settled"]
+    assert r["corp_applied"] == 1 and r["corp_symbols"] == ["600000"]
     conn = state_conn(st)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM settlement_log WHERE settle_key=?", (f"{ex}:{DEMO}",)
-    ).fetchone()[0] == 0
-    lot = conn.execute("SELECT * FROM lots WHERE account_id=?", (DEMO,)).fetchone()
-    assert lot["quantity"] == 1000 and lot["buy_price"] == 10.0
     cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
-    assert abs(cash - (100000.0 - 10005.1)) < 0.01
+    assert abs(cash - (100000.0 - 10005.1 + 500.0)) < 0.01
+    h = conn.execute(
+        "SELECT quantity, avg_cost FROM holdings WHERE account_id=? AND symbol='600000'",
+        (DEMO,)).fetchone()
+    assert h["quantity"] == 1000
+    assert abs(h["avg_cost"] - 10.0051) < 1e-4       # 成本不因分红调整
+    au = conn.execute(
+        "SELECT detail FROM audit_logs WHERE action='corp_action.dividend'").fetchall()
+    assert len(au) == 1
+    d = json.loads(au[0]["detail"])
+    assert d["cash_per_share"] == "0.5" and d["tax_enabled"] is False
+    assert d["lots"][0]["dividend"] == "500" and d["tax_total"] == "0"
+    assert d["net_credit"] == "500"
+
+
+def test_corp_dividend_multi_tax_brackets(authed_client):
+    """红利税启用：按各 lot 持有期自然月整月取档逐 lot 计税分摊（1 月内 20% / 1 月~1 年 10%）。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-07-20", qty=100, price=10.0)     # ex 时持有约 2 整月 → 10%
+    _buy(st, day="2026-09-07", qty=900, price=10.0)     # ex 时不满 1 月 → 20%
+    ex = "2026-09-08"
+    r = eodengine.settle_account(
+        st, DEMO, ex, close_map={"600000": 10.0}, prev_close_map={"600000": 10.0},
+        corp_events={"600000": {"kind": "dividend", "cash_per_share": 0.5, "tax": True}},
+    )
+    assert r["corp_applied"] == 1
+    # lot1 100 股分红 50 ×10% = 税 5；lot2 900 股分红 450 ×20% = 税 90；净 405
+    # 买入费：100@10 → 5.01；900@10 → 5.09（佣金 5 + 过户 0.09）
+    conn = state_conn(st)
+    cash = conn.execute("SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash - (100000.0 - 1005.01 - 9005.09 + 405.0)) < 0.01
+    au = conn.execute(
+        "SELECT detail FROM audit_logs WHERE action='corp_action.dividend'").fetchall()
+    assert len(au) == 1
+    d = json.loads(au[0]["detail"])
+    assert d["tax_enabled"] is True
+    by_rate = {lot["tax_rate"]: lot for lot in d["lots"]}
+    assert by_rate["0.1"]["dividend"] == "50" and by_rate["0.1"]["tax"] == "5"
+    assert by_rate["0.2"]["dividend"] == "450" and by_rate["0.2"]["tax"] == "90"
+    assert d["dividend_total"] == "500" and d["tax_total"] == "95"
+    assert d["net_credit"] == "405"
+
+
+def test_dividend_tax_rate_brackets():
+    """红利税档边界（按持有自然日折算）：≤30 日 20% / 31~365 日 10% / >365 日免。"""
+    from decimal import Decimal
+    f = eodengine._dividend_tax_rate
+    assert f("2026-09-07", "2026-09-08") == Decimal("0.20")   # 1 日
+    assert f("2026-09-07", "2026-10-06") == Decimal("0.20")   # 29 日（1 个月内）
+    assert f("2026-09-07", "2026-10-07") == Decimal("0.20")   # 30 日（恰 1 个月折算）
+    assert f("2026-09-07", "2026-10-08") == Decimal("0.10")   # 31 日（>1 个月）
+    assert f("2026-09-07", "2026-11-07") == Decimal("0.10")   # 61 日
+    assert f("2025-09-07", "2026-09-07") == Decimal("0.10")   # 365 日（恰 1 年 → 仍 10%）
+    assert f("2025-09-07", "2026-09-08") == Decimal("0")      # 366 日 → 超 1 年免
+    assert f("2025-09-07", "2026-08-06") == Decimal("0.10")   # 333 日
+    assert f("2025-09-07", "2026-10-07") == Decimal("0")      # 395 日 → 免
+
 
 
 def test_corp_split_run_day_passthrough(authed_client):
@@ -219,3 +271,35 @@ def test_corp_split_run_day_passthrough(authed_client):
     assert lot2["quantity"] == 1000 and lot2["remaining"] == 1000
     half = float(_row(buy_day)["close"]) / 2.0
     assert abs(lot2["buy_price"] - half) < 1e-4
+
+
+def test_corp_dividend_run_day_passthrough(authed_client):
+    """run_day 分红透传：ex 日现金分红净额经 corp_cash 注入，守恒式一通过、无额外成交。"""
+    st = authed_client.app.state
+    buy_day, ex_day = "2026-08-31", "2026-09-01"
+    low = float(_row(buy_day)["low"])
+    _insert_order(st, order_id="rd-dbuy", order_type="buy", direction="buy",
+                  qty=500, trigger={"op": "le", "price": low}, day=buy_day)
+    settle_day.run_day(st, buy_day, feed=MultiDayL2Feed(), account_ids=[DEMO])
+    conn = state_conn(st)
+    cash_before = conn.execute(
+        "SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+
+    r2 = settle_day.run_day(st, ex_day, feed=MultiDayL2Feed(), account_ids=[DEMO],
+                            corp_events={"600000": {"kind": "dividend",
+                                                    "cash_per_share": 0.5}})
+    acct2 = [a for a in r2["accounts"] if a["account_id"] == DEMO][0]
+    assert acct2.get("error") is not True
+    assert acct2["corp_applied"] == 1 and acct2["corp_symbols"] == ["600000"]
+    cash_after = conn.execute(
+        "SELECT cash FROM accounts WHERE id=?", (DEMO,)).fetchone()[0]
+    assert abs(cash_after - cash_before - 250.0) < 0.01      # 500 股 × 0.5 全额入账
+    h = conn.execute(
+        "SELECT quantity, avg_cost FROM holdings WHERE account_id=? AND symbol='600000'",
+        (DEMO,)).fetchone()
+    assert h["quantity"] == 500                                # 分红不动数量与成本
+    n = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE account_id=? AND settle_date=?",
+        (DEMO, ex_day)).fetchone()[0]
+    assert n == 0                                              # 无成交、纯现金事件
+
