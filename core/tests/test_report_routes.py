@@ -68,3 +68,62 @@ def test_report_detail_matches_direct_build(authed_client):
     got = authed_client.get(
         f"/api/accounts/{DEMO}/reports/2026-09-04").json()["versions"][0]["data_section"]
     assert got == ds
+
+from core.db import state_conn
+
+
+def _patch(client, url, body):
+    client.get("/api/auth/csrf")
+    from conftest import csrf_headers
+    return client.patch(url, json=body, headers=csrf_headers(client))
+
+
+def test_narrative_patch_persists_with_audit(authed_client):
+    """叙述段写入：PATCH 落库可读、留审计；空叙述可用于清除。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    url = f"/api/accounts/{DEMO}/reports/2026-09-04/versions/1/narrative"
+    r = _patch(authed_client, url, {"narrative": "四段观察：指数平开；五段：维持持仓。"})
+    assert r.status_code == 200 and r.json()["report"]["unchanged"] is False
+    detail = authed_client.get(
+        f"/api/accounts/{DEMO}/reports/2026-09-04").json()["versions"][0]
+    assert detail["narrative"] == "四段观察：指数平开；五段：维持持仓。"
+    n = state_conn(st).execute(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE action='report.narrative_update'"
+    ).fetchone()["n"]
+    assert n == 1
+    # 幂等同文重写 → unchanged=True 不新增审计
+    r2 = _patch(authed_client, url, {"narrative": "四段观察：指数平开；五段：维持持仓。"})
+    assert r2.json()["report"]["unchanged"] is True
+    n2 = state_conn(st).execute(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE action='report.narrative_update'"
+    ).fetchone()["n"]
+    assert n2 == 1
+
+
+def test_narrative_patch_guards(authed_client):
+    """叙述段守卫：越限 400、未知版本 404。"""
+    _buy(authed_client.app.state, day="2026-09-04")
+    url = f"/api/accounts/{DEMO}/reports/2026-09-04/versions/1/narrative"
+    assert _patch(authed_client, url, {"narrative": "长" * 12001}).status_code == 400
+    assert _patch(authed_client, url, {"narrative": ""}).status_code == 200   # 清除合法
+    assert _patch(authed_client, url.replace("/versions/1/", "/versions/99/"),
+                  {"narrative": "x"}).status_code == 404
+
+
+def test_report_export_downloads_markdown(authed_client):
+    """导出：text/markdown + Content-Disposition，含数据段与叙述段尾部。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    url = f"/api/accounts/{DEMO}/reports/2026-09-04/versions/1/narrative"
+    assert _patch(authed_client, url, {"narrative": "叙述段正文"}).status_code == 200
+    r = authed_client.get(f"/api/accounts/{DEMO}/reports/2026-09-04/export?version=1")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/markdown")
+    assert "attachment" in r.headers["content-disposition"]
+    assert r.headers["content-disposition"].endswith("report_agent-demo-001_2026-09-04_v1.md\"")
+    assert r.text.startswith("# 数据段日报 2026-09-04")
+    assert "## 叙述段\n\n叙述段正文" in r.text
+    # 无版本日报 → 404
+    assert authed_client.get(
+        f"/api/accounts/{DEMO}/reports/2026-09-11/export").status_code == 404

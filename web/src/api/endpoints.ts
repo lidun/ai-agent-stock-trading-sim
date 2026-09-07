@@ -1,4 +1,4 @@
-import { apiGet, apiPost } from "./client";
+import { apiGet, apiPatch, apiPost } from "./client";
 
 export interface Me {
   user: string;
@@ -351,4 +351,22 @@ export function fetchReportVersions(
   tradeDate: string,
 ): Promise<{ account_id: string; trade_date: string; versions: ReportVersion[] }> {
   return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}`);
+}
+
+export function updateReportNarrative(
+  agentId: string,
+  tradeDate: string,
+  version: number,
+  narrative: string,
+): Promise<{ ok: true; report: { version: number; unchanged: boolean } }> {
+  return apiPatch(
+    `/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}/versions/${version}/narrative`,
+    { narrative },
+  );
+}
+
+/** 单篇导出下载地址（同源会话 Cookie 直通，spec-06 §6.6 P3 基础版） */
+export function reportExportUrl(agentId: string, tradeDate: string, version?: number): string {
+  const q = version !== undefined ? `?version=${version}` : "";
+  return `/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}/export${q}`;
 }

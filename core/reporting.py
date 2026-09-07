@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from core.db import state_conn
+from core.db import state_conn, write_txn
 
 if TYPE_CHECKING:  # pragma: no cover
     from types import SimpleNamespace
@@ -361,3 +361,60 @@ def list_engine_reports(state, account_id: str, trade_date: str | None = None,
             "created_ts": r["created_ts"],
         })
     return out
+
+
+def update_narrative(state, account_id: str, trade_date: str, version: int,
+                     narrative: str, actor: str) -> dict | None:
+    """写叙述段（spec-04 §5.2 narrative 由日报任务/人工写入；同版本原地更新留审计，
+    版本留痕语义由修订 v+1 承担）。返回更新后的版本概览；无该行返回 None。"""
+    if not isinstance(narrative, str) or len(narrative) > 12000:
+        raise ValueError("叙述段须为文本且不超过 12000 字")
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        row = c.execute(
+            "SELECT id, narrative FROM daily_reports"
+            " WHERE agent_id=? AND trade_date=? AND version=?",
+            (account_id, trade_date, version),
+        ).fetchone()
+        if row is None:
+            return None
+        old = row["narrative"]
+        if old == narrative:
+            return {"id": row["id"], "account_id": account_id,
+                    "trade_date": trade_date, "version": version, "unchanged": True}
+        c.execute(
+            "UPDATE daily_reports SET narrative=? WHERE id=?", (narrative, row["id"]))
+        c.execute(
+            "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+            " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (_now_iso(), actor, "report.narrative_update", "daily_reports", row["id"],
+             "updated", json.dumps({"old_len": len(old), "new_len": len(narrative)},
+                                   ensure_ascii=False), ""),
+        )
+    return {"id": row["id"], "account_id": account_id,
+            "trade_date": trade_date, "version": version, "unchanged": False}
+
+
+def export_markdown(state, account_id: str, trade_date: str,
+                    version: int | None = None, conn=None) -> str | None:
+    """单篇导出（spec-06 §6.6）：数据段 merged_markdown +（若有）叙述段；无该版本 None。"""
+    c = conn or state_conn(state)
+    if version is not None:
+        row = c.execute(
+            "SELECT version, status, narrative, merged_markdown FROM daily_reports"
+            " WHERE agent_id=? AND trade_date=? AND version=?",
+            (account_id, trade_date, version),
+        ).fetchone()
+    else:
+        row = c.execute(
+            "SELECT version, status, narrative, merged_markdown FROM daily_reports"
+            " WHERE agent_id=? AND trade_date=? ORDER BY version DESC LIMIT 1",
+            (account_id, trade_date),
+        ).fetchone()
+    if row is None:
+        return None
+    parts = [row["merged_markdown"]]
+    if row["narrative"]:
+        parts += ["", "---", "## 叙述段", "", row["narrative"]]
+    parts += ["", f"---", f"_版本 v{row['version']}（{row['status']}）· {account_id} · 确定性引擎数据段（spec-04 §5.2）_"]
+    return "\n".join(parts)

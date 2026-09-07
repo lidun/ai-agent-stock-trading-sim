@@ -9,6 +9,7 @@ import {
   Drawer,
   Empty,
   Flex,
+  Input,
   Segmented,
   Select,
   Skeleton,
@@ -17,12 +18,14 @@ import {
   Typography,
   theme as antTheme,
 } from "antd";
-import { ReloadOutlined } from "@ant-design/icons";
+import { DownloadOutlined, EditOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import {
   fetchReportVersions,
   listAccounts,
   listReportTimeline,
+  reportExportUrl,
+  updateReportNarrative,
   type AccountInfo,
   type ReportTimelineEntry,
   type ReportVersion,
@@ -67,6 +70,9 @@ export default function ReportsPage() {
   const [versions, setVersions] = useState<ReportVersion[]>([]);
   const [verNo, setVerNo] = useState<number>(1);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [editNarrative, setEditNarrative] = useState(false);
+  const [narrativeDraft, setNarrativeDraft] = useState("");
+  const [savingNarrative, setSavingNarrative] = useState(false);
 
   const accountName = useMemo(() => {
     const m = new Map<string, string>();
@@ -130,6 +136,22 @@ export default function ReportsPage() {
     () => versions.find((v) => v.version === verNo) ?? versions[0],
     [versions, verNo],
   );
+
+  const saveNarrative = useCallback(async () => {
+    if (!detail || !version) return;
+    setSavingNarrative(true);
+    try {
+      await updateReportNarrative(detail.agentId, detail.date, version.version, narrativeDraft);
+      message.success("叙述段已保存（审计留痕）");
+      setEditNarrative(false);
+      await openDay(detail.agentId, detail.date);
+      setVerNo(version.version);
+    } catch (e) {
+      message.error((e as Error).message ?? "保存失败");
+    } finally {
+      setSavingNarrative(false);
+    }
+  }, [detail, version, narrativeDraft, message, openDay]);
 
   const columns: ColumnsType<TimelineRow> = [
     { title: "交易日", dataIndex: "trade_date", width: 120, sorter: (a, b) => b.trade_date.localeCompare(a.trade_date) },
@@ -220,9 +242,19 @@ export default function ReportsPage() {
         open={open}
         onClose={() => setOpen(false)}
         extra={
-          <Button icon={<ReloadOutlined />} onClick={() => detail && void openDay(detail.agentId, detail.date)}>
-            刷新
-          </Button>
+          <Flex gap={8} align="center">
+            <Button
+              icon={<DownloadOutlined />}
+              disabled={!version}
+              href={version ? reportExportUrl(detail?.agentId ?? "", detail?.date ?? "", version.version) : undefined}
+              target="_blank"
+            >
+              导出
+            </Button>
+            <Button icon={<ReloadOutlined />} onClick={() => detail && void openDay(detail.agentId, detail.date)}>
+              刷新
+            </Button>
+          </Flex>
         }
       >
         {detailLoading || !version ? (
@@ -293,17 +325,57 @@ export default function ReportsPage() {
               </Card>
             </Flex>
 
-            {version.narrative ? (
-              <Card size="small" title="叙述段">
+            <Card
+              size="small"
+              title="叙述段（手动日报简单叙述 / LLM 待接入，spec-04 §5.2）"
+              extra={
+                !editNarrative ? (
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<EditOutlined />}
+                    onClick={() => {
+                      setNarrativeDraft(version.narrative);
+                      setEditNarrative(true);
+                    }}
+                  >
+                    {version.narrative ? "编辑" : "撰写"}
+                  </Button>
+                ) : (
+                  <Flex gap={4}>
+                    <Button
+                      size="small"
+                      icon={<SaveOutlined />}
+                      type="primary"
+                      loading={savingNarrative}
+                      onClick={() => void saveNarrative()}
+                    >
+                      保存
+                    </Button>
+                    <Button size="small" onClick={() => setEditNarrative(false)}>
+                      取消
+                    </Button>
+                  </Flex>
+                )
+              }
+            >
+              {editNarrative ? (
+                <Input.TextArea
+                  value={narrativeDraft}
+                  onChange={(e) => setNarrativeDraft(e.target.value)}
+                  autoSize={{ minRows: 4, maxRows: 16 }}
+                  placeholder="叙述段：四、市场观察（主观）；五、策略执行判断与明日方向；六、能力/任务/风险申报（spec-04 §5.1）"
+                />
+              ) : version.narrative ? (
                 <div className="md-body">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{version.narrative}</ReactMarkdown>
                 </div>
-              </Card>
-            ) : (
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                叙述段待日报任务生成（LLM，spec-04 §5.2）
-              </Typography.Text>
-            )}
+              ) : (
+                <Typography.Text type="secondary">
+                  叙述段待日报任务生成（LLM，spec-04 §5.2）；可在本版直接撰写（同版本原地更新，审计留痕）
+                </Typography.Text>
+              )}
+            </Card>
 
             <Card
               size="small"

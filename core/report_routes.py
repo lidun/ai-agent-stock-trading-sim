@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
 from core import accountstore, reporting
 from core.auth import require_session
@@ -43,3 +44,40 @@ def account_report_detail(agent_id: str, trade_date: str, request: Request,
         "trade_date": trade_date,
         "versions": reporting.list_engine_reports(request.app.state, agent_id, trade_date),
     }
+
+
+@router.patch("/accounts/{agent_id}/reports/{trade_date}/versions/{version}/narrative")
+def report_narrative_update(agent_id: str, trade_date: str, version: int,
+                            request: Request, session: SessionDep,
+                            payload: dict | None = Body(default=None)):
+    """写叙述段（spec-04 §5.2 narrative；手动日报简单叙述/后续 LLM 写入共用入口）。"""
+    _ensure_account(request.app.state, agent_id)
+    actor = session["session"]["username"]
+    narrative = (payload or {}).get("narrative", "")
+    try:
+        updated = reporting.update_narrative(
+            request.app.state, agent_id, trade_date, version, narrative, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="该版本日报不存在")
+    return {"ok": True, "report": updated}
+
+
+@router.get("/accounts/{agent_id}/reports/{trade_date}/export")
+def report_export(agent_id: str, trade_date: str, request: Request,
+                  session: SessionDep, version: int | None = None):
+    """单篇导出（spec-06 §6.6）：merged_markdown +（若有）叙述段，text/markdown 下载。"""
+    _ensure_account(request.app.state, agent_id)
+    md = reporting.export_markdown(request.app.state, agent_id, trade_date,
+                                   version=version)
+    if md is None:
+        raise HTTPException(status_code=404, detail="该日无日报（含指定版本）")
+    label = version if version is not None else "latest"
+    return PlainTextResponse(
+        content=md,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="report_{agent_id}_{trade_date}_v{label}.md"',
+        },
+    )
