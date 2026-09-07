@@ -41,9 +41,10 @@
 - 时间契约：交易日本地墙钟 naive ISO；order 仅在其 created_at 之后的采样点参与判定（防前视 #38）；
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
-未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/封板确认事件类（seal_confirm，
+ 未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/封板确认事件类（seal_confirm，
 需盘口/封单数据）、volume 量能类、signal_registry（候选/买入等信号注册需策略侧供给通道，
-本版未建）、公司行动。
+本版未建）、公司行动除送转外（§6.6：送转 split 已支持——settle_account 收 corp_events 于
+事务首步确定性重写存量 lot；现金分红/配股/退市整理归 spec-01 §6.6 后续切片）。
 
 卖出跟踪（§8.1）引擎侧已实现：卖出成交自动登记 exit_trackings；跟踪推进与结清由
 settle_exits 在结算日调用（N=10 交易日结清，确定性/零 token，停牌缺价→最近可得价 stale
@@ -62,7 +63,7 @@ import json
 import logging
 import secrets
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
 from core.db import state_conn, write_txn
 
@@ -441,6 +442,126 @@ def settle_exits(
             "closed": closed}
 
 
+def _flags_tags(raw: str) -> list[str]:
+    """corp_action_flags 解析：既有 '[]'（JSON 空数组）与新 ';' 分隔双兼容。"""
+    s = (raw or "").strip()
+    if not s or s == "[]":
+        return []
+    if s.startswith("["):
+        try:
+            v = json.loads(s)
+            return list(v) if isinstance(v, list) else []
+        except ValueError:
+            pass
+    return [t for t in s.split(";") if t]
+
+
+def _append_flag(raw: str, tag: str) -> str:
+    tags = _flags_tags(raw)
+    if tag in tags:
+        return raw
+    tags.append(tag)
+    return json.dumps(tags, ensure_ascii=False)
+
+
+def _plain(d: Decimal) -> str:
+    """Decimal → 无尾零展示串（审计留痕可读，'1000.0'→'1000'、'5.0000'→'5'）。"""
+    s = str(d)
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def apply_corp_actions(c, account_id: str, ex_date: str, events: dict,
+                       now: str) -> dict:
+    """送转（split）除权日存量 lot 同步重写（spec-01 §2.2/§6.6；结算事务内首步调用）。
+
+    events[symbol] = {"kind": "split", "ratio": s}——每股送转 s 股（如 10 转 10 → ratio=1）。
+    buy_date < ex_date 的存量 lot（当日新买入价已含除权，不重写）：quantity/remaining
+    ×(1+s) 向下取整到股（股数尾差计入审计 detail）、buy_price ÷(1+s)（成本同比例摊薄，
+    舍入到成本位）；holdings.quantity 以 Σ remaining 重建、avg_cost ÷(1+s) 同步；lot 的
+    corp_action_flags 追加幂等 tag（同 tag 已存在 → 整事件跳过，防重试/重复调用重写）。
+    无存量 lot（当日才建仓/无持仓）→ 不动作也不报错。dividend/rights/delist 等 kind
+    未实现 → EngineGapError（不静默、不虚构入账，属 §6.6 后续切片）。
+    """
+    out = {"applied": 0, "symbols": []}
+    for symbol in sorted(events):
+        ev = events[symbol] or {}
+        kind = str(ev.get("kind") or "split")
+        if kind != "split":
+            raise EngineGapError(
+                f"corp_action kind={kind}（{symbol}）引擎侧未支持（spec-01 §6.6 后续切片）"
+            )
+        try:
+            s = Decimal(str(ev.get("ratio") or "0"))
+        except Exception as exc:
+            raise EngineError(f"corp_action {symbol} ratio 非法: {exc}") from exc
+        if s < 0:
+            raise EngineError(f"corp_action {symbol} ratio 须 >= 0")
+        one = _D("1") + s
+        rows = c.execute(
+            """
+            SELECT l.*, h.symbol, h.id AS holding_id
+              FROM lots l JOIN holdings h ON h.id = l.holding_id
+             WHERE l.account_id=? AND h.symbol=? AND l.buy_date < ?
+               AND l.remaining > 0
+             ORDER BY l.buy_date ASC, l.id ASC
+            """,
+            (account_id, symbol, ex_date),
+        ).fetchall()
+        if not rows:
+            continue                       # 除权日当日无存量持仓：无对象可重写
+        tag = f"split:{ex_date}:{symbol}"
+        if any(tag in _flags_tags(r["corp_action_flags"]) for r in rows):
+            continue                       # 幂等：同日同事件已重写过 → 整事件跳过
+        lots = []
+        tail = Decimal("0")
+        hid = rows[0]["holding_id"]
+        for r in rows:
+            q_old = _D(r["quantity"])
+            rem_old = _D(r["remaining"])
+            p_old = _D(r["buy_price"])
+            q_new = (q_old * one).to_integral_value(rounding=ROUND_DOWN)
+            rem_new = (rem_old * one).to_integral_value(rounding=ROUND_DOWN)
+            tail += (rem_old * one) - rem_new
+            p_new = (p_old / one).quantize(_COST, ROUND_HALF_UP)
+            c.execute(
+                "UPDATE lots SET buy_price=?, quantity=?, remaining=?, corp_action_flags=? WHERE id=?",
+                (_q(p_new), _q(q_new), _q(rem_new),
+                 _append_flag(r["corp_action_flags"], tag), r["id"]),
+            )
+            lots.append({"id": r["id"], "buy_date": r["buy_date"],
+                         "qty": [_plain(q_old), _plain(q_new)],
+                         "remaining": [_plain(rem_old), _plain(rem_new)],
+                         "price": [_plain(p_old), _plain(p_new)]})
+        qty_sum = c.execute(
+            "SELECT COALESCE(SUM(remaining), 0) AS t FROM lots WHERE holding_id=?",
+            (hid,),
+        ).fetchone()["t"]
+        hrow = c.execute(
+            "SELECT quantity, avg_cost FROM holdings WHERE id=?", (hid,)
+        ).fetchone()
+        avg_old = _D(hrow["avg_cost"])
+        avg_new = (avg_old / one).quantize(_COST, ROUND_HALF_UP)
+        c.execute(
+            "UPDATE holdings SET quantity=?, avg_cost=?, updated_ts=? WHERE id=?",
+            (_q(_D(qty_sum)), _q(avg_new), now, hid),
+        )
+        c.execute(
+            "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+            " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (now, account_id, "corp_action.split", "holding", hid, "rewritten",
+             json.dumps({
+                 "symbol": symbol, "ex_date": ex_date, "ratio": str(s),
+                 "holding": {"quantity": [_plain(_D(hrow["quantity"])), _plain(_D(qty_sum))],
+                             "avg_cost": [_plain(avg_old), _plain(avg_new)]},
+                 "lots": lots,
+                 "qty_tail": _plain(tail),      # 向下取整丢弃的股数尾差（审计留痕）
+             }, ensure_ascii=False), ""),
+        )
+        out["applied"] += 1
+        out["symbols"].append(symbol)
+    return out
+
+
 def settle_account(
     state,
     account_id: str,
@@ -458,6 +579,7 @@ def settle_account(
     suspend_map: dict[str, float] | None = None,
     fee: dict | None = None,
     exit_market: dict[str, dict] | None = None,
+    corp_events: dict[str, dict] | None = None,
 ) -> dict:
     """对单个账户执行一日 EOD 结算（单 SQLite 事务原子写入）。
 
@@ -484,6 +606,10 @@ def settle_account(
     复牌，#54）：其订单不参与判定——today 单到期 expired（当日无成交窗口，公平口径）、
     long/until 单保持 active 待复牌日恢复判定；持仓按停牌估值价并入 close_map 估值与对账
     守恒（非虚构替代价）。其余票缺当日序列仍显式 EngineError（数据缺口，不误判停牌）。
+    corp_events[symbol] = 当日公司行动事件（spec-01 §6.6）：{"kind": "split", "ratio": s}
+    送转除权——结算事务首步对 buy_date < 当日 的存量 lot 同步重写（数量×股、成本摊薄、
+    holdings 重建、审计留痕、幂等 tag），当日新买入 lot 不受影响；kind=dividend/rights
+    等未实现 → EngineGapError（不静默虚构）。默认缺省不传 → 无公司行动行为。
     """
     series_map = series_map or {}
     l1_map = {sym: _norm_l1(bars) for sym, bars in (l1_map or {}).items()}
@@ -595,6 +721,11 @@ def settle_account(
             "SELECT 1 FROM settlement_log WHERE settle_key=?", (settle_key,)
         ).fetchone():
             return {"already_settled": True, "account_id": account_id, "trade_date": trade_date}
+
+        # ---- 除权日公司行动：送转存量 lot 同步重写（§2.2/§6.6；撮合/对账之前，事务内）----
+        corp_out = {"applied": 0, "symbols": []}
+        if corp_events:
+            corp_out = apply_corp_actions(c, account_id, trade_date, corp_events, now)
 
         orders = c.execute(
             """
@@ -1402,6 +1533,8 @@ def settle_account(
             "today_pnl": _q(today_pnl),
             "circuit_blocked": len(frozen_buys),
             "suspended_symbols": sorted(suspend_map),
+            "corp_applied": corp_out["applied"],
+            "corp_symbols": corp_out["symbols"],
         }
         log.info("settle %s %s -> %s", trade_date, account_id, summary["today_pnl"])
         return summary

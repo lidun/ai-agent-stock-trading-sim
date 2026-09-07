@@ -173,9 +173,12 @@ def _build_feeds(feed, orders: list[dict], held_symbols: list[str], trade_date: 
 def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
             account_ids: list[str] | None = None,
             suspend_map: dict[str, dict] | None = None,
+            corp_events: dict[str, dict] | None = None,
             mode: str = "auto") -> dict:
     """逐账户结算；suspend_map[sym]={"close","prev"} 为当日停牌票（参考数据侧供给，
     见 _build_feeds）。停牌票订单照常进入引擎判定（today 到期/跨日挂起），仅不拉当日行情。
+    corp_events[symbol] = 当日送转除权事件（spec-01 §6.6，见 eodengine.settle_account）；
+    由公司行动数据侧按 ex_date 供给，缺省无公司行动行为。
     mode='replay' 供 trial 历史回放（trial_replays 台账窗口未满账户）。"""
     suspend_map = suspend_map or {}
     accounts = eligible_accounts(state, account_ids=account_ids, mode=mode)
@@ -204,6 +207,7 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
                 l1_map=l1_map, l2_map=l2_map,
                 close_map=close_map, prev_close_map=prev_close_map,
                 suspend_map={s: v["close"] for s, v in suspend_val.items()},
+                corp_events=corp_events,
             )
         except (eodengine.EngineError, eodengine.EngineGapError) as exc:
             results.append({"account_id": aid, "error": True, "reason": str(exc)})
