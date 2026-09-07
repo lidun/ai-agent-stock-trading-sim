@@ -83,12 +83,14 @@ def test_pending_quota_limit_and_freed(authed_client):
     for i in range(3):
         r = approval.submit_approval(
             st, type_="granularity", agent_id=DEMO,
-            payload={"proposal": f"intraday_{i}"}, reason=f"第 {i} 档方案申请")
+            payload={"granularity": "intraday_5m", "proposal": f"intraday_{i}"},
+            reason=f"第 {i} 档方案申请")
         assert r["ok"] is True
         ids.append(r["approval"]["id"])
     over = approval.submit_approval(
         st, type_="granularity", agent_id=DEMO,
-        payload={"proposal": "intraday_3"}, reason="第 3 档方案申请")
+        payload={"granularity": "intraday_5m", "proposal": "intraday_3"},
+        reason="第 3 档方案申请")
     assert over["ok"] is False and over["reason"] == "pending_full"
     assert set(over["pending_ids"]) == set(ids)
     # 通过一件释放额度 → 新申请可进（无驳回，不触发冷却）
@@ -96,8 +98,55 @@ def test_pending_quota_limit_and_freed(authed_client):
                              decided_by="user")
     r = approval.submit_approval(
         st, type_="granularity", agent_id=DEMO,
-        payload={"proposal": "intraday_3"}, reason="第 3 档方案申请")
+        payload={"granularity": "intraday_5m", "proposal": "intraday_3"},
+        reason="第 3 档方案申请")
     assert r["ok"] is True
+
+
+def test_decide_applies_granularity_and_cap_effects(authed_client):
+    """granularity/risk 效果器落地：撮合粒度写入历史并生效、单票上限回落，非法值阻断。"""
+    st = authed_client.app.state
+    conn = state_conn(st)
+    # granularity：通过 → 账户当前值变更 + granularity_history 留痕 from→to
+    gr = approval.submit_approval(
+        st, type_="granularity", agent_id=DEMO,
+        payload={"granularity": "intraday_5m"}, reason="盘中逐档跟踪需切 5 分钟粒度")
+    assert gr["ok"] is True
+    dg = approval.decide_approval(st, gr["approval"]["id"], decision="approved",
+                                  reason="粒度提升可行", decided_by="user")
+    assert dg["ok"] is True
+    got = json.loads(dg["approval"]["result_ref"])
+    assert got["granularity"] == "intraday_5m" and got["changed"] is True
+    acc = conn.execute("SELECT granularity, granularity_history FROM accounts WHERE id=?",
+                       (DEMO,)).fetchone()
+    assert acc["granularity"] == "intraday_5m"
+    hist = json.loads(acc["granularity_history"])
+    assert hist[-1]["from"] == "eod_replay" and hist[-1]["to"] == "intraday_5m"
+    # 同哈希命中已决，零重复写入
+    again = approval.submit_approval(
+        st, type_="granularity", agent_id=DEMO,
+        payload={"granularity": "intraday_5m"}, reason="盘中逐档跟踪需切 5 分钟粒度")
+    assert again["ok"] is False and again["reason"] == "hash_hit_approved"
+    # risk 单票上限：回落 0.2 生效；越界 (0,1] 值 → effect_failed 且不留决定
+    cap = approval.submit_approval(
+        st, type_="risk", agent_id=DEMO,
+        payload={"single_stock_cap": 0.2}, reason="单票仓位过度集中，下调红线")
+    assert cap["ok"] is True
+    dc = approval.decide_approval(st, cap["approval"]["id"], decision="approved",
+                                  reason="风控收紧", decided_by="user")
+    assert dc["ok"] is True
+    assert json.loads(dc["approval"]["result_ref"]) == {"single_stock_cap": 0.2}
+    assert conn.execute("SELECT single_stock_cap FROM accounts WHERE id=?",
+                        (DEMO,)).fetchone()["single_stock_cap"] == 0.2
+    bad = approval.submit_approval(
+        st, type_="risk", agent_id=DEMO,
+        payload={"single_stock_cap": 1.5}, reason="上限放宽测试（应被阻断）")
+    dbad = approval.decide_approval(st, bad["approval"]["id"], decision="approved",
+                                    reason="演示", decided_by="user")
+    assert dbad["ok"] is False and dbad["reason"] == "effect_failed"
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (bad["approval"]["id"],)).fetchone()["status"] == "pending"
 
 
 def test_decide_guards_and_expiry_sweep(authed_client):

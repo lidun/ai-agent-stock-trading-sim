@@ -110,8 +110,63 @@ def _effect_exemption(c, row: dict, now: str) -> str:
     return json.dumps(merged, ensure_ascii=False)
 
 
+def _effect_granularity(c, row: dict, now: str) -> str:
+    """granularity 效果器：账户撮合粒度变更（spec-04 §4.1 配置变更全程留痕）。
+    payload={"granularity": "intraday_5m"}；写入 granularity_history + 账户当前值。"""
+    allowed = ("eod_replay", "intraday_5m", "intraday_1m")
+    target = row["payload"].get("granularity", "")
+    if target not in allowed:
+        raise ValueError(f"撮合粒度须为 {'/'.join(allowed)} 之一")
+    acc = c.execute(
+        "SELECT granularity, granularity_history FROM accounts WHERE id=?",
+        (row["agent_id"],)).fetchone()
+    if acc is None:
+        raise LookupError(f"账户不存在：{row['agent_id']}")
+    try:
+        history = json.loads(acc["granularity_history"] or "[]")
+    except ValueError:
+        history = []
+    if not isinstance(history, list):
+        history = []
+    from_ = acc["granularity"]
+    if from_ == target:
+        return json.dumps({"granularity": target, "changed": False},
+                          ensure_ascii=False)
+    history = list(history) + [{"from": from_, "to": target, "ts": now}]
+    c.execute(
+        "UPDATE accounts SET granularity=?, granularity_history=?, updated_ts=? WHERE id=?",
+        (target, json.dumps(history, ensure_ascii=False), now, row["agent_id"]),
+    )
+    return json.dumps({"granularity": target, "changed": True,
+                       "history_entries": len(history)}, ensure_ascii=False)
+
+
+def _effect_single_stock_cap(c, row: dict, now: str) -> str:
+    """risk 效果器：事故性单票上限下调（spec-01 §7 硬红线账户可配）。
+    payload={"single_stock_cap": 0.2}；0<cap≤1。"""
+    raw = row["payload"].get("single_stock_cap")
+    if raw is None:
+        raise ValueError("单票上限单须提供 single_stock_cap")
+    try:
+        cap = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("single_stock_cap 须为数值") from exc
+    if not 0 < cap <= 1.0:
+        raise ValueError("single_stock_cap 须在 (0, 1] 区间（1.0=满仓允许，越低越保守）")
+    acc = c.execute(
+        "SELECT single_stock_cap FROM accounts WHERE id=?", (row["agent_id"],)).fetchone()
+    if acc is None:
+        raise LookupError(f"账户不存在：{row['agent_id']}")
+    cap_text = f"{cap:.4f}"
+    c.execute("UPDATE accounts SET single_stock_cap=?, updated_ts=? WHERE id=?",
+              (float(cap_text), now, row["agent_id"]))
+    return json.dumps({"single_stock_cap": float(cap_text)}, ensure_ascii=False)
+
+
 def _EFFECTS() -> dict:
-    return {"exemption": _effect_exemption}
+    return {"exemption": _effect_exemption,
+            "granularity": _effect_granularity,
+            "risk": _effect_single_stock_cap}
 
 
 def submit_approval(state, *, type_: str, agent_id: str, payload: dict,

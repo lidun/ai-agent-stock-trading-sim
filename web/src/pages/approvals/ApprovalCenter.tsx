@@ -50,6 +50,22 @@ const APPROVAL_TYPE_COLOR: Record<string, { color: string; text: string }> = {
   launch: { color: "purple", text: "上线确认" },
 };
 
+/** 已决生效值展示（result_ref 解析 → 中文摘要）。 */
+function effectSummary(r: ApprovalInfo): string | null {
+  if (!r.result_ref) return null;
+  try {
+    const v = JSON.parse(r.result_ref);
+    if (Array.isArray(v)) return `豁免 token：${v.join("、")}`;
+    if (v && typeof v === "object") {
+      if (v.single_stock_cap !== undefined) return `单票上限 → ${v.single_stock_cap}`;
+      if (v.granularity) return `撮合粒度 → ${v.granularity}`;
+    }
+    return r.result_ref;
+  } catch {
+    return r.result_ref;
+  }
+}
+
 /** 审批中心（spec-04 §4 审批流 / spec-06 §6.10）：人工待办+历史清单。
  *  管理 Agent LLM 未接入 → 决定方=登录用户；确定性短路（哈希去重/冷却/配额）由 core 判定。 */
 export default function ApprovalCenterPage() {
@@ -209,6 +225,11 @@ export default function ApprovalCenterPage() {
             <Typography.Text type="secondary" style={{ fontSize: 12 }} ellipsis={{ tooltip: true }}>
               {r.reason || r.close_note || "—"}
             </Typography.Text>
+            {effectSummary(r) && (
+              <Typography.Text type="success" style={{ fontSize: 12 }}>
+                生效：{effectSummary(r)}
+              </Typography.Text>
+            )}
           </Flex>
         ),
     },
