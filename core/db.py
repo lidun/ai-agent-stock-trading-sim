@@ -501,6 +501,33 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE settlement_log ADD COLUMN positions_snapshot TEXT;
         """,
     ),
+    (
+        15,
+        """
+        -- 日报表（spec-04 §5.2/§5.3：daily_reports schema 归本规格）：引擎结算产物直读
+        -- 生成 data_section（零 token）+ merged_markdown（确定性渲染）落库，narrative 为
+        -- LLM 叙述段（本切片留空，由日报任务后续写入）；version 递增留痕——补发/修订新增
+        -- 版本行不覆盖已推送版（v0.3 A5/A6 UNIQUE(agent_id,trade_date,version)）。
+        -- 本库以账户为日报数据域，agent_id 存账户口径标识（单 Agent 演示 1:1）；status
+        -- normal|absent|resend 对齐 §5.3（缺勤日报同样补数据段，叙述=原因说明）。
+        CREATE TABLE IF NOT EXISTS daily_reports (
+            id              TEXT PRIMARY KEY,
+            agent_id        TEXT NOT NULL,
+            trade_date      TEXT NOT NULL,
+            version         INTEGER NOT NULL,
+            data_section    TEXT NOT NULL,
+            narrative       TEXT NOT NULL DEFAULT '',
+            merged_markdown TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'normal'
+                            CHECK (status IN ('normal', 'absent', 'resend')),
+            llm_perf_id     TEXT,
+            created_ts      TEXT NOT NULL,
+            UNIQUE (agent_id, trade_date, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_reports_agent_date
+            ON daily_reports(agent_id, trade_date);
+        """,
+    ),
 ]
 
 

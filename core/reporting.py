@@ -1,9 +1,11 @@
-"""日报引擎数据段生成（spec-04 §5.1/§5.2：六段模板中一/二/三/五的明细 = 引擎结算产物
+"""日报引擎数据段（spec-04 §5.1/§5.2：六段模板中一/二/三/五的明细 = 引擎结算产物
 直接生成，零 token；数据段 JSON + LLM 叙述段 → merged_markdown 由日报任务拼装）。
 
-本模块只做确定性归档读取与结构化拼装，不含 LLM/叙述/落库：输入 = 结算产物落库态
-（accounts/holdings/settlement_log/trades/audit_logs/condition_orders/exit_trackings），
-输出 = data_section dict（可直接 JSON 序列化）。不虚构数据：估值价一律取结算当日
+本模块做确定性归档读取、结构化拼装与落库：结算产物落库态（accounts/holdings/
+settlement_log/trades/audit_logs/condition_orders/exit_trackings）→ data_section dict
+（可直接 JSON 序列化）→ merged_markdown（确定性 markdown 渲染）。落库走 daily_reports
+（版本递增留痕，spec-04 §5.3：补发/修订新增版本行不覆盖已推送版）；narrative（LLM
+叙述段）本切片不产出，由日报任务后续写入。不虚构数据：估值价一律取结算当日
 settlement_log.positions_snapshot（引擎闭市归档，含停牌估值）；缺失 → 对应字段显式
 null + annotations 标注，供缺勤日报"照常补齐可得部分"语义。
 
@@ -19,6 +21,8 @@ null + annotations 标注，供缺勤日报"照常补齐可得部分"语义。
 from __future__ import annotations
 
 import json
+import secrets
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -31,6 +35,11 @@ _SCHEMA_VERSION = "1.0"
 _MONEY = Decimal("0.01")
 _DEGRADED_LEVELS = {"l2"}              # 仅 L2 日线近似档计降级（L1 分钟档缺口）；series_map
                                        # replay_l0 属订单固有 basis，非当日降级（spec-01 §7）
+_ALLOWED_STATUS = {"normal", "absent", "resend"}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _plain(v) -> str:
@@ -41,9 +50,10 @@ def _plain(v) -> str:
     return str(d).rstrip("0").rstrip(".") if "." in str(d) else str(d)
 
 
-def build_engine_data_section(state, account_id: str, trade_date: str) -> dict:
-    """由结算产物落库态生成当日引擎数据段（纯读取，零 token）。"""
-    conn = state_conn(state)
+def build_engine_data_section(state, account_id: str, trade_date: str, conn=None) -> dict:
+    """由结算产物落库态生成当日引擎数据段（纯读取，零 token）。conn 缺省取 state 连接；
+    结算事务内调用须传同一写连接 c（读得到本事务刚落盘的结算产物）。"""
+    conn = conn or state_conn(state)
 
     acct = conn.execute(
         "SELECT cash, nav, total_pnl, today_pnl, shares FROM accounts WHERE id=?",
@@ -190,3 +200,145 @@ def build_engine_data_section(state, account_id: str, trade_date: str) -> dict:
         "execution": execution,
         "annotations": annotations,
     }
+
+
+def render_engine_data_markdown(ds: dict) -> str:
+    """确定性渲染 data_section → merged_markdown（无 LLM，纯数据段；叙述段后续拼接）。
+
+    覆盖 §5.1 六段模板中由引擎数据承载的一/二/三/五段；行尾不换行、管道不转义，
+    内容全部来自 data_section 已分位串，逐字节确定（测试快照比对用）。"""
+    lines: list[str] = []
+    anno = ds.get("annotations", {})
+    setl = ds.get("settlement", {})
+    smy = ds.get("summary", {})
+    lines.append(f"# 数据段日报 {ds['trade_date']}")
+    if anno.get("unsettled"):
+        lines.append("> 当日结算产物缺失：以下为缺勤日报的可得部分数据段（叙述=原因说明）。")
+    lines.append("")
+    lines.append(
+        f"- 状态：{('结算完成' if setl.get('done') else '未结算')} ｜ "
+        f"cash={smy.get('cash')} ｜ nav={smy.get('nav')} ｜ "
+        f"total_pnl={smy.get('total_pnl')} ｜ today_pnl={smy.get('today_pnl')}"
+    )
+    g = setl.get("granularity_used") or {}
+    if g:
+        lines.append("- 结算档位：" + "、".join(f"{k}={v}" for k, v in sorted(g.items())))
+    for sym in anno.get("degraded", []):
+        lines.append(f"- 数据降级：{sym}（L2 日线近似档，L1 分钟档缺口）")
+    for note in anno.get("notes", []):
+        lines.append(f"- 提示：{note}")
+
+    ops = ds.get("operations", {})
+    trades = ops.get("trades", [])
+    lines.append("")
+    lines.append("## 一、今日操作")
+    if trades:
+        lines.append("| symbol | 方向 | 数量 | 价格 | 金额 | 费用 | 档位 | 说明 |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for t in trades:
+            mark = t.get("quality") or ""
+            mark = mark + (f"/{t['reason']}" if t.get("reason") else "") or "—"
+            lines.append(f'| {t["symbol"]} | {t["side"]} | {t["qty"]} | {t["price"]} | '
+                         f'{t["amount"]} | {t["fee_total"]} | {t["basis_used"]} | {mark} |')
+    else:
+        lines.append("（无成交）")
+    for ca in ops.get("corp_actions", []):
+        det = json.dumps(ca.get("detail", {}), ensure_ascii=False, sort_keys=True)
+        lines.append(f'- 公司行动 {ca["action"]}[{ca.get("result")}] {det}')
+
+    pos = ds.get("positions", {})
+    lines.append("")
+    lines.append("## 二、持仓与盈亏")
+    snap = "快照已归档" if pos.get("snapshot_available") else "快照欠档（需另行估值）"
+    tot = pos.get("totals", {})
+    lines.append(f"- 现金 {tot.get('cash')} ｜ 持仓市值 {tot.get('market_value')} ｜ "
+                 f"权益 {tot.get('equity')}（{snap}）")
+    for p in pos.get("items", []):
+        lines.append(f'- {p["symbol"]} ×{p["quantity"]} 成本 {p["avg_cost"]} ｜ '
+                     f'收盘 {p["close"]} ｜ 市值 {p["market_value"]}')
+
+    track = ds.get("tracking", [])
+    lines.append("")
+    lines.append("## 三、卖出跟踪摘要")
+    if track:
+        lines.append("| symbol | 卖出日 | 价格 | 数量 | 原因 | 状态 | 会话 | 期间高 | 期间低 |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for x in track:
+            lines.append(f'| {x["symbol"]} | {x["sell_date"]} | {x["sell_price"]} | '
+                         f'{x["qty"]} | {x["sell_reason"]} | {x["status"]} | '
+                         f'{x["sessions_done"]} | {x["period_high"]} | {x["period_low"]} |')
+    else:
+        lines.append("（无跟踪中标的）")
+
+    ex = ds.get("execution", {})
+    lines.append("")
+    lines.append("## 五、执行数据")
+    lines.append(f"- 当日成交 {ex.get('trades_filled', 0)} 笔；公司行动 {ex.get('corp_events', 0)} 起。")
+    ost = ex.get("orders_today", {})
+    if ost:
+        seq = "、".join(f"{k}×{v['count']}" for k, v in sorted(ost.items()))
+        lines.append(f"- 当日订单终态：{seq}。")
+    else:
+        lines.append("- 当日无新建条件单。")
+    return "\n".join(lines)
+
+
+def store_engine_report(state, account_id: str, trade_date: str, *,
+                        status: str = "normal", narrative: str = "",
+                        conn=None) -> dict:
+    """数据段 + 确定性 markdown 落 daily_reports（版本递增留痕）。settle_account 在
+    结算事务内调用（conn 传同一写连接）→ 结算与首版日报同事务落盘；调度器修订/缺勤
+    补生成也可单独调用（version+1 新行，不覆盖既有版本，spec-04 §5.3）。"""
+    if status not in _ALLOWED_STATUS:
+        raise ValueError(f"daily_reports.status 非法: {status}")
+    c = conn or state_conn(state)
+    ds = build_engine_data_section(state, account_id, trade_date, conn=c)
+    markdown = render_engine_data_markdown(ds)
+    row = c.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM daily_reports"
+        " WHERE agent_id=? AND trade_date=?",
+        (account_id, trade_date),
+    ).fetchone()
+    version = int(row["v"]) + 1
+    rid = "dr" + secrets.token_hex(10)
+    c.execute(
+        "INSERT INTO daily_reports(id, agent_id, trade_date, version, data_section,"
+        " narrative, merged_markdown, status, created_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+        (rid, account_id, trade_date, version, json.dumps(ds, ensure_ascii=False),
+         narrative, markdown, status, _now_iso()),
+    )
+    return {"id": rid, "account_id": account_id, "trade_date": trade_date,
+            "version": version, "status": status}
+
+
+def list_engine_reports(state, account_id: str, trade_date: str | None = None,
+                        conn=None) -> list[dict]:
+    """读 daily_reports 全部版本（新→旧）。data_section 已解析为 dict，供日报中心/API。"""
+    c = conn or state_conn(state)
+    if trade_date:
+        rows = c.execute(
+            "SELECT id, agent_id, trade_date, version, data_section, narrative,"
+            " merged_markdown, status, created_ts FROM daily_reports"
+            " WHERE agent_id=? AND trade_date=? ORDER BY version DESC",
+            (account_id, trade_date),
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT id, agent_id, trade_date, version, data_section, narrative,"
+            " merged_markdown, status, created_ts FROM daily_reports"
+            " WHERE agent_id=? ORDER BY trade_date DESC, version DESC",
+            (account_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            ds = json.loads(r["data_section"] or "{}")
+        except ValueError:
+            ds = {}
+        out.append({
+            "id": r["id"], "trade_date": r["trade_date"], "version": r["version"],
+            "status": r["status"], "narrative": r["narrative"],
+            "merged_markdown": r["merged_markdown"], "data_section": ds,
+            "created_ts": r["created_ts"],
+        })
+    return out

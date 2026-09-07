@@ -25,7 +25,7 @@ from core.db import state_conn, write_txn
 DEMO = "agent-demo-001"
 GOLDEN_DIR = Path(__file__).parent / "golden"
 _TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(Z)?")
-_TOKEN_RE = re.compile(r"\b(?:sl|l|t|h|x)[0-9a-f]{20}\b")
+_TOKEN_RE = re.compile(r"\b(?:sl|dr|l|t|h|x)[0-9a-f]{20}\b")
 
 _ACCOUNT_COLS = ("id", "agent_id", "cash", "nav", "total_pnl", "today_pnl", "shares",
                  "initial_capital", "settle_key", "status", "active_version_no",
@@ -114,6 +114,7 @@ def _dump(state) -> str:
         ("condition_orders", "id", "account_id=?"),
         ("trades", "settle_date, qty, price", "account_id=?"),
         ("settlement_log", "settle_key", "account_id=?"),
+        ("daily_reports", "trade_date, version", "agent_id=?"),
         ("audit_logs", "id", "actor=?"),
     ):
         rows = c.execute(

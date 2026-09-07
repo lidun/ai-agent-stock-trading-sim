@@ -67,6 +67,7 @@ from datetime import date as _date
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
+from core import reporting
 from core.db import state_conn, write_txn
 
 log = logging.getLogger(__name__)
@@ -1869,6 +1870,10 @@ def settle_account(
                 json.dumps(positions_snapshot, ensure_ascii=False),
             ),
         )
+        # 数据段日报首版随结算同事务落盘（spec-04 §5.2/§5.3：引擎结算产物直接生成，零
+        # token；conn 传同写连接 → 读到本事务刚落盘的结算/账户终态。结算失败整事务
+        # 回滚时日报随之回滚，不产生孤行）
+        reporting.store_engine_report(state, account_id, trade_date, conn=c)
         summary = {
             "already_settled": False,
             "account_id": account_id,

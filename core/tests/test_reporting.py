@@ -96,3 +96,60 @@ def test_data_section_corp_and_invalid_orders_aggregated(authed_client):
     assert corp_acts[0]["detail"]["net_credit"] == "500"
     # 无效单聚合入口：无当日新建单 → orders_today 为空（b-09-04 属 ex 日前的单）
     assert ds["execution"]["corp_events"] == 1
+
+
+def test_daily_report_auto_stored_on_settle(authed_client):
+    """结算成功 → daily_reports 首版同事务落盘，行内容与 build 直读完全一致；幂等不增行。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    reports = reporting.list_engine_reports(st, DEMO, "2026-09-04")
+    assert len(reports) == 1
+    rp = reports[0]
+    assert rp["version"] == 1 and rp["status"] == "normal"
+    assert rp["data_section"] == reporting.build_engine_data_section(st, DEMO, "2026-09-04")
+    md = rp["merged_markdown"]
+    assert "# 数据段日报 2026-09-04" in md
+    assert "结算完成" in md and "cash=89994.9" in md
+    assert "- 600000 ×1000 成本 10.0051 ｜ 收盘 10 ｜ 市值 10000" in md
+    # 同一 settle_key 重复结算 → already_settled，不产生第二版本行
+    from core import eodengine as eng
+    r = eng.settle_account(
+        st, DEMO, "2026-09-04",
+        series_map={"600000": [("2026-09-04T09:31:00", 10.0)]},
+        close_map={"600000": 10.0}, prev_close_map={"600000": 10.0},
+    )
+    assert r["already_settled"] is True
+    assert len(reporting.list_engine_reports(st, DEMO, "2026-09-04")) == 1
+
+
+def test_daily_report_absent_and_resend_keep_version_history(authed_client):
+    """缺勤日报：未结算日数据段照常补齐（done=false/unsettled）、status=absent；
+    修订新增版本行留痕，不覆盖既有版本（spec-04 §5.3）。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    store = reporting.store_engine_report(
+        st, DEMO, "2026-09-08", status="absent", narrative="当日未运行（测试）")
+    assert store["version"] == 1 and store["status"] == "absent"
+    ds = reporting.list_engine_reports(st, DEMO, "2026-09-08")[0]["data_section"]
+    assert ds["settlement"]["done"] is False and ds["annotations"]["unsettled"] is True
+    assert ds["positions"]["items"] == [] and ds["positions"]["snapshot_available"] is False
+    v2 = reporting.store_engine_report(st, DEMO, "2026-09-08", status="resend",
+                                       narrative="修订补发")
+    assert v2["version"] == 2
+    rows = reporting.list_engine_reports(st, DEMO, "2026-09-08")
+    assert [r["version"] for r in rows] == [2, 1]           # 新→旧
+    assert rows[0]["status"] == "resend" and rows[0]["narrative"] == "修订补发"
+    assert rows[1]["status"] == "absent" and rows[1]["narrative"] == "当日未运行（测试）"
+
+
+def test_daily_report_status_guard(authed_client):
+    """status 越界 → 抛 ValueError（不产生脏行）。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    try:
+        reporting.store_engine_report(st, DEMO, "2026-09-04", status="bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("status 校验未生效")
+    assert len(reporting.list_engine_reports(st, DEMO, "2026-09-04")) == 1
