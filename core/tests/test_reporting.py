@@ -283,3 +283,29 @@ def test_monthly_report_deterministic_and_guard(authed_client):
     # 无数据月（2026-08 无 main 日报）→ 不生成不推送
     assert reporting.build_monthly_report_body(st, 2026, 8) is None
     assert reporting.push_monthly_report(st, 2026, 8) is None
+
+
+def test_push_settings_switch_gates_report_direct(authed_client):
+    """spec-04 §6.2 notify_rules P1：notify_daily=off → 日报直达不推（含缺勤版）不建会话；
+    同值重写幂等（仅一次审计）；重新开启恢复推送。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    assert reporting.get_push_settings(st, DEMO) is True      # 默认开启
+    reporting.set_push_settings(st, DEMO, False, actor="tester")   # off（审计 1）
+    reporting.set_push_settings(st, DEMO, False, actor="tester")   # 同值 → 幂等不再审计
+    assert reporting.push_pending_report_deliveries(st, "2026-09-04") == []
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM conversations WHERE agent_id=? AND conv_type='user_chat'",
+        (DEMO,)).fetchone()[0] == 0                             # 连会话都不建（零轰炸）
+    assert reporting.set_push_settings(st, DEMO, True, actor="tester") is True  # on（审计 2）
+    assert len(reporting.push_pending_report_deliveries(st, "2026-09-04")) == 1
+    # 关闭后缺勤首版同样不推（同一开关统一约束）
+    reporting.set_push_settings(st, DEMO, False, actor="tester")   # off（审计 3）
+    reporting.fill_absent_report(st, DEMO, "2026-09-08", reason="行情缺口未结算（已关推送）")
+    assert reporting.push_pending_report_deliveries(st, "2026-09-08") == []
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) FROM messages WHERE msg_type='report'").fetchone()[0] == 1
+    n = state_conn(st).execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='report.push_setting'"
+    ).fetchone()[0]
+    assert n == 3

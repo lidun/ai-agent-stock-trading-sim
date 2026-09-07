@@ -13,6 +13,7 @@ import {
   Segmented,
   Select,
   Skeleton,
+  Switch,
   Table,
   Tag,
   Typography,
@@ -21,12 +22,18 @@ import {
 import { DownloadOutlined, EditOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import {
+  fetchPushSettings,
   fetchReportVersions,
   listAccounts,
+  listConversations,
+  listMessages,
   listReportTimeline,
+  markConversationRead,
   reportExportUrl,
+  updatePushSettings,
   updateReportNarrative,
   type AccountInfo,
+  type MessageInfo,
   type ReportTimelineEntry,
   type ReportVersion,
 } from "../../api/endpoints";
@@ -37,6 +44,23 @@ const REPORT_STATUS: Record<string, { color: string; text: string }> = {
   absent: { color: "orange", text: "缺勤" },
   resend: { color: "purple", text: "修订" },
 };
+
+const DIGEST_TYPE: Record<string, { color: string; text: string }> = {
+  daily_summary: { color: "blue", text: "每日总汇报" },
+  monthly_report: { color: "purple", text: "月度体检" },
+};
+
+/** 从正文首行提取标签/日期（如 "# 每日总汇报 · 2026-09-07"），回退到消息时间。 */
+function digestLabel(m: MessageInfo): string {
+  const head = m.body.split("\n", 1)[0]?.replace(/^#+\s*/, "").trim();
+  if (head) return head;
+  return m.msg_type === "monthly_report" ? "策略体检报告" : "每日总汇报";
+}
+
+function digestExportName(m: MessageInfo): string {
+  const safe = digestLabel(m).replace(/[\\/:*?"<>|·\s]/g, "_");
+  return `${safe}.md`;
+}
 
 interface TimelineRow extends ReportTimelineEntry {
   agent_id: string;
@@ -74,11 +98,42 @@ export default function ReportsPage() {
   const [narrativeDraft, setNarrativeDraft] = useState("");
   const [savingNarrative, setSavingNarrative] = useState(false);
 
+  const [tab, setTab] = useState<"daily" | "digest">("daily");
+  const [digestMsgs, setDigestMsgs] = useState<MessageInfo[]>([]);
+  const [digestLoading, setDigestLoading] = useState(false);
+  const [expandedDigest, setExpandedDigest] = useState<string | null>(null);
+  const [notifyOn, setNotifyOn] = useState<boolean | undefined>(undefined);
+  const [notifyLoading, setNotifyLoading] = useState(false);
+
   const accountName = useMemo(() => {
     const m = new Map<string, string>();
     accounts.forEach((a) => m.set(a.id, a.agent_name));
     return m;
   }, [accounts]);
+
+  const singleAccount = useMemo(
+    () => (acctFilter === "all" ? undefined : accounts.find((a) => a.agent_id === acctFilter)),
+    [accounts, acctFilter],
+  );
+
+  useEffect(() => {
+    if (tab !== "daily" || acctFilter === "all") {
+      setNotifyOn(undefined);
+      return;
+    }
+    let live = true;
+    (async () => {
+      try {
+        const s = await fetchPushSettings(acctFilter);
+        if (live) setNotifyOn(s.notify_daily);
+      } catch {
+        if (live) setNotifyOn(undefined);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [tab, acctFilter]);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -137,6 +192,63 @@ export default function ReportsPage() {
     [versions, verNo],
   );
 
+  const toggleNotify = useCallback(
+    async (checked: boolean) => {
+      if (!singleAccount) return;
+      setNotifyLoading(true);
+      try {
+        const s = await updatePushSettings(singleAccount.agent_id, checked);
+        setNotifyOn(s.notify_daily);
+        message.success(
+          s.notify_daily
+            ? `${singleAccount.agent_name} 日报直达推送已开启（审计留痕）`
+            : `${singleAccount.agent_name} 日报直达推送已关闭（日报中心留痕不受影响）`,
+        );
+      } catch (e) {
+        message.error((e as Error).message ?? "更新失败");
+      } finally {
+        setNotifyLoading(false);
+      }
+    },
+    [singleAccount, message],
+  );
+
+  const reloadDigest = useCallback(async () => {
+    setDigestLoading(true);
+    try {
+      const { conversations } = await listConversations();
+      const conv = conversations.find((c) => c.agent_id === "agent-manager" && c.conv_type === "user_chat");
+      if (!conv) {
+        setDigestMsgs([]);
+        return;
+      }
+      const { messages } = await listMessages(conv.id);
+      const typed = messages
+        .filter((m) => m.msg_type === "daily_summary" || m.msg_type === "monthly_report")
+        .sort((a, b) => b.ts.localeCompare(a.ts));
+      setDigestMsgs(typed);
+      void markConversationRead(conv.id);
+    } catch (e) {
+      message.error((e as Error).message ?? "加载汇报失败");
+    } finally {
+      setDigestLoading(false);
+    }
+  }, [message]);
+
+  useEffect(() => {
+    if (tab === "digest") void reloadDigest();
+  }, [tab, reloadDigest]);
+
+  const exportDigest = (m: MessageInfo) => {
+    const blob = new Blob([m.body], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = digestExportName(m);
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   const saveNarrative = useCallback(async () => {
     if (!detail || !version) return;
     setSavingNarrative(true);
@@ -192,23 +304,108 @@ export default function ReportsPage() {
             引擎数据段日报（spec-04 §5.2，结算零 token 直读生成）；缺勤/修订按版本切换查看；单篇导出见 spec-06 §6.6（P3）
           </Typography.Text>
         </div>
-        <Flex gap={8} align="center">
-          <Select
-            style={{ width: 220 }}
-            value={acctFilter}
-            onChange={setAcctFilter}
+        <Flex gap={8} align="center" vertical>
+          <Segmented
+            value={tab}
+            onChange={(v) => setTab(v as "daily" | "digest")}
             options={[
-              { value: "all", label: "全部策略账户" },
-              ...accounts.map((a) => ({ value: a.agent_id, label: a.agent_name })),
+              { label: "日报中心", value: "daily" },
+              { label: "汇报中心", value: "digest" },
             ]}
           />
-          <Button icon={<ReloadOutlined />} onClick={() => void reload()}>
-            刷新
-          </Button>
+          {tab === "daily" && (
+            <Flex gap={8} align="center">
+              <Select
+                style={{ width: 220 }}
+                value={acctFilter}
+                onChange={setAcctFilter}
+                options={[
+                  { value: "all", label: "全部策略账户" },
+                  ...accounts.map((a) => ({ value: a.agent_id, label: a.agent_name })),
+                ]}
+              />
+              {singleAccount && (
+                <Switch
+                  checked={notifyOn ?? true}
+                  loading={notifyLoading}
+                  disabled={notifyOn === undefined}
+                  onChange={(c) => void toggleNotify(c)}
+                  checkedChildren="日报直达推"
+                  unCheckedChildren="日报直达关"
+                />
+              )}
+              <Button icon={<ReloadOutlined />} onClick={() => void reload()}>
+                刷新
+              </Button>
+            </Flex>
+          )}
         </Flex>
       </Flex>
 
-      <Card size="small" title="日报时间线" style={{ marginTop: 12 }}>
+      {tab === "digest" ? (
+        <Card
+          size="small"
+          title="汇报中心（管理 Agent 用户会话接收：每日总汇报 / 月度体检 · 确定性版）"
+          style={{ marginTop: 12 }}
+          extra={
+            <Button size="small" icon={<ReloadOutlined />} onClick={() => void reloadDigest()} loading={digestLoading}>
+              刷新
+            </Button>
+          }
+        >
+          {digestLoading ? (
+            <Skeleton active paragraph={{ rows: 6 }} />
+          ) : digestMsgs.length === 0 ? (
+            <Empty
+              description="尚无汇报——每日总汇报于交易日 20:00 后生成，月度策略体检于月结后推送（spec-04 §5.4/§5.5）"
+              style={{ padding: "24px 0" }}
+            />
+          ) : (
+            <Flex vertical gap={8}>
+              {digestMsgs.map((m) => {
+                const meta = DIGEST_TYPE[m.msg_type] ?? { color: "default", text: m.msg_type };
+                const open = expandedDigest === m.id;
+                return (
+                  <Card
+                    key={m.id}
+                    size="small"
+                    styles={{ body: { padding: open ? "0 12px 12px" : 0 } }}
+                    title={
+                      <div
+                        style={{ cursor: "pointer", userSelect: "none" }}
+                        onClick={() => setExpandedDigest(open ? null : m.id)}
+                      >
+                        <Flex gap={8} align="center" wrap>
+                          <Tag color={meta.color}>{meta.text}</Tag>
+                          <Typography.Text strong>{digestLabel(m)}</Typography.Text>
+                        </Flex>
+                      </div>
+                    }
+                    extra={
+                      <Flex gap={8} align="center">
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {fmtBeijingTime(m.ts)}
+                        </Typography.Text>
+                        <Button size="small" type="link" icon={<DownloadOutlined />} onClick={() => exportDigest(m)}>
+                          导出
+                        </Button>
+                      </Flex>
+                    }
+                  >
+                    {open && (
+                      <div className="md-body" style={{ paddingTop: 12 }}>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.body}</ReactMarkdown>
+                      </div>
+                    )}
+                  </Card>
+                );
+              })}
+            </Flex>
+          )}
+        </Card>
+      ) : (
+        <>
+          <Card size="small" title="日报时间线" style={{ marginTop: 12 }}>
         <Table<TimelineRow>
           rowKey={(r) => `${r.agent_id}:${r.trade_date}`}
           size="small"
@@ -230,7 +427,9 @@ export default function ReportsPage() {
           }}
           scroll={{ x: 640 }}
         />
-      </Card>
+          </Card>
+        </>
+      )}
 
       <Drawer
         title={

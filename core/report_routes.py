@@ -81,3 +81,27 @@ def report_export(agent_id: str, trade_date: str, request: Request,
             "Content-Disposition": f'attachment; filename="report_{agent_id}_{trade_date}_v{label}.md"',
         },
     )
+
+
+@router.get("/accounts/{agent_id}/push-settings")
+def account_push_settings(agent_id: str, request: Request, session: SessionDep):
+    """日报直达推送开关（spec-04 §6.2 notify_rules P1：agents.notify_daily）。"""
+    _ensure_account(request.app.state, agent_id)
+    return {
+        "agent_id": agent_id,
+        "notify_daily": reporting.get_push_settings(request.app.state, agent_id),
+    }
+
+
+@router.patch("/accounts/{agent_id}/push-settings")
+def account_push_settings_update(agent_id: str, request: Request, session: SessionDep,
+                                 payload: dict | None = Body(default=None)):
+    _ensure_account(request.app.state, agent_id)
+    actor = session["session"]["username"]
+    try:
+        new_value = reporting.set_push_settings(
+            request.app.state, agent_id, bool((payload or {}).get("notify_daily", False)),
+            actor=actor)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="账户不存在") from exc
+    return {"agent_id": agent_id, "notify_daily": new_value}

@@ -506,7 +506,8 @@ def push_pending_report_deliveries(state, trade_date: str) -> list[dict]:
     """将该交易日最新一版结算日报/缺勤日报作为“日报直达”消息推送进用户会话
     （spec-04 §6.1 联系人式直达，非中转）；幂等：同 payload 已推送过则跳过。
 
-    推送范围：main 策略账户（试运行/退役 Agent 全程不推，spec-04 §6.2 v0.6）；
+    推送范围：main 策略账户且推送开启（agents.notify_daily=1；试运行/退役 Agent 全程不推，
+    spec-04 §6.2 v0.6 硬约束不受开关影响）；
     仅首版（version=1）normal/absent 直达——修订/补发以 v+1 留痕由日报中心承载，
     不重复轰炸；同一交易日已存在更高版本（后到补发）时首版也不再补推。返回新推送的
     messages（serialize 形态，含 conv_id，供 WS 广播）。
@@ -521,6 +522,7 @@ def push_pending_report_deliveries(state, trade_date: str) -> list[dict]:
           JOIN accounts ac ON ac.id = dr.agent_id AND ac.role = 'main'
           JOIN agents ag ON ag.id = ac.agent_id
            AND ag.status NOT IN ('trial', 'archived')
+           AND ag.notify_daily = 1
          WHERE dr.trade_date = ?
            AND dr.status IN ('normal', 'absent')
            AND dr.version = 1
@@ -774,3 +776,36 @@ def push_monthly_report(state, year: int, month: int) -> dict | None:
         state, kind="monthly_report", scope_key=mkey, msg_type="monthly_report",
         body=build_monthly_report_body(state, year, month),
         detail=f"{mkey} 月度策略体检报告（确定性版）→ 管理 Agent 会话")
+
+
+# ---------------- 日报直达推送开关（spec-04 §6.2 notify_rules P1 最小化） ----------------
+
+def get_push_settings(state, agent_id: str, *, conn=None) -> bool:
+    """Agent 的 notify_daily 推送开关当前值（缺行按开启处理）。"""
+    c = conn or state_conn(state)
+    row = c.execute("SELECT notify_daily FROM agents WHERE id=?", (agent_id,)).fetchone()
+    return bool(row["notify_daily"]) if row else True
+
+
+def set_push_settings(state, agent_id: str, notify_daily: bool, actor: str) -> bool:
+    """写 notify_daily + report.push_setting 审计。返回新值；Agent 不存在 → LookupError。"""
+    from core.db import write_txn  # noqa: PLC0415
+    value = 1 if notify_daily else 0
+    with write_txn(state_conn(state)) as c:
+        row = c.execute("SELECT notify_daily FROM agents WHERE id=?",
+                        (agent_id,)).fetchone()
+        if row is None:
+            raise LookupError(agent_id)
+        old = bool(row["notify_daily"])
+        if old != bool(value):
+            c.execute("UPDATE agents SET notify_daily=? WHERE id=?",
+                      (value, agent_id))
+            c.execute(
+                "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+                " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+                (_now_iso(), actor, "report.push_setting", "agents", agent_id,
+                 "on" if value else "off",
+                 json.dumps({"old": old, "new": bool(value),
+                             "scope": "daily_report_push"}, ensure_ascii=False), ""),
+            )
+    return bool(value)

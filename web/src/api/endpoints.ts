@@ -370,3 +370,18 @@ export function reportExportUrl(agentId: string, tradeDate: string, version?: nu
   const q = version !== undefined ? `?version=${version}` : "";
   return `/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}/export${q}`;
 }
+
+export function fetchPushSettings(
+  agentId: string,
+): Promise<{ agent_id: string; notify_daily: boolean }> {
+  return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/push-settings`);
+}
+
+export function updatePushSettings(
+  agentId: string,
+  notifyDaily: boolean,
+): Promise<{ agent_id: string; notify_daily: boolean }> {
+  return apiPatch(`/api/accounts/${encodeURIComponent(agentId)}/push-settings`, {
+    notify_daily: notifyDaily,
+  });
+}

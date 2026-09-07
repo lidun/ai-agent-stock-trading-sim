@@ -528,6 +528,15 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON daily_reports(agent_id, trade_date);
         """,
     ),
+    (
+        16,
+        """
+        -- 日报直达推送开关（spec-04 §6.2 notify_rules P1 最小化：站内单通道，仅一布尔列）。
+        -- 默认开启；试运行/退役 Agent 的全程不推为硬约束（见 reporting 过滤，不受本列影响），
+        -- 本列供 main 策略账户关闭某 Agent 的日报直达推送（日报中心/版本留痕不受影响）。
+        ALTER TABLE agents ADD COLUMN notify_daily INTEGER NOT NULL DEFAULT 1;
+        """,
+    ),
 ]
 
 

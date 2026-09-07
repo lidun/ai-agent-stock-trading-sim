@@ -127,3 +127,18 @@ def test_report_export_downloads_markdown(authed_client):
     # 无版本日报 → 404
     assert authed_client.get(
         f"/api/accounts/{DEMO}/reports/2026-09-11/export").status_code == 404
+
+
+def test_push_settings_endpoint_read_and_toggle(authed_client):
+    """spec-04 §6.2 notify_rules P1 API：GET 读开关、PATCH 切换（审计留痕）、未知账户 404。"""
+    st = authed_client.app.state
+    url = f"/api/accounts/{DEMO}/push-settings"
+    assert authed_client.get(url).json()["notify_daily"] is True
+    r = _patch(authed_client, url, {"notify_daily": False})
+    assert r.status_code == 200 and r.json()["notify_daily"] is False
+    assert authed_client.get(url).json()["notify_daily"] is False
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE action='report.push_setting'"
+    ).fetchone()["n"] == 1
+    assert _patch(authed_client, url, {"notify_daily": True}).json()["notify_daily"] is True
+    assert authed_client.get("/api/accounts/no-such-agent/push-settings").status_code == 404
