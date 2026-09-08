@@ -850,3 +850,45 @@ export function fetchCharterVersion(
     `/api/agents/${encodeURIComponent(agentId)}/strategy-profile/versions/${encodeURIComponent(versionNo)}`,
   );
 }
+
+// ---------- 卖出跟踪只读（spec-06 §6.4 P3 文字+表格，#15；spec-01 §8.1） ----------
+
+export interface ExitTrackingItem {
+  id: string;
+  account_id: string;
+  role: string;
+  sell_trade_id: string;
+  symbol: string;
+  sell_date: string;
+  sell_price: number | null;
+  qty: number | null;
+  sell_reason: string;
+  status: "tracking" | "done";
+  sessions_done: number;
+  track_end_date: string;
+  fwd_return_pct: number | null;
+  bench_return_pct: number | null;
+  excess_pct: number | null;
+  period_high: number | null;
+  period_low: number | null;
+  conclusion: string;
+  is_loss_case: boolean;
+  quality: string;
+  created_ts: string;
+  done_ts: string;
+}
+export interface ExitTrackingList {
+  agent_id: string;
+  total: number;
+  tracking: number;
+  done: number;
+  items: ExitTrackingItem[];
+}
+
+export function fetchExitTrackings(
+  agentId: string,
+  status?: "tracking" | "done",
+): Promise<ExitTrackingList> {
+  const q = status ? `?status=${status}` : "";
+  return apiGet<ExitTrackingList>(`/api/agents/${encodeURIComponent(agentId)}/exit-trackings${q}`);
+}

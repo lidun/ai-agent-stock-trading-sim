@@ -29,6 +29,7 @@ import {
   controlAgent,
   fetchEquityCurve,
   fetchEvolution,
+  fetchExitTrackings,
   fetchReportVersions,
   fetchStrategyMetrics,
   fetchStrategyProfile,
@@ -46,6 +47,7 @@ import {
   type ControlOp,
   type CurveRange,
   type EquityCurve,
+  type ExitTrackingList,
   type FrozenSecurity,
   type HoldingInfo,
   type ReportTimelineEntry,
@@ -59,6 +61,7 @@ import MetricSummaryCard from "./MetricSummaryCard";
 import EquityCurveCard from "./EquityCurveCard";
 import StrategyEvolutionCard from "./StrategyEvolutionCard";
 import StrategyProfileCard from "./StrategyProfileCard";
+import SellTrackingCard from "./SellTrackingCard";
 
 const OT_LABEL: Record<string, string> = {
   buy: "买入",
@@ -122,6 +125,7 @@ export default function StrategyDetailPage() {
   const [curve, setCurve] = useState<EquityCurve | null>(null);
   const [evolution, setEvolution] = useState<StrategyEvolution | null>(null);
   const [profile, setProfile] = useState<StrategyProfile | null>(null);
+  const [exitTracks, setExitTracks] = useState<ExitTrackingList | null>(null);
   const [range, setRange] = useState<CurveRange>("all");
   const [p2Loading, setP2Loading] = useState(true);
 
@@ -215,12 +219,14 @@ export default function StrategyDetailPage() {
       fetchEquityCurve(selectedId, range),
       fetchEvolution(selectedId),
       fetchStrategyProfile(selectedId),
-    ]).then(([m, c, e, sp]) => {
+      fetchExitTrackings(selectedId),
+    ]).then(([m, c, e, sp, et]) => {
       if (!active) return;
       setMetrics(m.status === "fulfilled" ? m.value : null);
       setCurve(c.status === "fulfilled" ? c.value : null);
       setEvolution(e.status === "fulfilled" ? e.value : null);
       setProfile(sp.status === "fulfilled" ? sp.value : null);
+      setExitTracks(et.status === "fulfilled" ? et.value : null);
       if (m.status === "rejected" && c.status === "rejected" && e.status === "rejected") {
         console.warn("P2 数据源不可用（spec-06 §6.4），等 EOD 结算产出后再现。");
       }
@@ -667,9 +673,11 @@ export default function StrategyDetailPage() {
 
           <StrategyEvolutionCard evolution={evolution} loading={p2Loading} />
 
+          <SellTrackingCard data={exitTracks} loading={p2Loading} />
+
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
             关联视图已就位：持仓每行悬停/安全感标签可查该票已挂卖出保护单与最近结算日成交（spec-06 §6.4 B7）。
-            策略理念区块只读已落地（spec-05 §4.1）；P2+ 余项：能力包绑定（spec-05 §5 配置中心）、章程写入口（理念锁定变更需用户授权）、演进记忆（spec-02 memory_entries type=strategy）、卖出跟踪列表（P3 文字+表格，spec-06 #15）。
+            策略理念只读与卖出跟踪列表（P3，#15）已落地；P2+ 余项：能力包绑定（spec-05 §5 配置中心）、章程写入口（理念锁定变更需用户授权）、演进记忆（spec-02 memory_entries type=strategy）。
           </Typography.Paragraph>
         </>
       ) : null}
