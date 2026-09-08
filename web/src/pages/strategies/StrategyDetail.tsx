@@ -9,7 +9,6 @@ import {
   Flex,
   Select,
   Skeleton,
-  Space,
   Table,
   Tag,
   Tooltip,
@@ -27,7 +26,10 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import {
   controlAgent,
+  fetchEquityCurve,
+  fetchEvolution,
   fetchReportVersions,
+  fetchStrategyMetrics,
   getAccount,
   listAccountConditionOrders,
   listAccountHoldings,
@@ -40,12 +42,19 @@ import {
   type AgentInfo,
   type ConditionOrderInfo,
   type ControlOp,
+  type CurveRange,
+  type EquityCurve,
   type FrozenSecurity,
   type HoldingInfo,
   type ReportTimelineEntry,
+  type StrategyEvolution,
+  type StrategyMetrics,
   type TradeInfo,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
+import MetricSummaryCard from "./MetricSummaryCard";
+import EquityCurveCard from "./EquityCurveCard";
+import StrategyEvolutionCard from "./StrategyEvolutionCard";
 
 const OT_LABEL: Record<string, string> = {
   buy: "买入",
@@ -105,6 +114,11 @@ export default function StrategyDetailPage() {
   const [frozen, setFrozen] = useState<FrozenSecurity[]>([]);
   const [loading, setLoading] = useState(true);
   const [unsettledDates, setUnsettledDates] = useState<string[]>([]);
+  const [metrics, setMetrics] = useState<StrategyMetrics | null>(null);
+  const [curve, setCurve] = useState<EquityCurve | null>(null);
+  const [evolution, setEvolution] = useState<StrategyEvolution | null>(null);
+  const [range, setRange] = useState<CurveRange>("all");
+  const [p2Loading, setP2Loading] = useState(true);
 
   const strategyAgents = useMemo(() => agents.filter((a) => a.role === "strategy"), [agents]);
 
@@ -186,6 +200,29 @@ export default function StrategyDetailPage() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let active = true;
+    setP2Loading(true);
+    void Promise.allSettled([
+      fetchStrategyMetrics(selectedId),
+      fetchEquityCurve(selectedId, range),
+      fetchEvolution(selectedId),
+    ]).then(([m, c, e]) => {
+      if (!active) return;
+      setMetrics(m.status === "fulfilled" ? m.value : null);
+      setCurve(c.status === "fulfilled" ? c.value : null);
+      setEvolution(e.status === "fulfilled" ? e.value : null);
+      if (m.status === "rejected" && c.status === "rejected" && e.status === "rejected") {
+        console.warn("P2 数据源不可用（spec-06 §6.4），等 EOD 结算产出后再现。");
+      }
+      setP2Loading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [selectedId, range]);
 
   const mainStatus = account?.status;
   const isFrozen = mainStatus === "paused_buy" || mainStatus === "halted";
@@ -309,7 +346,7 @@ export default function StrategyDetailPage() {
             策略详情
           </Typography.Title>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            单策略聚合视图：持仓 / 条件单 / 成交流水 / 日报历史（spec-06 §6.4，P1 基础版）
+             单策略聚合视图：持仓 / 条件单 / 流水 / 日报 + 业绩指标 / 资金曲线（沪深300 基准）/ 演进账本（spec-06 §6.4）
           </Typography.Text>
         </div>
         <Flex gap={8} align="center">
@@ -445,6 +482,15 @@ export default function StrategyDetailPage() {
             )}
           </Card>
 
+          <MetricSummaryCard metrics={metrics} loading={p2Loading} />
+          <EquityCurveCard
+            agentName={agentInfo.name}
+            curve={curve}
+            loading={p2Loading}
+            range={range}
+            onRangeChange={setRange}
+          />
+
           <Card
             size="small"
             title="持仓明细"
@@ -529,16 +575,12 @@ export default function StrategyDetailPage() {
             />
           </Card>
 
-          <Card size="small" title="补充能力（P2+，待相应后端数据源就绪）" style={{ marginTop: 12 }}>
-            <Space direction="vertical" size={4}>
-              <Typography.Text type="secondary" style={{ fontSize: 13 }}>
-                资金曲线（ECharts + 沪深300 基准）、指标摘要卡（累计收益率/最大回撤/信号胜率）、策略理念/能力包、持仓-条件单关联视图（B7）、策略演进版本链 —— 见 spec-06 §6.4。
-              </Typography.Text>
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                数据源：spec-01 signal_registry / spec-02 memory_entries / spec-03 index_quotes（基准线）。
-              </Typography.Text>
-            </Space>
-          </Card>
+          <StrategyEvolutionCard evolution={evolution} loading={p2Loading} />
+
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
+            P2+ 余项（待相应后端数据源就绪）：策略理念 / 能力包、持仓-条件单关联视图（B7）—— 见 spec-06 §6.4；策略理念源 spec-02
+            memory_entries，版本链由多代策略发布驱动。
+          </Typography.Paragraph>
         </>
       ) : null}
     </div>

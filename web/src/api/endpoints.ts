@@ -706,3 +706,109 @@ export function upsertKbStats(
 ): Promise<{ stats: KbStatsRow }> {
   return apiPost(`/api/kb/${encodeURIComponent(kbId)}/stats`, body);
 }
+
+// ---------- 策略分析（spec-06 §6.4 P2：资金曲线/指标卡/策略演进） ----------
+
+export type CurveRange = "all" | "1m" | "3m";
+export type AccountRole = "main" | "trial" | "validation";
+
+export interface EquityPoint {
+  trade_date: string;
+  nav: number;
+  return_pct: number;
+}
+export interface BenchPoint {
+  trade_date: string;
+  close: number;
+  return_pct: number;
+}
+export interface EquitySeriesAccount {
+  account_id: string;
+  role: AccountRole;
+  label: string;
+  active_version_no: string;
+  created_ts: string;
+  status: string;
+  points: EquityPoint[];
+  last_return_pct: number | null;
+}
+export interface EquityCurve {
+  agent_id: string;
+  range: string;
+  series: EquitySeriesAccount[];
+  benchmark: { available: boolean; reason: string; points: BenchPoint[] };
+}
+
+export interface SignalStats {
+  n: number;
+  done: number;
+  win_n: number;
+  tie_n: number;
+  early_n: number;
+  win_rate_pct: number | null;
+  avg_fwd_return_pct: number | null;
+  avg_excess_pct: number | null;
+  note: string;
+}
+export interface StrategyMetrics {
+  agent_id: string;
+  as_of: string;
+  cum_return_pct: number | null;
+  max_drawdown_pct: number | null;
+  settle_days: number;
+  nav_last: number | null;
+  signal: SignalStats;
+}
+
+export interface EvolutionTrial {
+  window_days: number;
+  replay_status: string;
+}
+export interface EvolutionLedger {
+  account_id: string;
+  role: AccountRole;
+  label: string;
+  status: string;
+  active_version_no: string;
+  created_ts: string;
+  report_days: number;
+  first_report_date: string;
+  last_report_date: string;
+  first_nav: number | null;
+  nav_last: number | null;
+  return_pct: number | null;
+  trial: EvolutionTrial | null;
+}
+export interface EvolutionArchive {
+  account_id: string;
+  decision: "launch" | "reject";
+  verdict: string;
+  archived_ts: string;
+  end_nav: number | null;
+  end_total_pnl: number | null;
+  replay_window_days: number | null;
+  replay_sessions: number | null;
+  settle_days: number | null;
+  orders: number | null;
+  trades: number | null;
+  holdings: number | null;
+}
+export interface StrategyEvolution {
+  agent_id: string;
+  note: string;
+  ledgers: EvolutionLedger[];
+  archive: EvolutionArchive | null;
+  generated_ts: string;
+}
+
+export function fetchEquityCurve(agentId: string, range: CurveRange = "all"): Promise<EquityCurve> {
+  return apiGet<EquityCurve>(`/api/agents/${encodeURIComponent(agentId)}/equity-curve?range=${range}`);
+}
+
+export function fetchStrategyMetrics(agentId: string): Promise<StrategyMetrics> {
+  return apiGet<StrategyMetrics>(`/api/agents/${encodeURIComponent(agentId)}/metrics`);
+}
+
+export function fetchEvolution(agentId: string): Promise<StrategyEvolution> {
+  return apiGet<StrategyEvolution>(`/api/agents/${encodeURIComponent(agentId)}/evolution`);
+}
