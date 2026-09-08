@@ -32,6 +32,8 @@ import {
   StopOutlined,
 } from "@ant-design/icons";
 import {
+  batchControl,
+  batchSellAll,
   controlAgent,
   emergencySellAll,
   freezeSecurity,
@@ -177,6 +179,62 @@ export default function AgentsPage() {
   const [clearAgent, setClearAgent] = useState<AgentInfo | null>(null);
   const [clearConfirm, setClearConfirm] = useState("");
   const [clearing, setClearing] = useState(false);
+  const [batchClearOpen, setBatchClearOpen] = useState(false);
+  const [batchClearConfirm, setBatchClearConfirm] = useState("");
+  const [batchClearing, setBatchClearing] = useState(false);
+
+  const batchRun = (op: ControlOp) => {
+    const meta = {
+      pause_buy: {
+        title: "全局冻结买入？",
+        text: "将冻结全部运行中策略 Agent 的买入（保留卖出与风控）；非运行/已是目标态的 Agent 自动跳过。",
+      },
+      halt: {
+        title: "全局熔断冻结？",
+        text: "将对全部运行中策略 Agent 买卖全停（保留结算与风控）；非运行 Agent 自动跳过。",
+      },
+      resume: {
+        title: "全局解除冻结？",
+        text: "将恢复全部处于冻结态（paused_buy/halted）的策略 Agent 主账户为 normal。",
+      },
+    }[op];
+    modal.confirm({
+      title: meta.title,
+      content: <Typography.Text type="secondary">{meta.text}</Typography.Text>,
+      okText: "确认",
+      okButtonProps: { type: op === "resume" ? "primary" : "default", danger: op !== "resume" },
+      cancelText: "取消",
+      onOk: async () => {
+        try {
+          const r = await batchControl(op);
+          message.success(`全局直控完成：生效 ${r.applied_count} 个，跳过 ${r.skipped_count} 个`);
+          void reload();
+        } catch (e) {
+          message.error((e as Error).message ?? "全局直控失败");
+        }
+      },
+    });
+  };
+
+  const doBatchClear = async () => {
+    if (batchClearConfirm.trim() !== "清仓") return;
+    setBatchClearing(true);
+    try {
+      const r = await batchSellAll();
+      message.success(
+        r.total_holdings === 0
+          ? "全部运行中策略 Agent 均无持仓"
+          : `已为 ${r.agents_count} 个 Agent 生成 ${r.total_orders} 张卖出条件单（持仓 ${r.total_holdings} 只）`,
+      );
+      setBatchClearOpen(false);
+      setBatchClearConfirm("");
+      void reload();
+    } catch (e) {
+      message.error((e as Error).message ?? "全局清仓失败");
+    } finally {
+      setBatchClearing(false);
+    }
+  };
 
   const [frozenAgent, setFrozenAgent] = useState<AgentInfo | null>(null);
   const [frozenRows, setFrozenRows] = useState<FrozenSecurity[]>([]);
@@ -321,13 +379,43 @@ export default function AgentsPage() {
 
   return (
     <div style={{ padding: 16, minHeight: "100%" }}>
-      <div style={{ marginBottom: 12 }}>
-        <Typography.Title level={4} style={{ margin: 0 }}>
-          Agent 看板
-        </Typography.Title>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          模拟账户/净值/盈亏已接入（spec-01 份额法口径）；持仓与当日结算待撮合引擎落地后更新
-        </Typography.Text>
+      <div style={{ marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+        <div>
+          <Typography.Title level={4} style={{ margin: 0 }}>
+            Agent 看板
+          </Typography.Title>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            模拟账户/净值/盈亏已接入（spec-01 份额法口径）；持仓与当日结算待撮合引擎落地后更新
+          </Typography.Text>
+        </div>
+        <Dropdown
+          trigger={["click"]}
+          menu={{
+            items: [
+              {
+                key: "pause_buy", icon: <PauseCircleOutlined />,
+                label: "全部冻结买入（保留卖出与风控）",
+              },
+              { key: "halt", icon: <StopOutlined />, label: "全部熔断冻结（买卖全停）" },
+              { key: "resume", icon: <CaretRightOutlined />, label: "全部解除冻结 / 恢复" },
+              { type: "divider" as const },
+              {
+                key: "clear", icon: <ClearOutlined />, danger: true,
+                label: "全部紧急清仓",
+              },
+            ],
+            onClick: ({ key }) => {
+              if (key === "clear") {
+                setBatchClearConfirm("");
+                setBatchClearOpen(true);
+                return;
+              }
+              batchRun(key as ControlOp);
+            },
+          }}
+        >
+          <Button icon={<ControlOutlined />}>全局直控</Button>
+        </Dropdown>
       </div>
 
       {sorted.length === 0 ? (
@@ -644,6 +732,30 @@ export default function AgentsPage() {
           placeholder="请输入“清仓”以确认本次高危操作"
           value={clearConfirm}
           onChange={(e) => setClearConfirm(e.target.value)}
+          maxLength={16}
+        />
+      </Modal>
+
+      <Modal
+        title="全局紧急清仓（需输入确认）"
+        open={batchClearOpen}
+        onCancel={() => {
+          setBatchClearOpen(false);
+          setBatchClearConfirm("");
+        }}
+        onOk={() => void doBatchClear()}
+        confirmLoading={batchClearing}
+        okText="确认全局清仓"
+        okButtonProps={{ danger: true, disabled: batchClearConfirm.trim() !== "清仓" }}
+      >
+        <Typography.Paragraph type="secondary" style={{ fontSize: 13 }}>
+          将为全部运行中策略 Agent 的主账户逐票生成市价卖出条件单，不经 LLM、即时生效。
+          熔断冻结中的 Agent 卖出会被闸门拦截并在结果中提示。
+        </Typography.Paragraph>
+        <Input
+          placeholder="请输入“清仓”以确认本次高危操作"
+          value={batchClearConfirm}
+          onChange={(e) => setBatchClearConfirm(e.target.value)}
           maxLength={16}
         />
       </Modal>

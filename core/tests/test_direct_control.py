@@ -156,3 +156,46 @@ def test_control_guards(authed_client):
     # 紧急清仓守卫
     assert authed_client.post("/api/agents/agent-nope/control/sell-all", headers=csrf_headers(authed_client)).status_code == 409
     assert authed_client.post(f"/api/agents/{MANAGER}/control/sell-all", headers=csrf_headers(authed_client)).status_code == 409
+
+
+def test_batch_control_and_clear(authed_client):
+    """全局直控：批量冻结/恢复全部运行中策略 Agent，幂等跳过；全局清仓汇总。"""
+    from core import accountstore
+    from core.db import state_conn
+
+    st = authed_client.app.state
+    h = csrf_headers(authed_client)
+    accountstore.create_trial_agent(st, agent_id="agent-batch-1",
+                                    name="批量用例子 Agent")
+    state_conn(st).execute("UPDATE agents SET status='running' WHERE id='agent-batch-1'")
+    # 批量冻结买入 → demo 与 batch-1 双生效
+    pause = authed_client.post("/api/control/batch",
+                               json={"op": "pause_buy"}, headers=h)
+    assert pause.status_code == 200, pause.text
+    body = pause.json()
+    assert body["applied_count"] == 2 and body["skipped_count"] == 0
+    assert {a["agent_id"] for a in body["applied"]} == {"agent-demo-001", "agent-batch-1"}
+    conn = state_conn(st)
+    statuses = dict(conn.execute(
+        "SELECT agent_id, status FROM accounts WHERE role='main'").fetchall())
+    assert statuses["agent-demo-001"] == "paused_buy"
+    assert statuses["agent-batch-1"] == "paused_buy"
+    # 重复批量 → 幂等跳过全部
+    again = authed_client.post("/api/control/batch",
+                               json={"op": "pause_buy"}, headers=h)
+    assert again.json()["applied_count"] == 0 and again.json()["skipped_count"] == 2
+    # 批量恢复 → 双生效回 normal
+    resume = authed_client.post("/api/control/batch",
+                                json={"op": "resume"}, headers=h)
+    assert resume.json()["applied_count"] == 2 and resume.json()["skipped_count"] == 0
+    statuses = dict(conn.execute(
+        "SELECT agent_id, status FROM accounts WHERE role='main'").fetchall())
+    assert statuses["agent-demo-001"] == "normal"
+    # 全局清仓：双 Agent 无持仓仍返回明细，幂等可执行
+    cl = authed_client.post("/api/control/sell-all", headers=h)
+    assert cl.status_code == 200, cl.text
+    cb = cl.json()
+    assert cb["agents_count"] == 2 and cb["total_holdings"] == 0 and cb["total_orders"] == 0
+    # 非法批量 op → 422
+    bad = authed_client.post("/api/control/batch", json={"op": "wipe"}, headers=h)
+    assert bad.status_code == 422

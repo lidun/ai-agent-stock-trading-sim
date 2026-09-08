@@ -185,6 +185,38 @@ export function emergencySellAll(agentId: string): Promise<EmergencySellResult> 
   return apiPost(`/api/agents/${encodeURIComponent(agentId)}/control/sell-all`);
 }
 
+// ---------- 全局直控（spec-06 §6.3 全局层，作用于全部运行中策略 Agent） ----------
+
+export interface BatchControlResult {
+  op: ControlOp;
+  target: string;
+  applied: { agent_id: string; account_id: string; from: string; to: string }[];
+  skipped: { agent_id: string; reason: string }[];
+  applied_count: number;
+  skipped_count: number;
+}
+
+export interface BatchSellResult {
+  agents: {
+    agent_id: string;
+    account_id: string;
+    holdings: number;
+    orders: { symbol: string; qty: number; id: string }[];
+    blocked_halted: boolean;
+  }[];
+  agents_count: number;
+  total_holdings: number;
+  total_orders: number;
+}
+
+export function batchControl(op: ControlOp): Promise<BatchControlResult> {
+  return apiPost("/api/control/batch", { op });
+}
+
+export function batchSellAll(): Promise<BatchSellResult> {
+  return apiPost("/api/control/sell-all");
+}
+
 // ---------- 冻结证券（spec-06 §6.3 逐票冻结买入/解除，常驻清单） ----------
 
 export interface FrozenSecurity {

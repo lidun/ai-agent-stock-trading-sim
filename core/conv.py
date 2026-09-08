@@ -55,6 +55,10 @@ class ControlIn(BaseModel):
     op: str = Field(pattern="^(pause_buy|halt|resume)$")
 
 
+class BatchControlIn(BaseModel):
+    op: str = Field(pattern="^(pause_buy|halt|resume)$")
+
+
 class FrozenIn(BaseModel):
     symbol: str = Field(min_length=1, max_length=16)
     reason: str = Field(default="", max_length=200)
@@ -147,6 +151,53 @@ def unfreeze_security(agent_id: str, symbol: str,
                     f"## 直控干预 · 解除冻结 {symbol}\n"
                     f"- 已恢复买入（此前被取消的单据不自动重建）\n"
                     f"- 生效：即时；请将本次干预纳入复盘")
+    return result
+
+
+@router.post("/control/batch")
+def control_all(payload: BatchControlIn, request: Request, session: SessionDep):
+    """全局直控（spec-06 §6.3 全局层）：批量冻结买入/熔断/恢复运行中策略 Agent。"""
+    label = {"pause_buy": "冻结买入（保留卖出与风控）",
+             "halt": "熔断冻结（买卖全停）",
+             "resume": "解除冻结恢复"}[payload.op]
+    try:
+        result = accountstore.control_all(request.app.state, op=payload.op)
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    audit(request.app.state, session["session"]["username"],
+          "account.control_batch", result="ok",
+          object_type="agent", object_id="*",
+          detail=f"全局直控 {label}：生效 {result['applied_count']} / 跳过 "
+                 f"{result['skipped_count']}",
+          ctx=get_request_context(request))
+    for a in result["applied"]:
+        _notify_control(request.app.state, a["agent_id"],
+                        f"## 直控干预 · 全局{label}\n"
+                        f"- 账户状态：{a['from']} → {a['to']}（全局批量，即时生效）\n"
+                        f"- 请将本次干预纳入复盘（审计 account.control_batch 已留痕）")
+    return result
+
+
+@router.post("/control/sell-all")
+def emergency_sell_all_global(request: Request, session: SessionDep):
+    """全局紧急清仓（spec-06 §6.3 全局层）：全部运行中策略 Agent 持仓逐票市价卖出。"""
+    result = orderstore.emergency_sell_all_global(request.app.state)
+    audit(request.app.state, session["session"]["username"],
+          "account.emergency_sell", result="ok",
+          object_type="agent", object_id="*",
+          detail=f"全局紧急清仓：{result['agents_count']} 个 Agent"
+                 f" 持仓 {result['total_holdings']} 只，生成卖出单 {result['total_orders']} 张",
+          ctx=get_request_context(request))
+    for a in result["agents"]:
+        if a["holdings"] == 0 and not a["blocked_halted"]:
+            continue
+        if a["blocked_halted"]:
+            note = "熔断冻结态，卖出被闸门拦截（未生成条件单）"
+        else:
+            note = f"已生成 {len(a['orders'])} 张市价卖出条件单"
+        _notify_control(request.app.state, a["agent_id"],
+                        f"## 直控干预 · 全局紧急清仓\n- {note}\n"
+                        f"- 生效：即时（不经 LLM）；请纳入复盘")
     return result
 
 

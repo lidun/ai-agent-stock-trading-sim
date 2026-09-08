@@ -282,3 +282,33 @@ def emergency_sell_all(state, *, agent_id: str,
     return {"agent_id": agent_id, "account_id": main["id"],
             "holdings": len(rows), "orders": orders,
             "blocked_halted": blocked}
+
+
+def emergency_sell_all_global(state) -> dict:
+    """全局紧急清仓（spec-06 §6.3 全局层）：对全部运行中策略 Agent 逐票市价卖出。"""
+    conn = state_conn(state)
+    with read_txn(conn) as c:
+        agents = [r[0] for r in c.execute(
+            """
+            SELECT ag.id FROM agents ag
+             JOIN accounts ac ON ac.agent_id = ag.id AND ac.role = 'main'
+             WHERE ag.role = 'strategy' AND ag.status = 'running'
+             ORDER BY ag.id
+            """
+        ).fetchall()]
+    per_agent = []
+    total_orders = 0
+    total_holdings = 0
+    for agent_id in agents:
+        r = emergency_sell_all(state, agent_id=agent_id)
+        per_agent.append({
+            "agent_id": agent_id,
+            "account_id": r["account_id"],
+            "holdings": r["holdings"],
+            "orders": r["orders"],
+            "blocked_halted": r["blocked_halted"],
+        })
+        total_orders += len(r["orders"])
+        total_holdings += r["holdings"]
+    return {"agents": per_agent, "agents_count": len(agents),
+            "total_holdings": total_holdings, "total_orders": total_orders}

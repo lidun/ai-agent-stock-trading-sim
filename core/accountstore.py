@@ -331,6 +331,49 @@ def control_agent(state, *, agent_id: str, op: str,
             "from": cur, "to": updated["status"]}
 
 
+def control_all(state, *, op: str) -> dict:
+    """全局直控（spec-06 §6.3 全局层）：对全部运行中策略 Agent 批量冻结/熔断/恢复。
+
+    逐 Agent 同事务切换主账户状态；非运行、无主账户或已是目标态的账户记 skipped
+    并给原因（幂等：已是目标态不再重复变更）。返回 applied/skipped 明细供回执与审计。
+    """
+    if op not in ("pause_buy", "halt", "resume"):
+        raise LookupError(f"未知直控操作: {op}（仅 pause_buy/halt/resume）")
+    conn = state_conn(state)
+    target = {"pause_buy": "paused_buy", "halt": "halted"}.get(op, "normal")
+    applied: list[dict] = []
+    skipped: list[dict] = []
+    with write_txn(conn) as c:
+        rows = c.execute(
+            """
+            SELECT ag.id AS agent_id, ag.status AS agent_status,
+                   ac.id AS account_id, ac.status AS acct_status
+              FROM agents ag
+              JOIN accounts ac ON ac.agent_id = ag.id AND ac.role = 'main'
+             WHERE ag.role = 'strategy'
+             ORDER BY ag.id
+            """
+        ).fetchall()
+        ts = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+        for r in rows:
+            why = None
+            if r["agent_status"] != "running":
+                why = f"Agent 状态 {r['agent_status']}（仅运行中可直控）"
+            elif r["acct_status"] == target:
+                why = f"账户已是 {r['acct_status']}"
+            if why:
+                skipped.append({"agent_id": r["agent_id"], "reason": why})
+                continue
+            c.execute(
+                f"UPDATE accounts SET status=?, updated_ts={ts} WHERE id=?",
+                (target, r["account_id"]))
+            applied.append({"agent_id": r["agent_id"], "account_id": r["account_id"],
+                            "from": r["acct_status"], "to": target})
+    return {"op": op, "target": target, "applied": applied,
+            "skipped": skipped, "applied_count": len(applied),
+            "skipped_count": len(skipped)}
+
+
 def trial_progress(state, agent_id: str) -> dict | None:
     """试运行验收进度（spec-05 §6.1 门槛预览，供 UI 验收看板）。
 
