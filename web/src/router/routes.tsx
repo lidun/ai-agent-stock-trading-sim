@@ -8,6 +8,7 @@ import StrategyDetailPage from "../pages/strategies/StrategyDetail";
 import ControlCenterPage from "../pages/control/ControlCenter";
 import TradingPage from "../pages/trading/TradingPage";
 import ApprovalCenterPage from "../pages/approvals/ApprovalCenter";
+import KnowledgePage from "../pages/knowledge/KnowledgePage";
 import { ModulePlaceholder } from "../pages/Placeholder";
 import { NAV_ITEMS } from "../config/nav";
 
@@ -31,6 +32,8 @@ export const protectedChildren: RouteObject[] = [
         <ReportsPage />
       ) : n.key === "approvals" ? (
         <ApprovalCenterPage />
+      ) : n.key === "knowledge" ? (
+        <KnowledgePage />
       ) : (
         <ModulePlaceholder nav={n} />
       ),

@@ -582,3 +582,127 @@ export function decideApproval(
     reason: reason ?? "",
   });
 }
+
+// ---------- 知识库（spec-05 §3 / spec-06 §6.7） ----------
+
+export type KbType = "positive" | "pitfall";
+export type KbStatus = "observing" | "validating" | "valid" | "invalid" | "sealed";
+
+export interface KbEntry {
+  id: string;
+  type: KbType;
+  name: string;
+  description: string;
+  computable_spec: Record<string, unknown>;
+  severity: "" | "high" | "mid" | "low";
+  env_scope: string;
+  status: KbStatus;
+  invalid_reason: string;
+  sealed_reason: string;
+  source: string;
+  created_by: string;
+  origin_agent: string;
+  review_gate1_ref: { passed: boolean; checks?: string[]; ts?: string };
+  review_gate2_ref: Record<string, unknown>;
+  deleted_ts: string;
+  created_ts: string;
+  updated_ts: string;
+  type_label: string;
+  status_label: string;
+  stats?: KbStatsRow[];
+}
+
+export interface KbStatsRow {
+  id: string;
+  kb_id: string;
+  env_bucket: string;
+  sample_n: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  expectancy: number | null;
+  intercept_n: number;
+  exception_n: number;
+  stale_n: number;
+  dispatch_n: number;
+  window_days: number | null;
+  note: string;
+  updated_ts: string;
+}
+
+export function listKb(params?: {
+  type?: KbType;
+  status?: KbStatus;
+  source?: string;
+  kw?: string;
+  includeDeleted?: boolean;
+  limit?: number;
+}): Promise<{ entries: KbEntry[] }> {
+  const q = new URLSearchParams();
+  if (params?.type) q.set("type", params.type);
+  if (params?.status) q.set("status", params.status);
+  if (params?.source) q.set("source", params.source);
+  if (params?.kw) q.set("kw", params.kw);
+  if (params?.includeDeleted) q.set("include_deleted", "true");
+  if (params?.limit) q.set("limit", String(params.limit));
+  const s = q.toString();
+  return apiGet(`/api/kb${s ? `?${s}` : ""}`);
+}
+
+export function fetchKb(kbId: string): Promise<{ entry: KbEntry }> {
+  return apiGet(`/api/kb/${encodeURIComponent(kbId)}`);
+}
+
+export function listKbStats(kbId?: string): Promise<{ stats: KbStatsRow[] }> {
+  const q = kbId ? `?kb_id=${encodeURIComponent(kbId)}` : "";
+  return apiGet(`/api/kb/stats${q}`);
+}
+
+export function createKb(body: {
+  name: string;
+  type: KbType;
+  description?: string;
+  computable_spec?: Record<string, unknown>;
+  severity?: string;
+  env_scope?: string;
+  source?: string;
+  origin_agent?: string;
+}): Promise<{ entry: KbEntry }> {
+  return apiPost("/api/kb", body);
+}
+
+export function updateKb(
+  kbId: string,
+  body: {
+    name?: string;
+    description?: string;
+    env_scope?: string;
+    severity?: string;
+    note?: string;
+  },
+): Promise<{ entry: KbEntry }> {
+  return apiPatch(`/api/kb/${encodeURIComponent(kbId)}`, body);
+}
+
+export function transitionKb(
+  kbId: string,
+  action: "start_validation" | "approve_valid" | "invalidate" | "seal",
+  note: string,
+): Promise<{ entry: KbEntry }> {
+  return apiPost(`/api/kb/${encodeURIComponent(kbId)}/transition`, { action, note });
+}
+
+export function deleteKb(kbId: string, note?: string): Promise<{ entry: KbEntry }> {
+  return apiPost(`/api/kb/${encodeURIComponent(kbId)}/delete`, { note: note ?? "" });
+}
+
+export function restoreKb(kbId: string, note?: string): Promise<{ entry: KbEntry }> {
+  return apiPost(`/api/kb/${encodeURIComponent(kbId)}/restore`, { note: note ?? "" });
+}
+
+export function upsertKbStats(
+  kbId: string,
+  body: Partial<KbStatsRow> & { env_bucket: string; note?: string },
+): Promise<{ stats: KbStatsRow }> {
+  return apiPost(`/api/kb/${encodeURIComponent(kbId)}/stats`, body);
+}

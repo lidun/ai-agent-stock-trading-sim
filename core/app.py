@@ -20,6 +20,7 @@ from core.auth import router as auth_router
 from core.conv import router as conv_router
 from core.config import Settings, settings_from_override
 from core.db import Connections, migrate
+from core.kb_routes import router as kb_router
 from core.report_routes import router as report_router
 from core.security import InstanceLock
 
@@ -94,6 +95,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(account_router)
     app.include_router(report_router)
     app.include_router(approval_router)
+    app.include_router(kb_router)
 
     if settings.eod_auto_settle:
         # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点

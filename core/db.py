@@ -589,6 +589,65 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON frozen_securities(agent_id, symbol);
         """,
     ),
+    (
+        19,
+        """
+        -- 知识与经验库（spec-05 §3 kb_entries / kb_stats）。
+        -- 状态机（§3.2）：observing → validating → valid；validating → invalid/sealed；
+        --   invalid/sealed 经复核可回 validating。晋升只由 signal_registry 客观统计驱动，
+        --   管理 Agent/用户负责评审确认（评审记录 review_gate2_ref）。删除=软删（§3.7），
+        --   历史统计与信号引用保留供审计。
+        CREATE TABLE IF NOT EXISTS kb_entries (
+            id              TEXT PRIMARY KEY,          -- KB-0001 递增
+            type            TEXT NOT NULL
+                            CHECK (type IN ('positive', 'pitfall')),
+            name            TEXT NOT NULL,
+            description     TEXT NOT NULL DEFAULT '',
+            computable_spec TEXT NOT NULL DEFAULT '{}', -- JSON: trigger_rule/computation/data_sources
+            severity        TEXT NOT NULL DEFAULT ''     -- pitfall: high|mid|low
+                            CHECK (severity IN ('', 'high', 'mid', 'low')),
+            env_scope       TEXT NOT NULL DEFAULT 'all',
+            status          TEXT NOT NULL DEFAULT 'observing'
+                            CHECK (status IN ('observing', 'validating', 'valid',
+                                              'invalid', 'sealed')),
+            invalid_reason  TEXT NOT NULL DEFAULT '',
+            sealed_reason   TEXT NOT NULL DEFAULT '',
+            source          TEXT NOT NULL DEFAULT 'user'
+                            CHECK (source IN ('user', 'retrospective',
+                                              'manager_observation', 'market_anomaly')),
+            created_by      TEXT NOT NULL DEFAULT 'user',
+            origin_agent    TEXT REFERENCES agents(id),
+            review_gate1_ref TEXT NOT NULL DEFAULT '{}',
+            review_gate2_ref TEXT NOT NULL DEFAULT '{}',
+            deleted_ts      TEXT NOT NULL DEFAULT '',
+            created_ts      TEXT NOT NULL,
+            updated_ts      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kb_status ON kb_entries(status);
+        CREATE INDEX IF NOT EXISTS idx_kb_type_status ON kb_entries(type, status);
+        CREATE INDEX IF NOT EXISTS idx_kb_source ON kb_entries(source);
+
+        CREATE TABLE IF NOT EXISTS kb_stats (
+            id            TEXT PRIMARY KEY,
+            kb_id         TEXT NOT NULL REFERENCES kb_entries(id),
+            env_bucket    TEXT NOT NULL DEFAULT 'all',
+            sample_n      INTEGER NOT NULL DEFAULT 0,
+            win_rate      REAL,
+            avg_win       REAL,
+            avg_loss      REAL,
+            expectancy    REAL,
+            intercept_n   INTEGER NOT NULL DEFAULT 0,   -- #28 被拦截样本（真避坑）
+            exception_n   INTEGER NOT NULL DEFAULT 0,   -- #28 破例样本
+            stale_n       INTEGER NOT NULL DEFAULT 0,   -- #34 stale-price 样本
+            dispatch_n    INTEGER NOT NULL DEFAULT 0,   -- §3.9 UCB n_i
+            window_days   INTEGER,
+            note          TEXT NOT NULL DEFAULT '',
+            updated_ts    TEXT NOT NULL,
+            UNIQUE (kb_id, env_bucket)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kb_stats_kb ON kb_stats(kb_id);
+        """,
+    ),
 ]
 
 
