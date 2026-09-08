@@ -7,6 +7,7 @@ import {
   Card,
   Empty,
   Flex,
+  Popover,
   Select,
   Skeleton,
   Table,
@@ -270,6 +271,61 @@ export default function StrategyDetailPage() {
     });
   };
 
+  /** B7 持仓-条件单关联视图：每股持仓挂出的卖出保护单 + 最近结算日成交（spec-06 §6.4） */
+  const PROTECT_ACTIVE = ["active", "partial"];
+  const lastSettleDate = trades.reduce((acc, t) => (t.settle_date > acc ? t.settle_date : acc), "");
+  const protectOrdersOf = (symbol: string) =>
+    orders.filter(
+      (o) =>
+        o.direction === "sell" &&
+        PROTECT_ACTIVE.includes(o.status) &&
+        (o.symbol === symbol || (o.symbols ?? []).includes(symbol)),
+    );
+  const dayTradesOf = (symbol: string) =>
+    lastSettleDate ? trades.filter((t) => t.symbol === symbol && t.settle_date === lastSettleDate) : [];
+
+  const holdingProtectContent = (h: HoldingInfo) => {
+    const prot = protectOrdersOf(h.symbol);
+    const day = dayTradesOf(h.symbol);
+    return (
+      <div style={{ maxWidth: 340 }}>
+        <Typography.Text strong style={{ fontSize: 12 }}>
+          保护单（已挂 {prot.length}） · {h.symbol}
+        </Typography.Text>
+        {prot.length ? (
+          <Flex vertical gap={2} style={{ marginTop: 6 }}>
+            {prot.map((o) => (
+              <Typography.Text key={o.id} style={{ fontSize: 12 }} ellipsis>
+                {OT_LABEL[o.order_type] ?? o.order_type} · {o.trigger || "触发即市价"}（
+                {CO_STATUS[o.status]?.text ?? o.status}）
+              </Typography.Text>
+            ))}
+          </Flex>
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            该持仓未挂卖出保护（止盈/止损/移动止损）
+          </Typography.Text>
+        )}
+        <Typography.Text strong style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+          当日成交 · {lastSettleDate || "—"}
+        </Typography.Text>
+        {day.length ? (
+          <Flex vertical gap={2} style={{ marginTop: 4 }}>
+            {day.map((t) => (
+              <Typography.Text key={t.id} style={{ fontSize: 12 }}>
+                {t.side === "buy" ? "买入" : "卖出"} {qty(t.qty)} × {price(t.price)} @ {t.trade_time}
+              </Typography.Text>
+            ))}
+          </Flex>
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            当日无成交
+          </Typography.Text>
+        )}
+      </div>
+    );
+  };
+
   const holdingColumns: ColumnsType<HoldingInfo> = [
     { title: "代码", dataIndex: "symbol", width: 110, render: (s: string) => <Typography.Text code>{s}</Typography.Text> },
     {
@@ -281,6 +337,32 @@ export default function StrategyDetailPage() {
       render: (_, h) => money(String(Number(h.quantity) * Number(h.avg_cost))),
     },
     { title: "批次", dataIndex: "lots", width: 90, align: "right", render: (l: HoldingInfo["lots"]) => l?.length ?? 0 },
+    {
+      title: "安全感", key: "protect", width: 110, align: "center",
+      render: (_, h) => {
+        const prot = protectOrdersOf(h.symbol);
+        const remaining = Number(h.quantity || "0");
+        const body = holdingProtectContent(h);
+        const noData = prot.length === 0 && dayTradesOf(h.symbol).length === 0;
+        const tag =
+          remaining <= 0 ? (
+            <Tag>已清仓</Tag>
+          ) : prot.length ? (
+            <Tag color="green">已保护 {prot.length}</Tag>
+          ) : (
+            <Tag color="orange">无保护</Tag>
+          );
+        return noData ? (
+          <Tooltip title="该票无保护单且当日无成交——悬停查看 B7 关联明细">
+            {tag}
+          </Tooltip>
+        ) : (
+          <Popover trigger="hover" placement="left" title="持仓-条件单关联（spec-06 §6.4 B7）" content={body}>
+            <span style={{ cursor: "default" }}>{tag}</span>
+          </Popover>
+        );
+      },
+    },
     { title: "更新时间", dataIndex: "updated_ts", render: (v: string) => fmtBeijingTime(v) },
   ];
 
@@ -578,8 +660,8 @@ export default function StrategyDetailPage() {
           <StrategyEvolutionCard evolution={evolution} loading={p2Loading} />
 
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
-            P2+ 余项（待相应后端数据源就绪）：策略理念 / 能力包、持仓-条件单关联视图（B7）—— 见 spec-06 §6.4；策略理念源 spec-02
-            memory_entries，版本链由多代策略发布驱动。
+            关联视图已就位：持仓每行悬停/安全感标签可查该票已挂卖出保护单与最近结算日成交（spec-06 §6.4 B7）。
+            P2+ 余项：策略理念 / 能力包（待 spec-02 memory_entries(type=strategy) 后端落地）、卖出跟踪列表（P3 文字+表格，spec-06 #15）。
           </Typography.Paragraph>
         </>
       ) : null}
