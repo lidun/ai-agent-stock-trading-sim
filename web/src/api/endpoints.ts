@@ -892,3 +892,31 @@ export function fetchExitTrackings(
   const q = status ? `?status=${status}` : "";
   return apiGet<ExitTrackingList>(`/api/agents/${encodeURIComponent(agentId)}/exit-trackings${q}`);
 }
+
+// ---------- 演进记忆（spec-02 §3.1 memory_entries type=strategy，只读壳） ----------
+
+export interface StrategyMemoryEntry {
+  id: string;
+  agent_id: string;
+  mem_type: string;
+  version_no: string;
+  ts: string;
+  body: string;
+  ref_ids: string[];
+  revision: number;
+  source: string;
+  dedup_key: string;
+  quality: string;
+}
+export interface StrategyMemoryList {
+  agent_id: string;
+  mem_type: string;
+  version_no: string;
+  total: number;
+  versions: string[];
+  items: StrategyMemoryEntry[];
+}
+
+export function fetchStrategyMemory(agentId: string): Promise<StrategyMemoryList> {
+  return apiGet<StrategyMemoryList>(`/api/agents/${encodeURIComponent(agentId)}/strategy-memory`);
+}

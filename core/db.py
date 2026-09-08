@@ -674,6 +674,35 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON strategy_charter_versions(agent_id, created_ts);
         """,
     ),
+    (
+        21,
+        """
+        -- spec-02 §3.1 memory_entries（原文，append-only）——本片落地 type=strategy
+        -- 演进记忆子集（spec-05 §4.1/§4.2：每次优化记录 前/后/依据/预期/结果 全量入记忆，
+        -- 逐条挂 version_no，spec-02 §9 不变量）。
+        -- 幂等：UNIQUE(agent_id, dedup_key)；写入方=引擎 EVOQUANT 优化流（spec-05 §4.1，
+        -- 本片只读+内部受控写测试）。卡片/分层摘要/向量属 spec-02 §3.2/§4 后续切片，不在此建表。
+        CREATE TABLE IF NOT EXISTS memory_entries (
+            id          TEXT PRIMARY KEY,
+            agent_id    TEXT NOT NULL REFERENCES agents(id),
+            mem_type    TEXT NOT NULL DEFAULT 'strategy'
+                        CHECK (mem_type IN ('user_requirement', 'strategy',
+                                            'trade_decision', 'market_note')),
+            version_no  TEXT NOT NULL DEFAULT '',
+            ts          TEXT NOT NULL,
+            body        TEXT NOT NULL,
+            ref_ids     TEXT NOT NULL DEFAULT '[]',
+            revision    INTEGER NOT NULL DEFAULT 0,
+            source      TEXT NOT NULL DEFAULT '',
+            dedup_key   TEXT NOT NULL DEFAULT '',
+            quality     TEXT NOT NULL DEFAULT 'normal'
+                        CHECK (quality IN ('normal', 'flagged')),
+            UNIQUE (agent_id, dedup_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_agent_type_ts
+            ON memory_entries(agent_id, mem_type, ts);
+        """,
+    ),
 ]
 
 

@@ -32,6 +32,7 @@ import {
   fetchExitTrackings,
   fetchReportVersions,
   fetchStrategyMetrics,
+  fetchStrategyMemory,
   fetchStrategyProfile,
   getAccount,
   listAccountConditionOrders,
@@ -54,6 +55,7 @@ import {
   type StrategyEvolution,
   type StrategyMetrics,
   type StrategyProfile,
+  type StrategyMemoryList,
   type TradeInfo,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
@@ -126,6 +128,7 @@ export default function StrategyDetailPage() {
   const [evolution, setEvolution] = useState<StrategyEvolution | null>(null);
   const [profile, setProfile] = useState<StrategyProfile | null>(null);
   const [exitTracks, setExitTracks] = useState<ExitTrackingList | null>(null);
+  const [memory, setMemory] = useState<StrategyMemoryList | null>(null);
   const [range, setRange] = useState<CurveRange>("all");
   const [p2Loading, setP2Loading] = useState(true);
 
@@ -220,13 +223,15 @@ export default function StrategyDetailPage() {
       fetchEvolution(selectedId),
       fetchStrategyProfile(selectedId),
       fetchExitTrackings(selectedId),
-    ]).then(([m, c, e, sp, et]) => {
+      fetchStrategyMemory(selectedId),
+    ]).then(([m, c, e, sp, et, mem]) => {
       if (!active) return;
       setMetrics(m.status === "fulfilled" ? m.value : null);
       setCurve(c.status === "fulfilled" ? c.value : null);
       setEvolution(e.status === "fulfilled" ? e.value : null);
       setProfile(sp.status === "fulfilled" ? sp.value : null);
       setExitTracks(et.status === "fulfilled" ? et.value : null);
+      setMemory(mem.status === "fulfilled" ? mem.value : null);
       if (m.status === "rejected" && c.status === "rejected" && e.status === "rejected") {
         console.warn("P2 数据源不可用（spec-06 §6.4），等 EOD 结算产出后再现。");
       }
@@ -671,7 +676,7 @@ export default function StrategyDetailPage() {
             />
           </Card>
 
-          <StrategyEvolutionCard evolution={evolution} loading={p2Loading} />
+              <StrategyEvolutionCard evolution={evolution} memory={memory} loading={p2Loading} />
 
           <SellTrackingCard data={exitTracks} loading={p2Loading} />
 

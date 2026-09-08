@@ -1,11 +1,12 @@
 import { Alert, Card, Empty, Flex, Skeleton, Table, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import type { EvolutionLedger, StrategyEvolution } from "../../api/endpoints";
+import type { EvolutionLedger, StrategyEvolution, StrategyMemoryList } from "../../api/endpoints";
 import { fmtBeijing } from "../../utils/time";
 import { colorOfSign, pctText } from "../../styles/tokens";
 
 interface Props {
   evolution: StrategyEvolution | null;
+  memory: StrategyMemoryList | null;
   loading: boolean;
 }
 
@@ -67,7 +68,7 @@ const ledgerColumns: ColumnsType<EvolutionLedger> = [
   { title: "建立", dataIndex: "created_ts", width: 150, render: (v: string) => fmtBeijing(v) },
 ];
 
-export default function StrategyEvolutionCard({ evolution, loading }: Props) {
+export default function StrategyEvolutionCard({ evolution, memory, loading }: Props) {
   const archive = evolution?.archive;
   return (
     <Card size="small" title="策略演进 · 账本与验收链">
@@ -113,6 +114,52 @@ export default function StrategyEvolutionCard({ evolution, loading }: Props) {
                   </Typography.Text>
                 }
               />
+            </Flex>
+          )}
+
+          {!memory || memory.total === 0 ? (
+            <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 12, marginBottom: 0 }}>
+              演进记忆（spec-02 §3.1 memory_entries type=strategy）尚无落库——引擎 EVOQUANT 优化流写入后
+              逐条挂 version_no（spec-05 §4.1）在此展示。
+            </Typography.Paragraph>
+          ) : (
+            <Flex vertical gap={4} style={{ marginTop: 12 }}>
+              <Flex align="center" wrap gap={8}>
+                <Typography.Text strong style={{ fontSize: 13 }}>
+                  演进记忆 · type=strategy（{memory.total}）
+                </Typography.Text>
+                {memory.versions.map((v) => (
+                  <Tag key={v} color="purple">{v}</Tag>
+                ))}
+              </Flex>
+              {memory.items.map((m) => (
+                <div
+                  key={m.id}
+                  style={{
+                    border: "1px solid rgba(0,0,0,0.08)",
+                    borderRadius: 6,
+                    padding: "6px 10px",
+                    background: m.quality === "flagged" ? "rgba(255,77,79,0.05)" : undefined,
+                  }}
+                >
+                  <Flex wrap gap={8} align="center" style={{ marginBottom: 2 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {fmtBeijing(m.ts)}
+                    </Typography.Text>
+                    {m.version_no ? <Tag color="purple">{m.version_no}</Tag> : null}
+                    {m.quality === "flagged" && <Tag color="red">flagged</Tag>}
+                  </Flex>
+                  <Typography.Paragraph style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 13 }}>
+                    {m.body}
+                  </Typography.Paragraph>
+                  {(m.source || m.ref_ids.length > 0) && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      来源 {m.source || "—"}
+                      {m.ref_ids.length > 0 ? ` · 引用 ${m.ref_ids.join("、")}` : ""}
+                    </Typography.Text>
+                  )}
+                </div>
+              ))}
             </Flex>
           )}
         </>
