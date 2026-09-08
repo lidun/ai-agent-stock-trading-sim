@@ -653,6 +653,23 @@ export function fetchKb(kbId: string): Promise<{ entry: KbEntry }> {
   return apiGet(`/api/kb/${encodeURIComponent(kbId)}`);
 }
 
+// ---------- 知识库状态机时间线（spec-06 §6.7：证据变化可读，数据源 audit_logs） ----------
+
+export interface KbTimelineEvent {
+  ts: string;
+  actor: string;
+  action: string;
+  result: string;
+  detail: string;
+}
+export interface KbTimeline {
+  events: KbTimelineEvent[];
+}
+
+export function fetchKbTimeline(kbId: string): Promise<KbTimeline> {
+  return apiGet(`/api/kb/${encodeURIComponent(kbId)}/timeline`);
+}
+
 export function listKbStats(kbId?: string): Promise<{ stats: KbStatsRow[] }> {
   const q = kbId ? `?kb_id=${encodeURIComponent(kbId)}` : "";
   return apiGet(`/api/kb/stats${q}`);

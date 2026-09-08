@@ -62,6 +62,14 @@ def kb_detail(kb_id: str, request: Request, session: SessionDep,
     return {"entry": ent}
 
 
+@router.get("/kb/{kb_id}/timeline")
+def kb_timeline(kb_id: str, request: Request, session: SessionDep):
+    try:
+        return {"events": kb.timeline(request.app.state, kb_id)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/kb")
 def kb_create(request: Request, session: SessionDep,
               payload: dict | None = Body(default=None)):

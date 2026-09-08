@@ -36,6 +36,8 @@ import {
   restoreKb,
   transitionKb,
   upsertKbStats,
+  fetchKbTimeline,
+  type KbTimelineEvent,
   type KbEntry,
   type KbStatus,
   type KbStatsRow,
@@ -62,6 +64,22 @@ const SEVERITY_LABEL: Record<string, string> = {
   high: "高危", mid: "中危", low: "低危",
 };
 const SEVERITY_COLOR: Record<string, string> = { high: "red", mid: "orange", low: "green" };
+
+function timelineMeta(action: string): { color: string; label: string } {
+  const a = action.startsWith("kb.transition.") ? action.slice("kb.transition.".length) : action;
+  const map: Record<string, { color: string; label: string }> = {
+    "kb.create": { color: "cyan", label: "入库（观察中）" },
+    "kb.update": { color: "default", label: "元信息修改" },
+    "kb.delete": { color: "volcano", label: "软删" },
+    "kb.restore": { color: "purple", label: "恢复" },
+    "kb.stats.upsert": { color: "geekblue", label: "统计写入" },
+    start_validation: { color: "blue", label: "启动验证" },
+    approve_valid: { color: "green", label: "确认有效" },
+    invalidate: { color: "red", label: "判定失效" },
+    seal: { color: "gold", label: "封存" },
+  };
+  return map[a] ?? map[action] ?? { color: "default", label: action };
+}
 
 function money(v: number | null | undefined, digits = 2): string {
   return v == null ? "—" : v.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
@@ -141,6 +159,8 @@ export default function KnowledgePage() {
 
   const [detail, setDetail] = useState<KbEntry | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [timeline, setTimeline] = useState<KbTimelineEvent[]>([]);
+  const [timelineLoading, setTimelineLoading] = useState(false);
   const [transOpen, setTransOpen] = useState<KbEntry | null>(null);
   const [transAction, setTransAction] = useState("");
   const [transNote, setTransNote] = useState("");
@@ -172,7 +192,9 @@ export default function KnowledgePage() {
 
   const openDetail = async (e: KbEntry) => {
     setDetailLoading(true);
+    setTimelineLoading(true);
     setDetail(e);
+    setTimeline([]);
     try {
       const r = await fetchKb(e.id);
       setDetail(r.entry);
@@ -180,6 +202,14 @@ export default function KnowledgePage() {
       message.error((err as Error).message ?? "加载详情失败");
     } finally {
       setDetailLoading(false);
+    }
+    try {
+      const tl = await fetchKbTimeline(e.id);
+      setTimeline(tl.events);
+    } catch (err) {
+      message.error((err as Error).message ?? "加载状态机时间线失败");
+    } finally {
+      setTimelineLoading(false);
     }
   };
 
@@ -605,6 +635,51 @@ export default function KnowledgePage() {
                 口径（spec-05 §3.3）：样本 n 来自 signal_registry 前瞻收益；最小样本 n≥30 才可晋升 valid；
                 stale-price 样本单列；被拦截（intercept）与破例（exception）分开统计；n_i=dispatch_n 供 UCB 排序。
               </Typography.Text>
+            </Card>
+
+            <Card
+              size="small"
+              title="状态机时间线（spec-06 §6.7 · audit_logs）"
+              extra={
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {timeline.length} 条事件
+                </Typography.Text>
+              }
+            >
+              {timelineLoading ? (
+                <Skeleton active paragraph={{ rows: 4 }} />
+              ) : timeline.length === 0 ? (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚无审计事件" />
+              ) : (
+                <Space direction="vertical" size={0} style={{ width: "100%" }}>
+                  {timeline.map((ev, idx) => {
+                    const m = timelineMeta(ev.action);
+                    return (
+                      <Flex key={`${ev.ts}-${idx}`} gap={8} style={{ padding: "4px 0" }}>
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                          <div style={{ width: 8, height: 8, borderRadius: "50%", marginTop: 4, background: m.color === "default" ? "#bfbfbf" : m.color }} />
+                          {idx < timeline.length - 1 && <div style={{ width: 1, flex: 1, background: "rgba(0,0,0,0.08)" }} />}
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <Flex justify="space-between" wrap gap={6}>
+                            <Space size={6} wrap>
+                              <Tag color={m.color} style={{ marginInlineEnd: 0 }}>{m.label}</Tag>
+                              {ev.result && <Typography.Text code style={{ fontSize: 11 }}>{ev.result}</Typography.Text>}
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>由 {ev.actor}</Typography.Text>
+                            </Space>
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>{fmtBeijingTime(ev.ts)}</Typography.Text>
+                          </Flex>
+                          {ev.detail && (
+                            <Typography.Paragraph style={{ margin: "2px 0 0", fontSize: 12 }} type="secondary">
+                              {ev.detail}
+                            </Typography.Paragraph>
+                          )}
+                        </div>
+                      </Flex>
+                    );
+                  })}
+                </Space>
+              )}
             </Card>
 
             <Flex justify="space-between">

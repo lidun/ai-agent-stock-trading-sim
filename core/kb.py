@@ -416,3 +416,31 @@ def list_stats(state, kb_id: str | None = None) -> list[dict]:
         rows = c.execute("SELECT * FROM kb_stats ORDER BY updated_ts DESC LIMIT 500"
                          ).fetchall()
     return [stats_row_to_dict(s) for s in rows]
+
+
+def timeline(state, kb_id: str) -> list[dict]:
+    """条目状态机时间线（spec-06 §6.7）：审计事件按时间正序。
+
+    数据源=audit_logs（kb.create / kb.update / kb.transition.* / kb.delete /
+    kb.restore / kb.stats.upsert），detail 已含 旧态→新态 与原因说明（spec-05 §3.2）。
+    """
+    c = state_conn(state)
+    row = c.execute("SELECT id FROM kb_entries WHERE id=?", (kb_id,)).fetchone()
+    if row is None:
+        raise LookupError(f"条目不存在：{kb_id}")
+    rows = c.execute(
+        "SELECT ts, actor, action, result, detail FROM audit_logs"
+        " WHERE object_type='kb_entries' AND object_id=?"
+        " ORDER BY ts ASC, id ASC",
+        (kb_id,),
+    ).fetchall()
+    return [
+        {
+            "ts": r["ts"],
+            "actor": r["actor"],
+            "action": r["action"],
+            "result": r["result"],
+            "detail": r["detail"],
+        }
+        for r in rows
+    ]
