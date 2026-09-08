@@ -903,6 +903,20 @@ export interface AgentCapabilityBindings {
   items: CapabilityBindingItem[];
 }
 
+export interface CapabilityBindingBrief {
+  binding_id: string;
+  bound_by: string;
+  bound_ts: string;
+  unbound_ts: string;
+  active: boolean;
+  agent_id: string;
+  agent_name: string;
+}
+export interface CapabilityDetail {
+  capability: CapabilityItem;
+  bindings: CapabilityBindingBrief[];
+}
+
 export function fetchCapabilities(
   params?: { type?: string; status?: string; keyword?: string },
 ): Promise<CapabilityCatalog> {
@@ -912,6 +926,10 @@ export function fetchCapabilities(
   if (params?.keyword) q.set("keyword", params.keyword);
   const qs = q.toString();
   return apiGet<CapabilityCatalog>(`/api/capabilities${qs ? `?${qs}` : ""}`);
+}
+
+export function fetchCapabilityDetail(id: string): Promise<CapabilityDetail> {
+  return apiGet<CapabilityDetail>(`/api/capabilities/${encodeURIComponent(id)}`);
 }
 
 export function fetchAgentCapabilityBindings(
