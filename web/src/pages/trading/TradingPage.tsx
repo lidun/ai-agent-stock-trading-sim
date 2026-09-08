@@ -9,6 +9,7 @@ import {
   Skeleton,
   Table,
   Tag,
+  Tooltip,
   Typography,
   theme as antTheme,
 } from "antd";
@@ -54,6 +55,61 @@ const VALIDITY_LABEL: Record<string, string> = {
   until: "至指定日",
   long: "长期有效",
 };
+
+/** spec-03 §7 quality 字典：基础集 ok/degraded/stale/stale-price/approx + spec-01 引擎扩展标记 */
+const QUALITY_META: Record<string, { label: string; color: string; desc: string }> = {
+  ok: { label: "正常", color: "green", desc: "数据质量正常（价差/根数核验通过）" },
+  degraded: {
+    label: "降级",
+    color: "orange",
+    desc: "收盘价对齐偏差>0.3% 或源劣化——quality 标记传播（结算/日报/信号注册表）",
+  },
+  close_minute_fill: {
+    label: "收盘分钟填充",
+    color: "blue",
+    desc: "L1 序列末分钟价填充成交（spec-01 引擎扩展标记，质量不覆盖已有标记）",
+  },
+  stale_close: { label: "停牌最近价结清", color: "default", desc: "缺当日价，以最近可得价 stale 结清（退市/停牌）" },
+  stale: { label: "延迟/缺窗口", color: "default", desc: "行情延迟或缺窗口（spec-03 基础集）" },
+  "stale-price": { label: "停牌最近价", color: "default", desc: "停牌/退市以最近价结清（spec-03 基础集）" },
+  approx: { label: "近似结算", color: "geekblue", desc: "降级档（L1/L2）近似口径结算（spec-03 基础集）" },
+  no_bench: { label: "无基准对照", color: "default", desc: "无基准指数可对照，结论按个股口径判定" },
+};
+
+/** settlement_log.granularity_used 档位字典（引擎 feed_kind：L0 实时 / L1 分钟 / L2 日线） */
+const GRAN_META: Record<string, { label: string; color: string; desc: string }> = {
+  l0: { label: "L0", color: "green", desc: "实时采样序列——权威撮合口径" },
+  l1: { label: "L1", color: "blue", desc: "分钟级近似——相邻分钟判定（L1 就绪含 240 根核验）" },
+  l2: { label: "L2", color: "orange", desc: "日线档——当日区间触达 + 官方收盘价成交" },
+};
+
+/** quality 字典标记渲染（含释义悬浮） */
+function QualityTag({ q }: { q: string }) {
+  if (!q) return <Typography.Text type="secondary">—</Typography.Text>;
+  const m = QUALITY_META[q];
+  if (!m) return <Tag>{q}</Tag>;
+  return (
+    <Tooltip title={`${m.label}：${m.desc}`}>
+      <Tag color={m.color} style={{ marginInlineEnd: 0 }}>
+        {m.label}
+      </Tag>
+    </Tooltip>
+  );
+}
+
+/** 撮合档位渲染（带语义悬浮） */
+function TierTag({ tier }: { tier: string }) {
+  const key = (tier || "").toLowerCase();
+  const m = GRAN_META[key];
+  if (!m) return <Tag>{tier.toUpperCase()}</Tag>;
+  return (
+    <Tooltip title={`${m.label}：${m.desc}`}>
+      <Tag color={m.color} style={{ marginInlineEnd: 0 }}>
+        {m.label}
+      </Tag>
+    </Tooltip>
+  );
+}
 
 function price(v: string): string {
   return Number(v || "0").toLocaleString("zh-CN", {
@@ -132,6 +188,21 @@ export default function TradingPage() {
     [settlements, acctFilter],
   );
 
+  const settleQuality = useMemo(() => {
+    const m = new Map<string, { markers: Set<string>; degradedSymbols: string[] }>();
+    trades.forEach((t) => {
+      if (!t.quality) return;
+      const key = `${t.account_id}|${t.settle_date}`;
+      const v = m.get(key) ?? { markers: new Set<string>(), degradedSymbols: [] };
+      v.markers.add(t.quality);
+      if (t.quality === "degraded" && !v.degradedSymbols.includes(t.symbol)) {
+        v.degradedSymbols.push(t.symbol);
+      }
+      m.set(key, v);
+    });
+    return m;
+  }, [trades]);
+
   const holdingColumns: ColumnsType<HoldingInfo> = [
     { title: "账户", dataIndex: "account_id", width: 120, render: (id: string) => accountName.get(id) ?? id },
     { title: "代码", dataIndex: "symbol", width: 100, render: (s: string) => <Typography.Text code>{s}</Typography.Text> },
@@ -167,13 +238,37 @@ export default function TradingPage() {
       width: 130,
       render: (v: string, r) => (v === "until" ? `至 ${r.valid_until}` : VALIDITY_LABEL[v] ?? v),
     },
-    { title: "理由", dataIndex: "reason", ellipsis: true, render: (v: string) => v || "—" },
+    {
+      title: "理由 / 状态说明",
+      dataIndex: "reason",
+      render: (v: string, r) => {
+        const extra = r.invalid_reason
+          ? `无效原因：${r.invalid_reason}`
+          : r.insufficient_events > 0
+            ? `资金不足事件 ×${r.insufficient_events}（保持生效）`
+            : "";
+        return (
+          <Flex vertical gap={2}>
+            <Typography.Text ellipsis={{ tooltip: v || undefined }} style={{ maxWidth: 200 }}>
+              {v || "—"}
+            </Typography.Text>
+            {extra && <Typography.Text type="secondary" style={{ fontSize: 12 }}>{extra}</Typography.Text>}
+          </Flex>
+        );
+      },
+    },
     { title: "创建时间", dataIndex: "created_at", width: 150, render: (v: string) => fmtBeijingTime(v) },
   ];
 
   const tradeColumns: ColumnsType<TradeInfo> = [
     { title: "账户", dataIndex: "account_id", width: 120, render: (id: string) => accountName.get(id) ?? id },
     { title: "代码", dataIndex: "symbol", width: 90, render: (s: string) => <Typography.Text code>{s}</Typography.Text> },
+    {
+      title: "档位",
+      dataIndex: "basis_used",
+      width: 70,
+      render: (b: string) => (b ? <TierTag tier={b} /> : <Typography.Text type="secondary">—</Typography.Text>),
+    },
     {
       title: "方向",
       dataIndex: "side",
@@ -191,11 +286,10 @@ export default function TradingPage() {
     },
     { title: "费用", dataIndex: "fee_total", width: 110, align: "right", render: (v: string) => money2(v) },
     {
-      title: "质量",
+      title: "质量标记",
       dataIndex: "quality",
-      width: 90,
-      render: (q: string) =>
-        q ? <Tag color="orange">{q === "degraded" ? "降级" : q}</Tag> : <Typography.Text type="secondary">—</Typography.Text>,
+      width: 110,
+      render: (q: string) => <QualityTag q={q} />,
     },
     { title: "结算日", dataIndex: "settle_date", width: 110 },
     { title: "成交时刻", dataIndex: "trade_time", render: (v: string) => v },
@@ -211,14 +305,42 @@ export default function TradingPage() {
         Object.entries(g).length ? (
           <Flex gap={4} wrap>
             {Object.entries(g).map(([sym, tier]) => (
-              <Tag key={sym} style={{ marginInlineEnd: 0 }}>
-                {sym}: {tier.toUpperCase()}
-              </Tag>
+              <Flex key={sym} gap={4} align="center" style={{ marginInlineEnd: 4 }}>
+                <Typography.Text code style={{ fontSize: 12 }}>
+                  {sym}
+                </Typography.Text>
+                <TierTag tier={tier} />
+              </Flex>
             ))}
           </Flex>
         ) : (
           <Typography.Text type="secondary">—</Typography.Text>
         ),
+    },
+    {
+      title: "质量标记 / 降级清单",
+      key: "quality",
+      width: 220,
+      render: (_, r) => {
+        const q = settleQuality.get(`${r.account_id}|${r.trade_date}`);
+        if (!q || q.markers.size === 0) return <Typography.Text type="secondary">—</Typography.Text>;
+        const degradedLabel =
+          q.degradedSymbols.length > 0 ? (
+            <Tooltip title={q.degradedSymbols.join("、")}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                降级票 {q.degradedSymbols.length} 只
+              </Typography.Text>
+            </Tooltip>
+          ) : null;
+        return (
+          <Flex gap={4} align="center">
+            {[...q.markers].map((mk) => (
+              <QualityTag key={mk} q={mk} />
+            ))}
+            {degradedLabel}
+          </Flex>
+        );
+      },
     },
     {
       title: "状态",
@@ -262,7 +384,7 @@ export default function TradingPage() {
             交易中心
           </Typography.Title>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            跨 Agent 持仓/条件单/成交/结算日志只读视图（引擎写入后呈现）；回放可视化见 spec-06 §6.5（P3）
+            跨 Agent 持仓/条件单/成交/结算日志只读视图；quality 标记与档位按 spec-03 §7 字典渲染；回放可视化见 spec-06 §6.5（P3）
           </Typography.Text>
         </div>
         <Flex gap={8} align="center">
@@ -356,7 +478,7 @@ export default function TradingPage() {
               />
             ),
           }}
-          scroll={{ x: 1100 }}
+          scroll={{ x: 1220 }}
         />
       </Card>
 
@@ -375,8 +497,20 @@ export default function TradingPage() {
               />
             ),
           }}
-          scroll={{ x: 1000 }}
+          scroll={{ x: 1280 }}
         />
+        <Flex gap={10} align="center" wrap style={{ marginTop: 10 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            数据质量字典（spec-03 §7 基础集 + spec-01 引擎扩展；悬停看释义）：
+          </Typography.Text>
+          <QualityTag q="ok" />
+          <QualityTag q="degraded" />
+          <QualityTag q="close_minute_fill" />
+          <QualityTag q="stale_close" />
+          <TierTag tier="l0" />
+          <TierTag tier="l1" />
+          <TierTag tier="l2" />
+        </Flex>
       </Card>
     </div>
   );
