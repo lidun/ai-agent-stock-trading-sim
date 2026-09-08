@@ -4,6 +4,7 @@ import SettingsPage from "../pages/Settings";
 import ChatPage from "../pages/chat/ChatPage";
 import AgentsPage from "../pages/agents/AgentsPage";
 import ReportsPage from "../pages/reports/ReportsPage";
+import StrategyDetailPage from "../pages/strategies/StrategyDetail";
 import ControlCenterPage from "../pages/control/ControlCenter";
 import TradingPage from "../pages/trading/TradingPage";
 import ApprovalCenterPage from "../pages/approvals/ApprovalCenter";
@@ -22,6 +23,8 @@ export const protectedChildren: RouteObject[] = [
         <AgentsPage />
       ) : n.key === "control" ? (
         <ControlCenterPage />
+      ) : n.key === "strategies" ? (
+        <StrategyDetailPage />
       ) : n.key === "trading" ? (
         <TradingPage />
       ) : n.key === "reports" ? (
