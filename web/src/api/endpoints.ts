@@ -827,11 +827,20 @@ export interface CharterFull extends CharterVersionSummary {
   core_belief: string;
   layers: Record<string, unknown>;
 }
+export interface CapabilityPack {
+  name: string;
+  type: "skill" | "tool" | "mcp" | "datasource";
+  version: string;
+  description: string;
+  bound_by: string;
+  bound_ts: string;
+}
 export interface StrategyProfile {
   agent_id: string;
   active: CharterFull | null;
   versions: CharterVersionSummary[];
   has_capability_packs: boolean;
+  capability_packs: CapabilityPack[];
 }
 export interface CharterVersionDetail {
   agent_id: string;
@@ -848,6 +857,69 @@ export function fetchCharterVersion(
 ): Promise<CharterVersionDetail> {
   return apiGet<CharterVersionDetail>(
     `/api/agents/${encodeURIComponent(agentId)}/strategy-profile/versions/${encodeURIComponent(versionNo)}`,
+  );
+}
+
+// ---------- 能力配置中心只读（spec-05 §2 统一域；能力市场/绑定展示消费侧） ----------
+
+export interface CapabilityItem {
+  id: string;
+  name: string;
+  type: "skill" | "tool" | "mcp" | "datasource";
+  version: string;
+  description: string;
+  maintainer: string;
+  source_type: "opensource" | "api" | "selfmade";
+  source_ref: string;
+  sandbox_status: "pending" | "passed" | "failed";
+  sandbox_report_ref: string;
+  metadata: Record<string, unknown>;
+  status: "active" | "deprecated";
+  active_bindings: number;
+  created_ts: string;
+  updated_ts: string;
+}
+export interface CapabilityCatalog {
+  total: number;
+  types: string[];
+  items: CapabilityItem[];
+}
+export interface CapabilityBindingItem {
+  binding_id: string;
+  capability_id: string;
+  name: string;
+  type: string;
+  version: string;
+  description: string;
+  capability_status: string;
+  sandbox_status: string;
+  bound_by: string;
+  bound_ts: string;
+  unbound_ts: string;
+}
+export interface AgentCapabilityBindings {
+  agent_id: string;
+  total: number;
+  items: CapabilityBindingItem[];
+}
+
+export function fetchCapabilities(
+  params?: { type?: string; status?: string; keyword?: string },
+): Promise<CapabilityCatalog> {
+  const q = new URLSearchParams();
+  if (params?.type) q.set("type", params.type);
+  if (params?.status) q.set("status", params.status);
+  if (params?.keyword) q.set("keyword", params.keyword);
+  const qs = q.toString();
+  return apiGet<CapabilityCatalog>(`/api/capabilities${qs ? `?${qs}` : ""}`);
+}
+
+export function fetchAgentCapabilityBindings(
+  agentId: string,
+  includeUnbound = false,
+): Promise<AgentCapabilityBindings> {
+  return apiGet<AgentCapabilityBindings>(
+    `/api/agents/${encodeURIComponent(agentId)}/capability-bindings?include_unbound=${includeUnbound}`,
   );
 }
 

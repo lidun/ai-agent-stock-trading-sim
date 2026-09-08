@@ -27,6 +27,7 @@ from core.report_routes import router as report_router
 from core.security import InstanceLock
 from core.strategy_profile_routes import router as strategy_profile_router
 from core.strategy_memory_routes import router as strategy_memory_router
+from core.capability_center_routes import router as capability_center_router
 
 log = logging.getLogger("core")
 
@@ -104,6 +105,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(strategy_profile_router)
     app.include_router(exit_tracking_router)
     app.include_router(strategy_memory_router)
+    app.include_router(capability_center_router)
 
     if settings.eod_auto_settle:
         # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点

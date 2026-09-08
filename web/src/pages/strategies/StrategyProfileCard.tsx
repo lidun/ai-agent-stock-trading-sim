@@ -144,8 +144,17 @@ export default function StrategyProfileCard({ profile, loading }: Props) {
             {JSON.stringify(active.layers ?? {}, null, 2)}
           </pre>
           <Flex wrap gap={8} style={{ marginBottom: 8 }}>
-            {!profile.has_capability_packs && (
-              <Tag color="default">能力包：待 spec-05 §5 配置中心绑定</Tag>
+            {profile.has_capability_packs ? (
+              <>
+                <Tag color="green">能力包：已绑定 {profile.capability_packs.length} 项</Tag>
+                {profile.capability_packs.map((cp) => (
+                  <Tag key={`${cp.name}@${cp.version}`} color="blue">
+                    {cp.name}@{cp.version}
+                  </Tag>
+                ))}
+              </>
+            ) : (
+              <Tag color="default">能力包：待 spec-05 §2 配置中心绑定</Tag>
             )}
           </Flex>
           {profile.versions.length > 1 && (

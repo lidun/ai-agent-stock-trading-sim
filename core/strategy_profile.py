@@ -84,11 +84,26 @@ def profile(state, agent_id: str) -> dict:
     ).fetchall()
     versions = [_row_to_summary(r) for r in rows]
     active = next((v for v in versions if v["active"]), None)
+    from core import capability_center  # noqa: PLC0415
+    bound = capability_center.agent_bindings(state, agent_id)
+    capability_packs = [
+        {
+            "name": b["name"],
+            "type": b["type"],
+            "version": b["version"],
+            "description": b["description"],
+            "bound_by": b["bound_by"],
+            "bound_ts": b["bound_ts"],
+        }
+        for b in bound["items"]
+        if b["capability_status"] == "active"
+    ]
     return {
         "agent_id": agent_id,
         "active": _full_row(state, agent_id, active["version_no"]) if active else None,
         "versions": versions,
-        "has_capability_packs": False,  # spec-05 §5 能力配置中心未落地
+        "has_capability_packs": bool(capability_packs),
+        "capability_packs": capability_packs,  # spec-05 §2 绑定清单（active 项）
     }
 
 

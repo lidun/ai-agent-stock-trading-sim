@@ -703,6 +703,54 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON memory_entries(agent_id, mem_type, ts);
         """,
     ),
+    (
+        22,
+        """
+        -- spec-05 §2 能力配置中心统一域（能力模型 + 绑定清单）。
+        -- 只读域切片：注册/绑定/解绑的写入口语义属管理 Agent + spec-04 审批流
+        -- （spec-05 §2.3 申请-下发闭环），本片仅建 schema + 受控 seed（测试用），
+        -- 公开写路由不开放。绑定=能力行(capability_id,version)×agent 一条，
+        -- unbound_ts 留痕解绑/回滚（spec-05 §2.4）；同 (capability_id,version,agent)
+        -- 只允许一条在绑。
+        CREATE TABLE IF NOT EXISTS capabilities (
+            id                 TEXT PRIMARY KEY,
+            name               TEXT NOT NULL,
+            capability_type    TEXT NOT NULL
+                               CHECK (capability_type IN ('skill', 'tool', 'mcp', 'datasource')),
+            version            TEXT NOT NULL,
+            description        TEXT NOT NULL DEFAULT '',
+            maintainer         TEXT NOT NULL DEFAULT '',
+            source_type        TEXT NOT NULL
+                               CHECK (source_type IN ('opensource', 'api', 'selfmade')),
+            source_ref         TEXT NOT NULL DEFAULT '',
+            sandbox_status     TEXT NOT NULL DEFAULT 'pending'
+                               CHECK (sandbox_status IN ('pending', 'passed', 'failed')),
+            sandbox_report_ref TEXT NOT NULL DEFAULT '',
+            metadata           TEXT NOT NULL DEFAULT '{}',
+            status             TEXT NOT NULL DEFAULT 'active'
+                               CHECK (status IN ('active', 'deprecated')),
+            created_ts         TEXT NOT NULL,
+            updated_ts         TEXT NOT NULL,
+            UNIQUE (name, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cap_type_status ON capabilities(capability_type, status);
+
+        CREATE TABLE IF NOT EXISTS capability_bindings (
+            id            TEXT PRIMARY KEY,
+            capability_id TEXT NOT NULL REFERENCES capabilities(id),
+            version       TEXT NOT NULL,
+            agent_id      TEXT NOT NULL REFERENCES agents(id),
+            bound_by      TEXT NOT NULL DEFAULT '',
+            bound_ts      TEXT NOT NULL,
+            unbound_ts    TEXT NOT NULL DEFAULT '',
+            created_ts    TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_cap_binding_active
+            ON capability_bindings(capability_id, version, agent_id) WHERE unbound_ts = '';
+        CREATE INDEX IF NOT EXISTS idx_cap_binding_agent
+            ON capability_bindings(agent_id, unbound_ts);
+        """,
+    ),
 ]
 
 
