@@ -32,10 +32,11 @@ Entries discovered by the Agent during task execution should follow this format:
 ## Entries
 
 [User Instruction Summary]
-- Date: 2026-09-06
-- Context: 完成多个开发切片后，用户补充推进方式约定
+- Date: 2026-09-06（2026-09-08 演进记忆/能力域切片后用户重申并明确：继续）
+- Context: 完成多个开发切片后，用户补充推进方式约定；本次再强调"以后不用问先做哪个，按你的建议直接做"
 - Instructions:
   - 后续切片推进时无需询问用户"先做哪个"；由 Agent 自行按规格依赖与风险排序决定，并持续自主推进直至整个项目完成。
+  - 每完成一个切片只需用一段话汇报交付与验证结果，可顺带列出后续候选但不提供选择菜单。
 
 [User Instruction Summary]
 - Date: 2026-09-06
