@@ -648,6 +648,32 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_kb_stats_kb ON kb_stats(kb_id);
         """,
     ),
+    (
+        20,
+        """
+        -- 策略章程版本链（spec-05 §4.1 语义受控：#21 双层结构；spec-02 §9 版本不变量）
+        -- charter 语义：核心理念不落 config、按版本快照存储；locked=1 表示核心理念已锁定，
+        -- 变更需用户授权（写入方=策略发布/管理 Agent；Web 详情只读，写入口后置）。
+        -- checkpoint 提交校验 charter_hash 未变（spec-05 §4.1 语义受控执行机制）。
+        CREATE TABLE IF NOT EXISTS strategy_charter_versions (
+            id           TEXT PRIMARY KEY,
+            agent_id     TEXT NOT NULL REFERENCES agents(id),
+            version_no   TEXT NOT NULL,
+            active       INTEGER NOT NULL DEFAULT 0,
+            core_belief  TEXT NOT NULL DEFAULT '',
+            layers       TEXT NOT NULL DEFAULT '{}',
+            locked       INTEGER NOT NULL DEFAULT 1,
+            charter_hash TEXT NOT NULL DEFAULT '',
+            note         TEXT NOT NULL DEFAULT '',
+            created_ts   TEXT NOT NULL,
+            UNIQUE (agent_id, version_no)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_charter_active
+            ON strategy_charter_versions(agent_id) WHERE active = 1;
+        CREATE INDEX IF NOT EXISTS idx_charter_agent_ts
+            ON strategy_charter_versions(agent_id, created_ts);
+        """,
+    ),
 ]
 
 

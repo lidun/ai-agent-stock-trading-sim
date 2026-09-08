@@ -31,6 +31,7 @@ import {
   fetchEvolution,
   fetchReportVersions,
   fetchStrategyMetrics,
+  fetchStrategyProfile,
   getAccount,
   listAccountConditionOrders,
   listAccountHoldings,
@@ -50,12 +51,14 @@ import {
   type ReportTimelineEntry,
   type StrategyEvolution,
   type StrategyMetrics,
+  type StrategyProfile,
   type TradeInfo,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
 import MetricSummaryCard from "./MetricSummaryCard";
 import EquityCurveCard from "./EquityCurveCard";
 import StrategyEvolutionCard from "./StrategyEvolutionCard";
+import StrategyProfileCard from "./StrategyProfileCard";
 
 const OT_LABEL: Record<string, string> = {
   buy: "买入",
@@ -118,6 +121,7 @@ export default function StrategyDetailPage() {
   const [metrics, setMetrics] = useState<StrategyMetrics | null>(null);
   const [curve, setCurve] = useState<EquityCurve | null>(null);
   const [evolution, setEvolution] = useState<StrategyEvolution | null>(null);
+  const [profile, setProfile] = useState<StrategyProfile | null>(null);
   const [range, setRange] = useState<CurveRange>("all");
   const [p2Loading, setP2Loading] = useState(true);
 
@@ -210,11 +214,13 @@ export default function StrategyDetailPage() {
       fetchStrategyMetrics(selectedId),
       fetchEquityCurve(selectedId, range),
       fetchEvolution(selectedId),
-    ]).then(([m, c, e]) => {
+      fetchStrategyProfile(selectedId),
+    ]).then(([m, c, e, sp]) => {
       if (!active) return;
       setMetrics(m.status === "fulfilled" ? m.value : null);
       setCurve(c.status === "fulfilled" ? c.value : null);
       setEvolution(e.status === "fulfilled" ? e.value : null);
+      setProfile(sp.status === "fulfilled" ? sp.value : null);
       if (m.status === "rejected" && c.status === "rejected" && e.status === "rejected") {
         console.warn("P2 数据源不可用（spec-06 §6.4），等 EOD 结算产出后再现。");
       }
@@ -499,6 +505,8 @@ export default function StrategyDetailPage() {
             />
           )}
 
+          <StrategyProfileCard profile={profile} loading={p2Loading} />
+
           <Card size="small" style={{ marginBottom: 12 }} title={`模拟账户 · ${agentInfo.name}`}>
             <Flex gap={24} wrap align="center" style={{ marginBottom: 4 }}>
               <div>
@@ -661,7 +669,7 @@ export default function StrategyDetailPage() {
 
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
             关联视图已就位：持仓每行悬停/安全感标签可查该票已挂卖出保护单与最近结算日成交（spec-06 §6.4 B7）。
-            P2+ 余项：策略理念 / 能力包（待 spec-02 memory_entries(type=strategy) 后端落地）、卖出跟踪列表（P3 文字+表格，spec-06 #15）。
+            策略理念区块只读已落地（spec-05 §4.1）；P2+ 余项：能力包绑定（spec-05 §5 配置中心）、章程写入口（理念锁定变更需用户授权）、演进记忆（spec-02 memory_entries type=strategy）、卖出跟踪列表（P3 文字+表格，spec-06 #15）。
           </Typography.Paragraph>
         </>
       ) : null}

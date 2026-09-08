@@ -812,3 +812,41 @@ export function fetchStrategyMetrics(agentId: string): Promise<StrategyMetrics> 
 export function fetchEvolution(agentId: string): Promise<StrategyEvolution> {
   return apiGet<StrategyEvolution>(`/api/agents/${encodeURIComponent(agentId)}/evolution`);
 }
+
+// ---------- 策略理念 · 章程只读（spec-06 §6.4 理念区块；spec-05 §4.1 双层结构） ----------
+
+export interface CharterVersionSummary {
+  version_no: string;
+  active: boolean;
+  locked: boolean;
+  charter_hash: string;
+  note: string;
+  created_ts: string;
+}
+export interface CharterFull extends CharterVersionSummary {
+  core_belief: string;
+  layers: Record<string, unknown>;
+}
+export interface StrategyProfile {
+  agent_id: string;
+  active: CharterFull | null;
+  versions: CharterVersionSummary[];
+  has_capability_packs: boolean;
+}
+export interface CharterVersionDetail {
+  agent_id: string;
+  version: CharterFull;
+}
+
+export function fetchStrategyProfile(agentId: string): Promise<StrategyProfile> {
+  return apiGet<StrategyProfile>(`/api/agents/${encodeURIComponent(agentId)}/strategy-profile`);
+}
+
+export function fetchCharterVersion(
+  agentId: string,
+  versionNo: string,
+): Promise<CharterVersionDetail> {
+  return apiGet<CharterVersionDetail>(
+    `/api/agents/${encodeURIComponent(agentId)}/strategy-profile/versions/${encodeURIComponent(versionNo)}`,
+  );
+}
