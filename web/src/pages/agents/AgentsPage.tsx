@@ -28,6 +28,7 @@ import {
   LoadingOutlined,
   MessageOutlined,
   PauseCircleOutlined,
+  ProfileOutlined,
   RobotOutlined,
   StopOutlined,
 } from "@ant-design/icons";
@@ -50,6 +51,7 @@ import {
 } from "../../api/endpoints";
 import { useConnection } from "../../connection";
 import { daySeparator, fmtBeijing, fmtBeijingTime } from "../../utils/time";
+import AgentOverviewDrawer from "./AgentOverviewDrawer";
 import TrialAcceptance from "./TrialAcceptance";
 
 const ROLE_LABEL: Record<string, string> = {
@@ -120,6 +122,7 @@ export default function AgentsPage() {
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [trialAgent, setTrialAgent] = useState<AgentInfo | null>(null);
+  const [overviewAgent, setOverviewAgent] = useState<AgentInfo | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -593,6 +596,18 @@ export default function AgentsPage() {
                     </Typography.Text>
                   </div>
                   <Space size={6}>
+                    <Tooltip title="概览：章程版本链 + 已下发能力包聚合（spec-05 §4.1/§5 只读）">
+                      <Button
+                        size="small"
+                        icon={<ProfileOutlined />}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setOverviewAgent(agent);
+                        }}
+                      >
+                        概览
+                      </Button>
+                    </Tooltip>
                     {controlMenu && (
                       <Dropdown
                         trigger={["click"]}
@@ -664,6 +679,8 @@ export default function AgentsPage() {
           }}
         />
       )}
+
+      <AgentOverviewDrawer agent={overviewAgent} onClose={() => setOverviewAgent(null)} />
 
       <Modal
         title={`冻结证券 · ${frozenAgent?.name ?? ""}（冻结买入保留卖出）`}
