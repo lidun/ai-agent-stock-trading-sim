@@ -38,6 +38,7 @@ import {
   controlAgent,
   emergencySellAll,
   freezeSecurity,
+  fetchValidationWindows,
   listAccounts,
   listAgents,
   listConversations,
@@ -48,6 +49,7 @@ import {
   type ConversationInfo,
   type ControlOp,
   type FrozenSecurity,
+  type ValidationWindow,
 } from "../../api/endpoints";
 import { useConnection } from "../../connection";
 import { daySeparator, fmtBeijing, fmtBeijingTime } from "../../utils/time";
@@ -74,6 +76,29 @@ const GRAN_LABEL: Record<string, string> = {
   intraday_5m: "盘中撮合(5m)",
   intraday_1m: "盘中撮合(1m)",
 };
+
+const DECISION_LABEL: Record<string, string> = {
+  activate: "已晋升现役",
+  rollback: "否决候选",
+  sealed: "封存留证",
+};
+
+function windowTagLines(items: ValidationWindow[]): string {
+  const running = items.filter((w) => w.status === "in_progress");
+  const lines = running.map(
+    (w) =>
+      `v${w.version_no} 验证中：会话 ${w.sessions_done}/${w.window_days} 日 · 成交样本 ${w.trade_samples}/${w.trade_target}`,
+  );
+  items
+    .filter((w) => w.status === "done")
+    .slice(0, 4)
+    .forEach((w) => {
+      const d = w.decision ? DECISION_LABEL[w.decision] ?? w.decision : "已收口";
+      const reason = (w.decision_reason || "").slice(0, 40);
+      lines.push(`v${w.version_no} ${d}：${reason || "（未记录理由）"}`);
+    });
+  return lines.join("\n") || "暂无窗口留证";
+}
 
 /** 盈亏着色：A 股红涨绿跌（spec-06 §5.2，涨红跌绿全局口径） */
 function pnlColor(v: number): string {
@@ -120,20 +145,34 @@ export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [convs, setConvs] = useState<ConversationInfo[]>([]);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
+  const [windowsByAgent, setWindowsByAgent] = useState<Record<string, ValidationWindow[]>>({});
   const [loading, setLoading] = useState(true);
   const [trialAgent, setTrialAgent] = useState<AgentInfo | null>(null);
   const [overviewAgent, setOverviewAgent] = useState<AgentInfo | null>(null);
 
   const reload = useCallback(async () => {
     try {
-      const [{ agents: a }, { conversations: c }, { accounts: ac }] = await Promise.all([
-        listAgents(),
+      const { agents: a } = await listAgents();
+      setAgents(a);
+      const [{ conversations: c }, { accounts: ac }] = await Promise.all([
         listConversations(),
         listAccounts(),
       ]);
-      setAgents(a);
       setConvs(c);
       setAccounts(ac);
+      // 策略 Agent 的验证窗台账（并行拉取，单窗失败静默降级——台账为增量角标数据源）
+      const strat = a.filter((ag) => ag.role === "strategy");
+      const entries = await Promise.all(
+        strat.map(async (ag) => {
+          try {
+            const v = await fetchValidationWindows(ag.id);
+            return [ag.id, v.items] as const;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      setWindowsByAgent(Object.fromEntries(entries.filter((e): e is readonly [string, ValidationWindow[]] => e !== null)));
     } catch (e) {
       message.error((e as Error).message ?? "加载失败");
     } finally {
@@ -515,6 +554,20 @@ export default function AgentsPage() {
                           处理中
                         </Tag>
                       )}
+                      {(() => {
+                        const witems = windowsByAgent[agent.id] ?? [];
+                        if (witems.length === 0) return null;
+                        const running = witems.filter((w) => w.status === "in_progress");
+                        const tag =
+                          running.length > 0 ? (
+                            <Tag color="blue" icon={<ExperimentOutlined />} style={{ marginInlineEnd: 0 }}>
+                              {running.length} 窗验证中
+                            </Tag>
+                          ) : (
+                            <Tag style={{ marginInlineEnd: 0 }}>窗 ×{witems.length}</Tag>
+                          );
+                        return <Tooltip title={windowTagLines(witems)}>{tag}</Tooltip>;
+                      })()}
                     </div>
                     <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
                       {ROLE_LABEL[agent.role] ?? agent.role}
