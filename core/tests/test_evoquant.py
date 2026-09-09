@@ -134,6 +134,13 @@ def test_window_activate_rollback_sealed_real_engine(authed_client):
     assert accountstore.get_account(st, a1)["status"] == "archived"
     main = accountstore.get_account(st, DEMO)
     assert main["active_version_no"] == "v1"
+    # activate 演进记忆正文由 EVOQUANT 写入窗口收口证据（而非通用占位文案）
+    mem1 = strategy_memory.list_strategy_memory(st, DEMO)["items"]
+    act1 = [m for m in mem1 if m["version_no"] == "v1"
+            and m["source"].startswith("engine:activate")]
+    assert act1 and "窗口验证收口(activate)" in act1[0]["body"]
+    assert "期望值(含费)" in act1[0]["body"] and "成交样本 " in act1[0]["body"]
+    assert "违规 0" in act1[0]["body"] and "熔断 0" in act1[0]["body"]
 
     # ---- 第 2 轮：v2 通过 → v1 自动降为 validated（回退候选）
     o2 = evoquant.open_validation(st, DEMO, version_no="v2", config=CFG,

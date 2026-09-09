@@ -168,8 +168,12 @@ def checkpoint(state, agent_id: str, *, version_no: str,
 
 
 def activate(state, agent_id: str, version_no: str, *,
-             activated_by: str = "manager") -> dict:
-    """晋升全仓：候选（draft/validated）→ active，旧 active 降 validated（回退候选）。"""
+             activated_by: str = "manager",
+             event_body: str | None = None) -> dict:
+    """晋升全仓：候选（draft/validated）→ active，旧 active 降 validated（回退候选）。
+
+    event_body：EVOQUANT 调用方可将窗口收口证据写入演进记忆正文；默认保留
+    通用文案（幂等 dedup=engine:activate:<version>，重复判定不覆盖首次留证）。"""
     _require_agent(state, agent_id)
     if activated_by not in CREATORS:
         raise ValueError(f"activated_by 须为 {'/'.join(CREATORS)} 之一")
@@ -203,7 +207,7 @@ def activate(state, agent_id: str, version_no: str, *,
                detail=f"{agent_id} 晋升 {version_no}（validated_on={now}）")
     _record_event(
         state, agent_id, version_no, event="activate",
-        body=f"验证通过：版本 {version_no} 晋升全仓（validated_on）。")
+        body=event_body or f"验证通过：版本 {version_no} 晋升全仓（validated_on）。")
     fresh = get_version(state, agent_id, version_no)
     return fresh
 

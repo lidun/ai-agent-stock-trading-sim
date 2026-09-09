@@ -319,7 +319,11 @@ def decide(state, w: dict, *, trade_date: str) -> dict:
     rejected = False
     if decision == "activate":
         fresh = sv.activate(state, w["agent_id"], w["version_no"],
-                            activated_by="strategy_agent")
+                            activated_by="strategy_agent",
+                            event_body=(
+                                f"窗口验证收口(activate)：{reason}。"
+                                f"会话 {sessions}/{w['window_days']}、成交样本 {samples}；"
+                                f"违规 {int(viol)}、熔断 {int(fuse)}。"))
         activated = fresh["version_no"]
     elif decision == "rollback":
         # 候选（draft）验证失败 → 否决候选本身：status=rolled_back + failure_reason，
