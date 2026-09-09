@@ -1,10 +1,11 @@
-import { Card, Empty, Flex, Skeleton, Table, Tag, Typography } from "antd";
+import { Card, Empty, Flex, Skeleton, Table, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import type { StrategyVersion, StrategyVersionList } from "../../api/endpoints";
+import type { StrategyVersion, StrategyVersionList, ValidationWindow, ValidationWindowList } from "../../api/endpoints";
 import { fmtBeijing } from "../../utils/time";
 
 interface Props {
   versions: StrategyVersionList | null;
+  windows: ValidationWindowList | null;
   loading: boolean;
 }
 
@@ -14,6 +15,28 @@ const STATUS_META: Record<string, { color: string; text: string }> = {
   draft: { color: "gold", text: "draft 验证中" },
   rolled_back: { color: "red", text: "rolled_back" },
 };
+
+const DECISION_META: Record<string, { color: string; text: string }> = {
+  activate: { color: "green", text: "晋升现役" },
+  rollback: { color: "red", text: "否决候选" },
+  sealed: { color: "default", text: "封存留证" },
+};
+
+function WindowVerdict({ w }: { w: ValidationWindow }) {
+  if (w.status === "in_progress") {
+    return (
+      <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+        验证窗在跑 · {w.sessions_done}/{w.window_days} 会话
+      </Tag>
+    );
+  }
+  const m = DECISION_META[w.decision] ?? { color: "default", text: w.decision || "收口" };
+  return (
+    <Tooltip title={w.decision_reason || undefined}>
+      <Tag color={m.color} style={{ marginInlineEnd: 0 }}>{m.text}</Tag>
+    </Tooltip>
+  );
+}
 
 function StatusTag({ status }: { status: string }) {
   const m = STATUS_META[status] ?? { color: "default", text: status };
@@ -108,7 +131,9 @@ const columns: ColumnsType<StrategyVersion> = [
   },
 ];
 
-export default function StrategyVersionsCard({ versions, loading }: Props) {
+export default function StrategyVersionsCard({ versions, windows, loading }: Props) {
+  const winByVer = new Map<string, ValidationWindow>();
+  (windows?.items ?? []).forEach((w) => winByVer.set(w.version_no, w));
   return (
     <Card
       size="small"
@@ -137,10 +162,19 @@ export default function StrategyVersionsCard({ versions, loading }: Props) {
           <Table<StrategyVersion>
             rowKey="id"
             size="small"
-            columns={columns}
+            columns={[
+              ...columns,
+              {
+                title: "验证窗判定", key: "win", width: 170,
+                render: (_, v) => {
+                  const w = winByVer.get(v.version_no);
+                  return w ? <WindowVerdict w={w} /> : <Typography.Text type="secondary">—</Typography.Text>;
+                },
+              },
+            ]}
             dataSource={versions.items}
             pagination={false}
-            scroll={{ x: 980 }}
+            scroll={{ x: 1150 }}
             expandable={{
               expandedRowRender: (v) => (
                 <Flex gap={16} wrap>

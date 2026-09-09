@@ -720,7 +720,7 @@ export default function StrategyDetailPage() {
             loading={p2Loading}
           />
 
-          <StrategyVersionsCard versions={versions} loading={p2Loading} />
+          <StrategyVersionsCard versions={versions} windows={windows} loading={p2Loading} />
 
           <ValidationWindowsCard windows={windows} loading={p2Loading} />
 
