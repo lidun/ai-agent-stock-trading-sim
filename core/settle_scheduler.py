@@ -175,6 +175,23 @@ class EodSettleTrigger:
             log.exception("验证窗推进失败 trade_date=%s", trade_date)
             return []
 
+    def _window_pending(self) -> bool:
+        """是否存在仍需推进的在跑验证窗（其验证账户未归档）。
+
+        结算会话日口径与实盘一致：验证窗 on-going 的交易日也算会话（spec-05 §6.2 对齐
+        trial replay_sessions 空日计数）；账户无订单无持仓的“纯窗口日”同样推进窗口，
+        不能走空日快路径，否则窗口期以活跃成交日为窗口的候选永不按 window_days 到期。
+        """
+        conn = state_conn(self.state)
+        row = conn.execute(
+            """
+            SELECT 1 FROM strategy_validation_windows w
+             JOIN accounts a ON a.id = w.validation_account_id
+             WHERE w.status='in_progress' AND a.status='trial' LIMIT 1
+            """,
+        ).fetchone()
+        return row is not None
+
     def settle_once(self, now: datetime | None = None) -> dict:
         """单次判定+触发（含当日缺口账户记账，供 close_day_gaps 窗口关闭后补缺勤）。"""
         outcome = self._settle_once(now or bjt_now())
@@ -196,14 +213,14 @@ class EodSettleTrigger:
         if has_pending:
             return self._settle_trading_day(dstr)
         accounts, _ = self._tracking_state(dstr)
-        if not accounts:
+        if not accounts and not self._window_pending():
             # 空日快路径：仅一次本地 SQL，不发起任何行情网络请求
             return {"date": dstr, "status": "no_pending"}
         snap_day = self._probe_trade_date()
         if snap_day is None or snap_day != day:
             return {"date": dstr, "status": "not_trading_session",
                     "snapshot_date": snap_day.isoformat() if snap_day else None}
-        exits = self._advance_exits(dstr)
+        exits = self._advance_exits(dstr) if accounts else {}
         self._done_dates.add(dstr)
         return {"date": dstr, "status": "no_pending", "exits": exits,
                 "windows": self._advance_windows(dstr)}

@@ -7,15 +7,18 @@ activate/rollback/sealed，全部统计取自真实 trades/condition_orders 记�
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
 from core import accountstore
 from core import eodengine
 from core import evoquant
+from core import settle_scheduler
 from core import strategy_memory
 from core import strategy_versions as sv
 from core.db import state_conn
+from _feedkit import MultiDayL2Feed
 
 DEMO = "agent-demo-001"
 
@@ -207,3 +210,85 @@ def test_windows_route_via_scheduler_hook(authed_client):
     assert w2["sessions_done"] == 1 and w2["status"] == "done"
     assert w2["decision"] == "sealed"
     assert w2["final_snapshot"]["final"]["decision"] == "sealed"
+
+
+class _SnapDayFeed:
+    """只应答快照日期的实时探测 feed（纯窗口日无行情拉取，供 settle_once 走交易日确认）。"""
+
+    def __init__(self, day: str):
+        self.day = day
+
+    def realtime_batch(self, symbols):
+        return {"600000": {"ts": self.day.replace("-", "") + "153500"}}
+
+
+def _at_day(day: str) -> datetime:
+    return datetime.fromisoformat(f"{day}T15:40:00")
+
+
+def test_settle_once_ages_window_on_idle_days(authed_client):
+    """实时路径：验证窗跨无成交交易日也按会话日推进（spec-05 §6.2 空日计数对齐）。
+
+    窗口在跑但账户当日无订单无持仓 → 不得走空日快路径跳过；每个真实交易日推进一次，
+    window_days 到期即 sealed（零成交样本，不晋升不执行）。
+    """
+    st = authed_client.app.state
+    feed = _SnapDayFeed("2026-09-02")
+    trig = settle_scheduler.EodSettleTrigger(
+        st, feed=feed, corp_events={}, probe_ttl_s=0)
+    evoquant.open_validation(st, DEMO, version_no="v1", config=CFG,
+                             window_days=2, trade_target=500)
+
+    r1 = trig.settle_once(now=_at_day("2026-09-02"))
+    assert r1["status"] == "no_pending" and len(r1["windows"]) == 1
+    w1 = r1["windows"][0]
+    assert w1["reached"] is False and w1["sessions_done"] == 1
+
+    feed.day = "2026-09-03"
+    r2 = trig.settle_once(now=_at_day("2026-09-03"))
+    assert r2["status"] == "no_pending" and len(r2["windows"]) == 1
+    w2 = r2["windows"][0]
+    assert w2["reached"] is True and w2["decision"] == "sealed"
+    assert w2["sessions_done"] == 2 and w2["trade_samples"] == 0
+    w = evoquant.get_window(st, DEMO, "v1")
+    assert w["status"] == "done" and w["decision"] == "sealed"
+    assert accountstore.get_account(st, f"{DEMO}.validation")["status"] == "archived"
+    assert accountstore.get_account(st, DEMO)["active_version_no"] == ""
+
+    # 已收口后：纯空日恢复快路径（不再探测/推进窗口）
+    feed.day = "2026-09-04"
+    r3 = trig.settle_once(now=_at_day("2026-09-04"))
+    assert r3["status"] == "no_pending" and "windows" not in r3
+
+
+def test_catchup_backfills_window_sessions(authed_client):
+    """快进回放：重启补缺的会话日逐日计入验证窗（spec-04 §2.4/§2.6 对齐 spec-05 §6.2）。
+
+    catchup 覆盖 N 个历史交易日时，期间在跑窗口按交易日逐日推进；达到 window_days
+    即密封收口；重复补跑幂等零重复（done 窗口不再计会话）。
+    """
+    st = authed_client.app.state
+    feed = MultiDayL2Feed()
+    trig = settle_scheduler.EodSettleTrigger(st, feed=feed, corp_events={})
+    evoquant.open_validation(st, DEMO, version_no="v1", config=CFG,
+                             window_days=5, trade_target=500)
+
+    out = trig.catchup_missed(now=_at_day("2026-09-05"),
+                              start=datetime.fromisoformat("2026-08-20").date(),
+                              lookback_days=60)
+    progressed = [d for d in out["dates"] if d["windows"]]
+    assert len(progressed) == 5            # 08-20/21/24/25/26 逐日推进后满窗
+    assert [p["windows"][0]["sessions_done"] for p in progressed] == [1, 2, 3, 4, 5]
+    sealed = progressed[-1]["windows"][0]
+    assert sealed["decision"] == "sealed" and sealed["reached"] is True
+    assert "无卖出样本" in sealed["reason"]
+
+    # 重复补跑：done 窗口零副作用
+    out2 = trig.catchup_missed(now=_at_day("2026-09-05"),
+                               start=datetime.fromisoformat("2026-08-20").date(),
+                               lookback_days=60)
+    assert all(not d["windows"] for d in out2["dates"])
+    w = evoquant.get_window(st, DEMO, "v1")
+    assert w["status"] == "done" and w["decision"] == "sealed"
+    assert w["sessions_done"] == 5
+    assert accountstore.get_account(st, f"{DEMO}.validation")["status"] == "archived"
