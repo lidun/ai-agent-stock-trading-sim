@@ -126,6 +126,12 @@ def provider_get(state) -> dict:
     return provider_public(_row(state))
 
 
+def provider_configured(state) -> bool:
+    """模型服务是否已配置（密钥+端点+模型齐备）——供调度器廉价门，避免空转 chat。"""
+    row = _row(state)
+    return bool(row and row["api_key_enc"] and row["base_url"] and row["model"])
+
+
 def provider_health(state) -> dict:
     """健康自检视图：不含 base_url（避免把端点到处带），仅状态与模型。"""
     row = _row(state)

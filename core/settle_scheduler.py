@@ -476,6 +476,24 @@ class EodSettleTrigger:
             except Exception:  # noqa: BLE001
                 log.debug("日报消息 WS 广播失败：%s", m.get("id"))
 
+    _nar_auto = None
+
+    def _auto_narratives(self) -> dict:
+        """spec-04 §5.3 18:31 叙述段自动任务：正常日报叙述段生成（幂等收敛）。
+
+        复用 narrative.AutoNarrativeSweep（候选=主账户结算 done 且叙述为空的 normal
+        日报；未配置聚合留痕、瞬时失败退避重试、配置就绪自动续跑）。"""
+        try:
+            if self._nar_auto is None:
+                from core import narrative as _nar
+                self._nar_auto = _nar.AutoNarrativeSweep(self.state)
+            return self._nar_auto.sweep(bjt_now())
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("叙述段自动任务异常（下个 tick 重试）")
+            return {}
+
     async def _evening_summaries(self, now: datetime) -> None:
         """§5.4/§5.5 夜间汇报（BJ 20:00 后每个 tick 收敛一次，幂等）：当日每日总汇报
         （确定性拼接版）＋上月月度《策略体检报告》（与总汇报同批推送语义的简化落地）。"""
@@ -516,6 +534,14 @@ class EodSettleTrigger:
                         log.info("审批单过期清扫：%s 件（spec-04 §4.4）", expired)
                 except Exception:  # noqa: BLE001
                     log.exception("审批单过期清扫失败（下个 tick 重试）")
+                nar = self._auto_narratives()
+                if nar.get("status") == "ok" and (
+                        nar.get("candidates") or nar.get("noprov")):
+                    log.info("18:31 叙述段自动任务：date=%s candidates=%s "
+                             "generated=%s failed=%s retrying=%s noprov=%s",
+                             nar.get("date"), nar.get("candidates"),
+                             nar.get("generated"), nar.get("failed"),
+                             nar.get("retrying"), nar.get("noprov"))
                 await self._notify_report_pushes(pushed)
                 await self._evening_summaries(bjt_now())
             except asyncio.CancelledError:

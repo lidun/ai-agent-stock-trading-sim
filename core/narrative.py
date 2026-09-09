@@ -5,11 +5,19 @@
 - 上下文只取已落库确定性事实（摘要/持仓/成交/降级标注/活跃版本配置/上日叙述），
   不引外部行情资讯；市场观察段明确标"主观"，禁止虚构当日具体行情数据。
 - provider 未配置/调用失败：不阻塞日报，narrative 保持空并落审计
-  （report.narrative_generate result=failed/not_configured），可稍后重跑。
+   （report.narrative_generate result=failed/not_configured），可稍后重跑。
+- AutoNarrativeSweep：spec-04 §5.3 18:31 正常日报叙述段自动任务（调度器 tick 收敛）——
+  只收主账户结算 done 的 normal 日报；未配置模型服务聚合留痕不刷审计，配置就绪自动
+  续跑；瞬时失败指数退避重试，耗尽后聚合留痕可 UI/force 重跑。
 """
 from __future__ import annotations
 
 import json
+import time as _tm
+from datetime import date as _date
+from datetime import datetime as _datetime
+from datetime import time as _time
+from datetime import timedelta as _td
 
 from core import llm, reporting
 from core.db import state_conn, write_txn
@@ -185,3 +193,156 @@ def _audit(state, report: dict, result: str, detail: str,
             (ts, "strategy_agent", "report.narrative_generate", "daily_reports",
              report["id"], result, json.dumps(meta, ensure_ascii=False), ""),
         )
+
+
+_NARR_START = _time(18, 31)
+_NARR_LOOKBACK_DAYS = 3
+_NARR_MAX_ATTEMPTS = 3
+_NARR_BASE_BACKOFF_S = 300.0
+
+
+class AutoNarrativeSweep:
+    """spec-04 §5.3 18:31 叙述段自动任务（调度器每分钟 tick 内收敛，幂等）。
+
+    - 时点：北京时间 >= start_at（默认 18:31）才动作；早于时点零动作零网络。
+    - 候选：role='main' 账户、lookback 日历窗内（含引擎 catchup 补结算的近期日）、
+      结算 done 的 normal 日报最新版且叙述为空。trial/验证窗账户不入列，不给回放
+      账户烧 LLM token。
+    - provider 未配置：不调用 chat、不刷逐条审计；同一 trade_date 聚合留 1 条
+      skipped 审计，随后每 tick 廉价重检，配置就绪自动续跑（晚间晚配置也能补上）。
+    - 瞬时失败（llm_failed/empty_output）：指数退避重试至多 max_attempts 次；耗尽后
+      聚合留痕并停止（当日叙述保持为空，日报不受影响，可经 UI/force 重跑）。
+    - 进程重启即清零退避表：已落库叙述被候选过滤自然排除，不重写；未配置日的审计
+      聚合同样由 set 去重，不重复刷屏。
+    """
+
+    def __init__(self, state, *, start_at: _time = _NARR_START,
+                 lookback_days: int = _NARR_LOOKBACK_DAYS,
+                 max_attempts: int = _NARR_MAX_ATTEMPTS,
+                 base_backoff_s: float = _NARR_BASE_BACKOFF_S,
+                 mono=None):
+        self.state = state
+        self.start_at = start_at
+        self.lookback_days = max(1, int(lookback_days))
+        self.max_attempts = max(1, int(max_attempts))
+        self.base_backoff_s = max(0.0, float(base_backoff_s))
+        self._mono = mono or _tm.monotonic
+        self._st: dict[tuple[str, str], dict] = {}
+        self._noprov_audited: set[str] = set()
+
+    def _candidate_dates(self, today: _date) -> list[str]:
+        return [(today - _td(days=k)).isoformat()
+                for k in range(self.lookback_days)]
+
+    def _pending(self, dates: list[str]) -> list[dict]:
+        """主账户当日结算 done 且叙述为空的 normal 日报最新版（确定性候选）。"""
+        ph = ",".join("?" * len(dates))
+        rows = state_conn(self.state).execute(
+            f"""
+            SELECT dr.agent_id, dr.trade_date, dr.data_section
+              FROM daily_reports dr
+              JOIN accounts a ON a.id = dr.agent_id AND a.role = 'main'
+             WHERE dr.trade_date IN ({ph})
+               AND dr.status = 'normal'
+               AND (dr.narrative IS NULL OR trim(dr.narrative) = '')
+               AND NOT EXISTS (
+                    SELECT 1 FROM daily_reports dr2
+                     WHERE dr2.agent_id = dr.agent_id
+                       AND dr2.trade_date = dr.trade_date
+                       AND dr2.version > dr.version)
+             ORDER BY dr.trade_date, dr.agent_id
+            """,
+            dates,
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                ds = json.loads(r["data_section"] or "{}")
+            except ValueError:
+                continue
+            if not (ds.get("settlement") or {}).get("done"):
+                continue
+            out.append({"account_id": r["agent_id"],
+                        "trade_date": r["trade_date"]})
+        return out
+
+    def _write_audit(self, action: str, result: str, detail: str) -> None:
+        from datetime import timezone
+        ts = _datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with write_txn(state_conn(self.state)) as tx:
+            tx.execute(
+                "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+                " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+                (ts, "scheduler", action, "daily_reports", "",
+                 result, json.dumps({"detail": detail}, ensure_ascii=False), ""),
+            )
+
+    def sweep(self, now: _datetime) -> dict:
+        """单次收敛（调度器每 tick 调用；返回轻量状态机结果）。"""
+        today = now.date()
+        stats = {"phase": "narrative_auto", "date": today.isoformat(),
+                 "candidates": 0, "generated": 0, "failed": 0, "retrying": 0,
+                 "noprov": 0}
+        if now.time() < self.start_at:
+            stats["status"] = "outside_window"
+            stats["start_at"] = self.start_at.isoformat()
+            return stats
+        dates = self._candidate_dates(today)
+        pending = self._pending(dates)
+        stats["candidates"] = len(pending)
+        configured = llm.provider_configured(self.state)
+        noprov_cnt: dict[str, int] = {}
+        for cand in pending:
+            key = (cand["account_id"], cand["trade_date"])
+            rec = self._st.get(key) or {"attempts": 0, "next": 0.0}
+            if rec.get("final"):
+                continue
+            if self._mono() < rec.get("next", 0.0):
+                stats["retrying"] += 1
+                continue
+            if not configured:
+                rec.update(kind="noprov", final=None)
+                self._st[key] = rec
+                noprov_cnt[cand["trade_date"]] = noprov_cnt.get(
+                    cand["trade_date"], 0) + 1
+                stats["noprov"] += 1
+                continue
+            res = generate_narrative(self.state, cand["account_id"],
+                                     cand["trade_date"])
+            code = res.get("code", "")
+            if code in ("generated", "skipped", "no_report", "not_settled"):
+                self._st[key] = {"attempts": 0, "next": 0.0, "final": code}
+                if code == "generated":
+                    stats["generated"] += 1
+                continue
+            if code == "not_configured":
+                self._st[key] = {"attempts": 0, "next": 0.0, "kind": "noprov"}
+                noprov_cnt[cand["trade_date"]] = noprov_cnt.get(
+                    cand["trade_date"], 0) + 1
+                stats["noprov"] += 1
+                continue
+            attempts = rec.get("attempts", 0) + 1
+            if attempts >= self.max_attempts:
+                self._st[key] = {"attempts": attempts, "next": 0.0,
+                                 "final": code}
+                stats["failed"] += 1
+                self._write_audit(
+                    "report.narrative_auto", "failed",
+                    f"{cand['account_id']}@{cand['trade_date']} 18:31 自动叙述"
+                    f"重试 {attempts} 次仍 {code}，当日叙述保持为空"
+                    f"（可经 UI/force 重跑）")
+            else:
+                self._st[key] = {"attempts": attempts, "kind": "retry",
+                                 "next": self._mono()
+                                 + self.base_backoff_s * attempts}
+                stats["retrying"] += 1
+        for d, n in sorted(noprov_cnt.items()):
+            if d in self._noprov_audited:
+                continue
+            self._noprov_audited.add(d)
+            self._write_audit(
+                "report.narrative_auto", "skipped",
+                f"{d} {n} 份主账户日报待叙述，未配置模型服务已跳过"
+                f"（spec-04 §9.1：配置后可自动补跑，不伪造叙述）")
+        stats["status"] = "ok"
+        return stats
