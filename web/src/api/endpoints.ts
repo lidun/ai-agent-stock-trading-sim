@@ -1036,3 +1036,34 @@ export interface StrategyMemoryList {
 export function fetchStrategyMemory(agentId: string): Promise<StrategyMemoryList> {
   return apiGet<StrategyMemoryList>(`/api/agents/${encodeURIComponent(agentId)}/strategy-memory`);
 }
+
+// ---------- 策略版本化（spec-02 §9 strategy_versions，只读状态机） ----------
+
+export interface StrategyVersion {
+  id: string;
+  agent_id: string;
+  version_no: string;
+  parent_version: string;
+  status: "draft" | "validated" | "active" | "rolled_back";
+  config: Record<string, unknown>;
+  config_diff: Record<string, unknown>;
+  basis: string[];
+  created_by: string;
+  created_ts: string;
+  trial_window: Record<string, unknown>;
+  validated_on: string;
+  failure_reason: string;
+  rolled_back_to: string;
+}
+export interface StrategyVersionList {
+  agent_id: string;
+  total: number;
+  active_version: string;
+  items: StrategyVersion[];
+}
+
+export function fetchStrategyVersions(agentId: string): Promise<StrategyVersionList> {
+  return apiGet<StrategyVersionList>(
+    `/api/agents/${encodeURIComponent(agentId)}/strategy-versions`,
+  );
+}

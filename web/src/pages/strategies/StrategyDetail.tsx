@@ -34,6 +34,7 @@ import {
   fetchStrategyMetrics,
   fetchStrategyMemory,
   fetchStrategyProfile,
+  fetchStrategyVersions,
   getAccount,
   listAccountConditionOrders,
   listAccountHoldings,
@@ -56,6 +57,7 @@ import {
   type StrategyMetrics,
   type StrategyProfile,
   type StrategyMemoryList,
+  type StrategyVersionList,
   type TradeInfo,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
@@ -63,6 +65,7 @@ import MetricSummaryCard from "./MetricSummaryCard";
 import EquityCurveCard from "./EquityCurveCard";
 import StrategyEvolutionCard from "./StrategyEvolutionCard";
 import StrategyProfileCard from "./StrategyProfileCard";
+import StrategyVersionsCard from "./StrategyVersionsCard";
 import SellTrackingCard from "./SellTrackingCard";
 
 const OT_LABEL: Record<string, string> = {
@@ -129,6 +132,7 @@ export default function StrategyDetailPage() {
   const [profile, setProfile] = useState<StrategyProfile | null>(null);
   const [exitTracks, setExitTracks] = useState<ExitTrackingList | null>(null);
   const [memory, setMemory] = useState<StrategyMemoryList | null>(null);
+  const [versions, setVersions] = useState<StrategyVersionList | null>(null);
   const [range, setRange] = useState<CurveRange>("all");
   const [p2Loading, setP2Loading] = useState(true);
 
@@ -224,7 +228,8 @@ export default function StrategyDetailPage() {
       fetchStrategyProfile(selectedId),
       fetchExitTrackings(selectedId),
       fetchStrategyMemory(selectedId),
-    ]).then(([m, c, e, sp, et, mem]) => {
+      fetchStrategyVersions(selectedId),
+    ]).then(([m, c, e, sp, et, mem, ver]) => {
       if (!active) return;
       setMetrics(m.status === "fulfilled" ? m.value : null);
       setCurve(c.status === "fulfilled" ? c.value : null);
@@ -232,6 +237,7 @@ export default function StrategyDetailPage() {
       setProfile(sp.status === "fulfilled" ? sp.value : null);
       setExitTracks(et.status === "fulfilled" ? et.value : null);
       setMemory(mem.status === "fulfilled" ? mem.value : null);
+      setVersions(ver.status === "fulfilled" ? ver.value : null);
       if (m.status === "rejected" && c.status === "rejected" && e.status === "rejected") {
         console.warn("P2 数据源不可用（spec-06 §6.4），等 EOD 结算产出后再现。");
       }
@@ -676,7 +682,9 @@ export default function StrategyDetailPage() {
             />
           </Card>
 
-              <StrategyEvolutionCard evolution={evolution} memory={memory} loading={p2Loading} />
+          <StrategyEvolutionCard evolution={evolution} memory={memory} loading={p2Loading} />
+
+          <StrategyVersionsCard versions={versions} loading={p2Loading} />
 
           <SellTrackingCard data={exitTracks} loading={p2Loading} />
 
