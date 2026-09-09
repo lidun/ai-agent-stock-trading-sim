@@ -562,6 +562,25 @@ export function fetchReportVersions(
   return apiGet(`/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}`);
 }
 
+export interface NarrativeGenerateResult {
+  ok: boolean;
+  code: string;
+  detail?: string;
+  version?: number;
+  narrative_len?: number;
+  model?: string;
+}
+
+export function generateDailyNarrative(
+  agentId: string,
+  tradeDate: string,
+  force = false,
+): Promise<NarrativeGenerateResult> {
+  return apiPost(
+    `/api/accounts/${encodeURIComponent(agentId)}/reports/${encodeURIComponent(tradeDate)}/narrative/generate?force=${force}`,
+  );
+}
+
 export function updateReportNarrative(
   agentId: string,
   tradeDate: string,

@@ -36,6 +36,7 @@ import {
   fetchStrategyProfile,
   fetchStrategyVersions,
   fetchValidationWindows,
+  generateDailyNarrative,
   getAccount,
   listAccountConditionOrders,
   listAccountHoldings,
@@ -141,6 +142,8 @@ export default function StrategyDetailPage() {
   const [p2Loading, setP2Loading] = useState(true);
   const [reportScope, setReportScope] = useState<string>("main");
   const [decisionDates, setDecisionDates] = useState<Record<string, { decision: string; version_no: string; reason?: string; decided_ts?: string }>>({});
+  const [narrativeDates, setNarrativeDates] = useState<string[]>([]);
+  const [narrBusy, setNarrBusy] = useState<string | null>(null);
 
   const strategyAgents = useMemo(() => agents.filter((a) => a.role === "strategy"), [agents]);
 
@@ -201,6 +204,7 @@ export default function StrategyDetailPage() {
           }
           if (d.versions.some((v) => v.data_section?.annotations?.unsettled)) unsettled.push(d.date);
         }
+        setNarrativeDates(detail.filter((d) => d.versions[0]?.narrative).map((d) => d.date));
         setUnsettledDates(isMain ? unsettled : []);
         setDecisionDates(decisions);
       } catch (e) {
@@ -271,6 +275,7 @@ export default function StrategyDetailPage() {
       setReportScope("main");
       setUnsettledDates([]);
       setDecisionDates({});
+      setNarrativeDates([]);
       void reload();
       return;
     }
@@ -278,7 +283,44 @@ export default function StrategyDetailPage() {
     setReportScope(v);
     setUnsettledDates([]);
     setDecisionDates({});
+    setNarrativeDates([]);
     void loadReportArea(v, false);
+  };
+
+  const doGenerateNarrative = (date: string) => {
+    if (!selectedId) return;
+    const existing = narrativeDates.includes(date);
+    const run = async () => {
+      setNarrBusy(date);
+      try {
+        const res = await generateDailyNarrative(selectedId, date, existing);
+        if (res.ok) {
+          message.success(
+            res.code === "generated"
+              ? `LLM 叙述段已生成（v${res.version} · ${res.model ?? ""}）`
+              : `叙述段已存在，跳过（${res.detail ?? res.code}）`,
+          );
+        } else {
+          message.warning(res.detail ?? `生成失败（${res.code}）`);
+        }
+        await loadReportArea(selectedId, true);
+      } catch (e) {
+        message.error((e as Error).message ?? "生成叙述段失败");
+      } finally {
+        setNarrBusy(null);
+      }
+    };
+    if (existing) {
+      modal.confirm({
+        title: "重写叙述段",
+        content: "该日已有 LLM 叙述段，重写将覆盖原文本（审计留痕）。确认？",
+        okButtonProps: { danger: true },
+        okText: "重写",
+        onOk: run,
+      });
+    } else {
+      void run();
+    }
   };
 
   useEffect(() => {
@@ -795,6 +837,26 @@ export default function StrategyDetailPage() {
                   },
                 },
                 { title: "版本", dataIndex: "latest_version", width: 80, align: "right" },
+                {
+                  title: "叙述段", key: "narrative", width: 160,
+                  render: (_, r) => {
+                    if (reportScope !== "main") {
+                      return <Typography.Text type="secondary">—</Typography.Text>;
+                    }
+                    const has = narrativeDates.includes(r.trade_date);
+                    return (
+                      <Button
+                        type="link"
+                        size="small"
+                        style={{ padding: 0 }}
+                        loading={narrBusy === r.trade_date}
+                        onClick={() => doGenerateNarrative(r.trade_date)}
+                      >
+                        {has ? <Tag color="green" style={{ marginInlineEnd: 0 }}>叙述段已生成 · 重写</Tag> : <Tag>生成 LLM 叙述段</Tag>}
+                      </Button>
+                    );
+                  },
+                },
                 { title: "最新生成", dataIndex: "latest_created_ts", render: (v: string) => fmtBeijingTime(v) },
               ]}
             />
