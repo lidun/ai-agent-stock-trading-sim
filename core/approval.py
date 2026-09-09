@@ -163,10 +163,46 @@ def _effect_single_stock_cap(c, row: dict, now: str) -> str:
     return json.dumps({"single_stock_cap": float(cap_text)}, ensure_ascii=False)
 
 
+def _effect_capability(c, row: dict, now: str) -> str:
+    """capability 效果器：审批通过 → 能力下发绑定（spec-05 §2.1 申请-下发闭环）。
+
+    payload={"capability_id": …}；在绑幂等（部分唯一索引兜底），废弃/沙箱未过拒绝。
+    result_ref = 绑定结果 JSON。"""
+    from core import capability_center as cc  # noqa: PLC0415
+    cap_id = row["payload"].get("capability_id", "")
+    if not cap_id:
+        raise ValueError("能力审批单须提供 capability_id")
+    cap = c.execute(
+        "SELECT id, version, status, sandbox_status FROM capabilities WHERE id=?",
+        (cap_id,),
+    ).fetchone()
+    if cap is None:
+        raise LookupError(f"能力不存在：{cap_id}")
+    if cap["status"] == "deprecated":
+        raise ValueError("能力已 deprecated，不再下发（存量绑定通知迁移，§2.4）")
+    if cap["sandbox_status"] != cc._SANDBOX_OK:
+        raise ValueError("沙箱未通过，不得下发（上架四门槛②）")
+    ts = now
+    bid = f"cb{secrets.token_hex(10)}"
+    cur = c.execute(
+        "INSERT OR IGNORE INTO capability_bindings"
+        " (id, capability_id, version, agent_id, bound_by, bound_ts,"
+        "  unbound_ts, created_ts)"
+        " VALUES (?,?,?,?,?,?,'',?)",
+        (bid, cap_id, cap["version"], row["agent_id"], cc._MANAGER, ts, ts),
+    )
+    return json.dumps({
+        "capability_id": cap_id, "agent_id": row["agent_id"],
+        "version": cap["version"], "binding_id": bid,
+        "changed": cur.rowcount == 1, "bound_ts": ts,
+    }, ensure_ascii=False)
+
+
 def _EFFECTS() -> dict:
     return {"exemption": _effect_exemption,
             "granularity": _effect_granularity,
-            "risk": _effect_single_stock_cap}
+            "risk": _effect_single_stock_cap,
+            "capability": _effect_capability}
 
 
 def submit_approval(state, *, type_: str, agent_id: str, payload: dict,

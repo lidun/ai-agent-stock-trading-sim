@@ -8,7 +8,9 @@ import {
   Empty,
   Flex,
   Input,
+  Modal,
   Radio,
+  Select,
   Skeleton,
   Space,
   Statistic,
@@ -22,9 +24,19 @@ import { ReloadOutlined, SearchOutlined } from "@ant-design/icons";
 import {
   fetchCapabilities,
   fetchCapabilityDetail,
+  listAgents,
+  submitApproval,
+  type AgentInfo,
   type CapabilityDetail,
   type CapabilityItem,
 } from "../../api/endpoints";
+
+const APPLY_SHORT: Record<string, string> = {
+  hash_hit_approved: "该能力此前已被批准，无需重复申请（确定性短路）。",
+  hash_hit_rejected: "相同申请此前已被驳回（确定性短路）；如需调整请提交不同理由/目标。",
+  cooldown: "同类申请被驳回后 24h 冷却中，如需提前放行请在审批中心人工豁免。",
+  pending_full: "该 Agent 同类待决审批已达上限（≤3），请先处理待办。",
+};
 import { fmtBeijingTime } from "../../utils/time";
 
 const TYPE_META: Record<string, { color: string; label: string }> = {
@@ -64,6 +76,18 @@ export default function CapabilityMarketPage() {
   const [detail, setDetail] = useState<CapabilityDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [applyAgent, setApplyAgent] = useState("");
+  const [applyReason, setApplyReason] = useState("");
+  const [applySending, setApplySending] = useState(false);
+
+  useEffect(() => {
+    listAgents()
+      .then((r) => setAgents(r.agents.filter((a) => a.role === "strategy")))
+      .catch(() => undefined);
+  }, []);
+
   const reload = useCallback(async () => {
     setLoading(true);
     try {
@@ -93,6 +117,40 @@ export default function CapabilityMarketPage() {
       message.error((err as Error).message ?? "加载能力详情失败");
     } finally {
       setDetailLoading(false);
+    }
+  };
+
+  const openApply = () => {
+    setApplyAgent("");
+    setApplyReason("");
+    setApplyOpen(true);
+  };
+
+  const doApply = async (c: CapabilityItem) => {
+    if (!applyAgent || !applyReason.trim()) {
+      message.warning("请选择目标 Agent 并填写申请理由（策略依据）");
+      return;
+    }
+    setApplySending(true);
+    try {
+      const r = await submitApproval({
+        type: "capability",
+        agent_id: applyAgent,
+        payload: { capability_id: c.id },
+        reason: applyReason.trim(),
+      });
+      if (r.ok) {
+        message.success("能力申请单已提交待决——请在审批中心通过后自动下发（spec-05 §2.3）");
+        setApplyOpen(false);
+      } else if (r.reason) {
+        message.warning(APPLY_SHORT[r.reason] ?? r.detail ?? "申请被确定性短路退回");
+      } else {
+        message.error(r.detail ?? "提交失败");
+      }
+    } catch (err) {
+      message.error((err as Error).message ?? "提交能力申请失败");
+    } finally {
+      setApplySending(false);
     }
   };
 
@@ -334,12 +392,77 @@ export default function CapabilityMarketPage() {
               </Typography.Paragraph>
             )}
 
-            <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
-              注册/绑定/解绑/回滚操作走管理 Agent 与 spec-04 审批流（spec-05 §2.3），本页仅只读陈列。
-            </Typography.Paragraph>
+            <Flex justify="space-between" align="center" gap={8}>
+              <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
+                注册/绑定/解绑/回滚由管理 Agent + spec-04 审批流执行（spec-05 §2.3）；
+                子 Agent 申请下发经审批通过后在此自动绑定。
+              </Typography.Paragraph>
+              <Tooltip
+                title={
+                  cap.status === "deprecated"
+                    ? "已废弃能力不再下发（存量绑定保留）"
+                    : cap.sandbox_status !== "passed"
+                      ? "沙箱未通过，暂不可申请下发"
+                      : undefined
+                }
+              >
+                <Button
+                  type="primary"
+                  disabled={cap.status === "deprecated" || cap.sandbox_status !== "passed"}
+                  onClick={() => openApply()}
+                >
+                  申请绑定
+                </Button>
+              </Tooltip>
+            </Flex>
           </Space>
         )}
       </Drawer>
+
+      <Modal
+        title={cap ? `申请绑定 · ${cap.name}` : ""}
+        open={applyOpen && cap !== null}
+        onCancel={() => setApplyOpen(false)}
+        okText="提交申请"
+        confirmLoading={applySending}
+        onOk={() => cap && void doApply(cap)}
+      >
+        {cap && (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <Alert
+              type="info"
+              showIcon
+              message="下发闭环（spec-05 §2.3）"
+              description="提交后生成 capability 审批单（24h 未决自动过期）；审批中心人工评审通过即绑定，驳回留痕并进入 24h 冷却。相同申请此前已决将被确定性短路拦截。"
+            />
+            <div>
+              <Typography.Text strong>目标 Agent</Typography.Text>
+              <Select
+                style={{ width: "100%", marginTop: 4 }}
+                placeholder="选择需要该能力的策略 Agent"
+                value={applyAgent || undefined}
+                onChange={setApplyAgent}
+                options={agents.map((a) => ({
+                  value: a.id,
+                  label: `${a.name}（${a.id}）`,
+                }))}
+              />
+            </div>
+            <div>
+              <Typography.Text strong>申请理由（策略依据）</Typography.Text>
+              <Input.TextArea
+                style={{ marginTop: 4 }}
+                rows={3}
+                maxLength={500}
+                showCount
+                placeholder="说明该能力将如何被使用、解决什么问题"
+                value={applyReason}
+                onChange={(e) => setApplyReason(e.target.value)}
+              />
+            </div>
+          </Space>
+        )}
+      </Modal>
     </div>
   );
 }
