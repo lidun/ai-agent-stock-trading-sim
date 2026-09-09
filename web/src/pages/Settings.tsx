@@ -42,20 +42,24 @@ const CONN_LABEL: Record<string, string> = {
   offline: "中断重连中",
 };
 
-interface Preset {
+interface Vendor {
   key: string;
   label: string;
   base_url: string;
   model: string;
 }
 
-const LLM_PRESETS: Preset[] = [
+const LLM_VENDORS: Vendor[] = [
   { key: "deepseek", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   { key: "openai", label: "OpenAI", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   { key: "dashscope", label: "通义千问（DashScope 兼容）", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
   { key: "moonshot", label: "Kimi（Moonshot）", base_url: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
   { key: "zhipu", label: "智谱 GLM", base_url: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
 ];
+
+function vendorByKey(key: string): Vendor {
+  return LLM_VENDORS.find((v) => v.key === key) ?? LLM_VENDORS[0];
+}
 
 export default function SettingsPage() {
   const user = useAuth((s) => s.user);
@@ -67,18 +71,14 @@ export default function SettingsPage() {
   const [revoking, setRevoking] = useState(false);
 
   const [llm, setLlm] = useState<LlmProviderView | null>(null);
-  const [preset, setPreset] = useState<string>("deepseek");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [model, setModel] = useState("");
+  const [vendor, setVendor] = useState<string>("deepseek");
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
 
   const applyLlm = (v: LlmProviderView) => {
     setLlm(v);
-    setPreset(v.preset || "deepseek");
-    setBaseUrl(v.base_url);
-    setModel(v.model);
+    setVendor(v.preset || "deepseek");
     setApiKey("");
   };
 
@@ -112,22 +112,14 @@ export default function SettingsPage() {
     }
   };
 
-  const choosePreset = (key: string) => {
-    const p = LLM_PRESETS.find((x) => x.key === key);
-    setPreset(key);
-    if (p) {
-      setBaseUrl(p.base_url);
-      setModel(p.model);
-    }
-  };
-
   const saveProvider = async () => {
+    const v = vendorByKey(vendor);
     setSaving(true);
     try {
       const res = await saveLlmProvider({
-        preset,
-        base_url: baseUrl.trim(),
-        model: model.trim(),
+        preset: vendor,
+        base_url: v.base_url,
+        model: v.model,
         ...(apiKey ? { api_key: apiKey.trim() } : {}),
       });
       applyLlm(res.provider);
@@ -144,7 +136,7 @@ export default function SettingsPage() {
     try {
       const res = await testLlmProvider();
       if (res.ok) {
-        message.success(`连通成功 · ${res.model ?? model}（${res.latency_ms ?? "?"}ms）`);
+        message.success(`连通成功 · ${res.model ?? vendorByKey(vendor).model}（${res.latency_ms ?? "?"}ms）`);
       } else {
         message.error(res.error ?? "连通失败");
       }
@@ -159,7 +151,7 @@ export default function SettingsPage() {
   const removeProvider = () => {
     modal.confirm({
       title: "移除模型服务配置",
-      content: "将删除已加密保存的 API Key、Base URL 与模型。确认移除？",
+      content: "将删除已加密保存的 API Key 与厂商配置。确认移除？",
       okButtonProps: { danger: true },
       okText: "移除",
       onOk: async () => {
@@ -175,7 +167,9 @@ export default function SettingsPage() {
     });
   };
 
-  const hasProviderConfig = Boolean(llm && (baseUrl.trim() || model.trim()));
+  const auto = vendorByKey(vendor);
+  const keepExistingKey = Boolean(llm?.api_key_set && vendor === llm?.preset);
+  const canSave = Boolean(apiKey.trim() || keepExistingKey);
 
   return (
     <div className="page">
@@ -241,49 +235,34 @@ export default function SettingsPage() {
           }
         >
           <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-            Agent 的大模型能力（日报叙述段 / 市场判断 / 审批评审）经 OpenAI 兼容统一适配层调用（spec-04 §8）。
-            API Key 在 core 本地以 0600 密钥文件加密后落库，界面仅掩码展示，不回传明文。
+            选择厂商并填入你的 API Key 即可，端点与模型自动采用该厂商默认值（OpenAI 兼容统一适配层，spec-04 §8）。
+            Key 在 core 本地加密落库，界面仅掩码展示。
           </Typography.Paragraph>
           <Form layout="vertical" size="small" style={{ maxWidth: 560 }}>
-            <Form.Item label="供应商预设">
+            <Form.Item label="厂商">
               <Select
-                value={preset}
-                options={LLM_PRESETS.map((p) => ({ value: p.key, label: p.label }))}
-                onChange={choosePreset}
-                placeholder="选择预设，可再手动修正下方端点与模型"
+                value={vendor}
+                options={LLM_VENDORS.map((v) => ({ value: v.key, label: v.label }))}
+                onChange={(k) => {
+                  setVendor(k);
+                  setApiKey("");
+                }}
               />
             </Form.Item>
-            <Form.Item label="Base URL（OpenAI 兼容 /chat/completions 端点前缀）">
-              <Input
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://api.deepseek.com/v1"
-              />
-            </Form.Item>
-            <Form.Item label="模型">
-              <Input
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                placeholder="deepseek-chat"
-              />
-            </Form.Item>
-            <Form.Item
-              label={
-                llm?.api_key_set
-                  ? `API Key（已保存 ${llm.api_key_hint}，留空表示保留原密钥）`
-                  : "API Key"
-              }
-            >
+            <Form.Item label="API Key">
               <Input.Password
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder={llm?.api_key_set ? "输入新密钥以替换" : "粘贴 provider API Key"}
+                placeholder={llm?.api_key_set && vendor === llm?.preset ? "留空保留原密钥，输入则替换" : "粘贴该厂商的 API Key"}
                 autoComplete="new-password"
               />
             </Form.Item>
             <Form.Item style={{ marginBottom: 0 }}>
+              <Typography.Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
+                将自动使用端点 {auto.base_url} · 模型 {auto.model}
+              </Typography.Text>
               <Flex gap={8} wrap>
-                <Button type="primary" loading={saving} disabled={!hasProviderConfig} onClick={() => void saveProvider()}>
+                <Button type="primary" loading={saving} disabled={!canSave} onClick={() => void saveProvider()}>
                   保存
                 </Button>
                 <Button icon={<ThunderboltOutlined />} loading={testing} disabled={!llm?.configured} onClick={() => void runTest()}>
