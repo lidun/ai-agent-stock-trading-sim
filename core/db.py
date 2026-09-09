@@ -43,6 +43,7 @@ def state_conn(state) -> sqlite3.Connection:
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -913,6 +914,101 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON performance_records(task_id);
         CREATE INDEX IF NOT EXISTS idx_perf_records_agent_time
             ON performance_records(agent_id, created_ts);
+        """,
+    ),
+    (
+        27,
+        """
+        -- spec-03 §5.1 L0 3 秒采集序列：PK(symbol, trade_date, ts) 唯一 → 重采幂等；
+        -- price/prev_close/cum_turnover 以 TEXT 存 Decimal；status=suspended 样本仅审计
+        -- 不进判定序列；is_extended=1（15:00 后延续采样）仅作 close_candidates。
+        CREATE TABLE IF NOT EXISTS l0_ticks (
+            symbol        TEXT NOT NULL,
+            trade_date    TEXT NOT NULL,
+            ts            TEXT NOT NULL,
+            price         TEXT NOT NULL,
+            prev_close    TEXT NOT NULL,
+            pct_chg       TEXT NOT NULL DEFAULT '0',
+            cum_turnover  TEXT NOT NULL DEFAULT '0',
+            status        TEXT NOT NULL DEFAULT 'normal'
+                          CHECK (status IN ('normal', 'suspended')),
+            is_extended   INTEGER NOT NULL DEFAULT 0,
+            source        TEXT NOT NULL DEFAULT '',
+            quality       TEXT NOT NULL DEFAULT 'ok',
+            PRIMARY KEY (symbol, trade_date, ts)
+        );
+
+        -- spec-03 §4.1/§5.1 票级覆盖：分母=该票当日实际可交易秒数/3（盘中停牌秒数剔除），
+        -- coverage_rate TEXT(Decimal)；quality/degraded_reason 供日报降级判定共用。
+        CREATE TABLE IF NOT EXISTS l0_coverage (
+            symbol           TEXT NOT NULL,
+            trade_date       TEXT NOT NULL,
+            expected_ticks   INTEGER NOT NULL DEFAULT 0,
+            actual_ticks     INTEGER NOT NULL DEFAULT 0,
+            started_ts       TEXT NOT NULL DEFAULT '',
+            ended_ts         TEXT NOT NULL DEFAULT '',
+            suspended_secs   INTEGER NOT NULL DEFAULT 0,
+            coverage_rate    TEXT NOT NULL DEFAULT '',
+            quality          TEXT NOT NULL DEFAULT 'ok',
+            degraded_reason  TEXT NOT NULL DEFAULT '',
+            notes            TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, trade_date)
+        );
+
+        -- spec-03 §3.3 单源同日判定不变式：当日绑定源记录，换源只对次日起生效。
+        CREATE TABLE IF NOT EXISTS source_binding (
+            symbol     TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            source     TEXT NOT NULL,
+            PRIMARY KEY (symbol, trade_date)
+        );
+
+        -- spec-03 §4.1 官方收盘价源当日绑定（防跨源收盘价基准漂移，换源次日生效）。
+        CREATE TABLE IF NOT EXISTS official_close_source (
+            trade_date TEXT PRIMARY KEY,
+            source     TEXT NOT NULL
+        );
+
+        -- spec-03 §3.1 观察集合（管理 Agent 配置、常驻，v0.1 支持；集合变更次日生效）。
+        CREATE TABLE IF NOT EXISTS market_observation (
+            symbol   TEXT PRIMARY KEY,
+            added_ts TEXT NOT NULL,
+            reason   TEXT NOT NULL DEFAULT '',
+            active   INTEGER NOT NULL DEFAULT 1
+        );
+
+        -- spec-03 §3.1 每日采集清单快照（当日有效条件单 ∪ 持仓 ∪ 观察集合；审计口径）。
+        CREATE TABLE IF NOT EXISTS collector_watchlist (
+            trade_date TEXT NOT NULL,
+            symbol     TEXT NOT NULL,
+            reason     TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (trade_date, symbol)
+        );
+
+        -- spec-03 §6 本地 SQLite 缓存：L1 分钟线按票按日落盘 + 更新时间戳（增量更新）。
+        CREATE TABLE IF NOT EXISTS minute_cache (
+            symbol     TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            minute     TEXT NOT NULL,
+            close      TEXT NOT NULL,
+            source     TEXT NOT NULL DEFAULT '',
+            fetched_ts TEXT NOT NULL,
+            PRIMARY KEY (symbol, trade_date, minute)
+        );
+
+        -- spec-03 §6 本地 SQLite 缓存：日线（官方收盘价权威列增量缓存）。
+        CREATE TABLE IF NOT EXISTS daily_cache (
+            symbol     TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            open       TEXT NOT NULL,
+            close      TEXT NOT NULL,
+            high       TEXT NOT NULL,
+            low        TEXT NOT NULL,
+            volume     TEXT NOT NULL DEFAULT '0',
+            source     TEXT NOT NULL DEFAULT '',
+            fetched_ts TEXT NOT NULL,
+            PRIMARY KEY (symbol, trade_date)
+        );
         """,
     ),
 ]

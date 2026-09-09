@@ -58,6 +58,10 @@ class Settings:
     eod_settle_earliest: str = "15:35"    # 最早结算点（可配，spec-01 §3.1）
     eod_settle_retry_until: str = "16:35" # 重试窗口终点（默认 15:35+60m）
 
+    # spec-03 盘中 3 秒采集器与本地缓存数据服务（部署启用；测试默认关）
+    market_data_enabled: bool = False     # 数据服务常驻开关（交易时段内 3s 采集循环）
+    market_sources: str = "tencent"       # 运行期已配置/可用的源（逗号分隔，按 spec §2.2 默认链优先级取用）
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -99,6 +103,8 @@ def load_settings() -> Settings:
         eod_settle_tick_s=_as_int("CORE_EOD_SETTLE_TICK_S", 60),
         eod_settle_earliest=os.getenv("CORE_EOD_SETTLE_EARLIEST", "15:35"),
         eod_settle_retry_until=os.getenv("CORE_EOD_SETTLE_RETRY_UNTIL", "16:35"),
+        market_data_enabled=_as_bool("CORE_MARKET_DATA_ENABLED", False),
+        market_sources=os.getenv("CORE_MARKET_SOURCES", "tencent").strip(),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )

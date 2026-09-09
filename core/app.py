@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,7 @@ from core.capability_center_routes import router as capability_center_router
 from core.quality_routes import router as quality_router
 from core.performance_routes import router as performance_router
 from core.llm_routes import router as llm_router
+from core.market_routes import router as market_router
 
 log = logging.getLogger("core")
 
@@ -116,10 +118,10 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(quality_router)
     app.include_router(performance_router)
     app.include_router(llm_router)
+    app.include_router(market_router)
 
     if settings.eod_auto_settle:
         # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点
-        import asyncio
         from datetime import datetime as _dt
 
         from core.settle_scheduler import EodSettleTrigger
@@ -150,6 +152,30 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
         @app.on_event("shutdown")
         async def _stop_eod_settle():
             task = getattr(app.state, "settle_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    if settings.market_data_enabled:
+        # spec-03 §3.5 交易时段采集器常驻（web 部署版进程级在线保障：交易时段不中断）
+        from core.collector import MarketCollector
+
+        app.state.collector = MarketCollector(app.state)
+
+        @app.on_event("startup")
+        async def _start_collector():
+            app.state.collector_task = asyncio.create_task(
+                app.state.collector.run_forever(3)
+            )
+            log.info("spec-03 数据服务已启用：源=%s，采集间隔 3s",
+                     app.state.collector.configured)
+
+        @app.on_event("shutdown")
+        async def _stop_collector():
+            task = getattr(app.state, "collector_task", None)
             if task is not None:
                 task.cancel()
                 try:
