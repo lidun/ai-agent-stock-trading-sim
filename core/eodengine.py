@@ -1214,6 +1214,26 @@ def settle_account(
                 ),
             )
 
+        def record_sell_pnl(o: dict, tid: str, qty: int, p: Decimal,
+                            fz: dict) -> None:
+            """spec-05 §4.2 期望值取数：卖出成交写盘已实现净盈亏（含双边费）。
+
+            realized_pnl = 卖出净额(amount-fee) − 摊薄含费成本(avg_cost×qty)；
+            avg_cost 为持仓含费摊薄（买入即算），成交时刻真实读取，不虚构。
+            """
+            avgrow = c.execute(
+                "SELECT avg_cost FROM holdings WHERE account_id=? AND symbol=?",
+                (account_id, o["symbol"]),
+            ).fetchone()
+            if avgrow is None or avgrow["avg_cost"] is None:
+                return
+            amount = (p * qty).quantize(_MONEY, ROUND_HALF_UP)
+            realized = (amount - fz["total"]
+                        - _D(avgrow["avg_cost"]) * qty).quantize(
+                _MONEY, ROUND_HALF_UP)
+            c.execute("UPDATE trades SET realized_pnl=? WHERE id=?",
+                      (_q(realized), tid))
+
         def sell_fill(o: dict, qty: int, p: Decimal, ts: str, *, oid: str) -> None:
             """卖出撮合公共路径（L0/开板共用）：T+1 可卖校验、现金、FIFO 核销、清仓删除。"""
             nonlocal cash
@@ -1232,6 +1252,7 @@ def settle_account(
             fz = _fees(amount, side="sell", fee=f)
             cash += amount - fz["total"]
             tid = write_trade(o, "sell", qty, p, ts, fz)
+            record_sell_pnl(o, tid, qty, p, fz)
             rem = qty
             lots = c.execute(
                 """
@@ -1563,6 +1584,7 @@ def settle_account(
                                 fz = _fees(amount, side="sell", fee=f)
                                 cash += amount - fz["total"]
                                 tid = write_trade(o, "sell", qty, p, ts, fz, quality=quality)
+                                record_sell_pnl(o, tid, qty, p, fz)
                                 rem = qty
                                 lots = c.execute(
                                     """
@@ -1729,6 +1751,7 @@ def settle_account(
                     fz = _fees(amount, side="sell", fee=f)
                     cash += amount - fz["total"]
                     tid = write_trade(o, "sell", qty, p, close_ts, fz, quality=trail_quality)
+                    record_sell_pnl(o, tid, qty, p, fz)
                     rem = qty
                     lots = c.execute(
                         """

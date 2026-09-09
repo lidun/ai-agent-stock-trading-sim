@@ -162,6 +162,19 @@ class EodSettleTrigger:
                     f"行情缺口 {gaps} 票")
         return {"tracked_accounts": len(accounts), "closed": closed, "updated": updated}
 
+    def _advance_windows(self, trade_date: str) -> list[dict]:
+        """EVOQUANT 验证窗推进（spec-05 §4.3：验证窗口到期由调度器触发）。
+
+        在每个确认的交易日结算/跟踪推进完成后登记当日会话并做满窗判定（真实事件，
+        幂等，见 core/evoquant.advance_windows）。窗口内判定只依据真实引擎记录。
+        """
+        from core import evoquant  # noqa: PLC0415
+        try:
+            return evoquant.advance_windows(self.state, trade_date)
+        except Exception:  # noqa: BLE001 - 窗口推进故障不阻断结算主流程
+            log.exception("验证窗推进失败 trade_date=%s", trade_date)
+            return []
+
     def settle_once(self, now: datetime | None = None) -> dict:
         """单次判定+触发（含当日缺口账户记账，供 close_day_gaps 窗口关闭后补缺勤）。"""
         outcome = self._settle_once(now or bjt_now())
@@ -192,7 +205,8 @@ class EodSettleTrigger:
                     "snapshot_date": snap_day.isoformat() if snap_day else None}
         exits = self._advance_exits(dstr)
         self._done_dates.add(dstr)
-        return {"date": dstr, "status": "no_pending", "exits": exits}
+        return {"date": dstr, "status": "no_pending", "exits": exits,
+                "windows": self._advance_windows(dstr)}
 
     def _settle_trading_day(self, dstr: str) -> dict:
         """实盘会话当天：探测交易日 → 推进卖出跟踪 → 跑当日结算。"""
@@ -214,7 +228,7 @@ class EodSettleTrigger:
             self._audit("trade.eod_settle_auto", "ok",
                         f"{dstr} 结算完成，账户 {len(accounts_r)} 个")
             return {"date": dstr, "status": "settled", "accounts": accounts_r,
-                    "exits": exits}
+                    "exits": exits, "windows": self._advance_windows(dstr)}
         self._audit("trade.eod_settle_auto", "partial",
                     f"{dstr} 存在缺口账户 {len(errors)} 个，窗口内续试")
         return {"date": dstr, "status": "retry_gap", "errors": errors,
@@ -257,8 +271,9 @@ class EodSettleTrigger:
                                         corp_events=self._corp_events_for(d))
             accts = report.get("accounts", [])
             acct_errs = [a for a in accts if a.get("error")]
+            windows = [] if acct_errs else self._advance_windows(d)
             dates.append({"date": d, "exits": exits, "error": bool(acct_errs),
-                          "accounts": accts})
+                          "accounts": accts, "windows": windows})
             if acct_errs:
                 errs.append({"date": d, "errors": acct_errs})
                 self._fill_catchup_absent(d, acct_errs)

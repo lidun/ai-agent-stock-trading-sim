@@ -162,6 +162,59 @@ def create_trial_agent(state, *, agent_id: str, name: str,
     }
 
 
+def provision_validation_account(state, *, agent_id: str) -> dict:
+    """EVOQUANT 验证窗独立账户（spec-05 §4.2 v0.5/#63，写方=引擎优化流）。
+
+    面向"在跑"策略 Agent（非 trial/archived，须已有 role=main 主账户）：每轮验证窗
+    各建一个 role=validation 独立账户（id <agent_id>.validation[.N]，避免复用上一轮
+    已归档账户导致资金/持仓串轮）、parent=主 Agent、初始资金同主账户 initial_capital
+    （10 万种子）、status='trial'、active_version_no 留空（由 evoquant.open_validation
+    置为待验版本——下单引擎默认按账户快照继承，spec-01 §2.5/§2.7 版本标记链路）。
+    与主账户同期、同市场、独立结算（spec-01 §2.7 v0.6）。整体单事务，不写审计
+    （写侧审计归 EVOQUANT 闭环）。
+    """
+    conn = state_conn(state)
+    with write_txn(conn) as c:
+        ag = c.execute(
+            "SELECT id, name, status FROM agents WHERE id=?", (agent_id,)
+        ).fetchone()
+        if ag is None:
+            raise LookupError(f"Agent 不存在：{agent_id}")
+        if ag["status"] in ("trial", "archived"):
+            raise LookupError(
+                f"Agent {agent_id} 不在可验证运行态（status={ag['status']}）"
+            )
+        main = c.execute(
+            "SELECT * FROM accounts WHERE agent_id=? AND role='main'"
+            " AND status NOT IN ('archived', 'halted') ORDER BY created_ts LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if main is None:
+            raise LookupError(f"Agent {agent_id} 无现役主账户可参照")
+        base = f"{agent_id}.validation"
+        n = 1
+        while True:
+            aid = base if n == 1 else f"{base}.{n}"
+            if c.execute("SELECT 1 FROM accounts WHERE id=?", (aid,)).fetchone() is None:
+                break
+            n += 1
+        ts = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+        cap = _money(float(main["initial_capital"]))
+        c.execute(
+            f"""
+            INSERT INTO accounts
+                (id, agent_id, role, parent_agent_id,
+                 initial_capital, cash, nav, shares, total_pnl, today_pnl,
+                 granularity, granularity_history, settle_key, status,
+                 active_version_no, created_ts, updated_ts)
+            VALUES (?,?,?,?, ?,?,?,?,?,?, 'eod_replay','[]','', 'trial', '', {ts}, {ts})
+            """,
+            (aid, agent_id, "validation", agent_id, cap,
+             cap, 1.0, cap, 0.0, 0.0),
+        )
+    return get_account(state, aid)
+
+
 def trial_replay(state, agent_id: str) -> dict | None:
     """试运行回放台账：{window_days, status, sessions: [..], sessions_done}。"""
     conn = state_conn(state)

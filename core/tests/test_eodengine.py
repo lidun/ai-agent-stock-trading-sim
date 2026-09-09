@@ -1406,3 +1406,36 @@ def test_eod_suspended_symbol_does_not_block_other_fills(authed_client):
     trs = _fetch(st, "SELECT order_id FROM trades WHERE account_id=?", (DEMO,))
     assert [t["order_id"] for t in trs] == ["co-ok-b"]
     assert _fetch(st, "SELECT status FROM condition_orders WHERE id='co-susp-b'")[0]["status"] == "expired"
+
+
+def test_eod_sell_writes_realized_pnl_net_of_fees(authed_client):
+    """spec-05 §4.2 取数前置：卖出成交写入含费已实现盈亏（spec-01 记账产物）。
+
+    买入 avg_cost 含双边费摊薄（10.0501/股），卖出净额扣除摊薄成本即每笔
+    realized_pnl；买入行恒 0。
+    """
+    st = authed_client.app.state
+    _insert_order(st, order_id="rp-b", order_type="buy", direction="buy", qty=100,
+                  trigger={"op": "le", "price": 10.05}, created="2026-09-07T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-07",
+        series_map={"600000": [("2026-09-07T09:31:00", 10.00)]},
+        close_map={"600000": 10.90},
+    )
+    buy = _fetch(st, "SELECT realized_pnl FROM trades WHERE order_id='rp-b'")[0]
+    assert float(buy["realized_pnl"]) == 0.0
+    _insert_order(st, order_id="rp-s", order_type="sell_take_profit", direction="sell",
+                  qty=100, trigger={"op": "ge", "price": 11.2},
+                  created="2026-09-08T09:00:00")
+    eodengine.settle_account(
+        st, DEMO, "2026-09-08",
+        series_map={"600000": [("2026-09-08T09:31:00", 11.10),
+                               ("2026-09-08T09:32:00", 11.25)]},
+        close_map={"600000": 11.00}, prev_close_map={"600000": 10.90},
+    )
+    sell = _fetch(st, "SELECT amount, fee_total, realized_pnl FROM trades WHERE order_id='rp-s'")[0]
+    # 净额 1110 - 手续费 > 成本 1005.01 → 已实现盈亏为正且约 100 元量级
+    rp = float(sell["realized_pnl"])
+    assert rp > 50.0 and rp < 200.0
+    net = float(sell["amount"]) - float(sell["fee_total"])
+    assert abs(rp - (net - 1005.01)) < 1.0

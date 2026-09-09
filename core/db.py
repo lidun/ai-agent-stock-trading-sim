@@ -781,6 +781,74 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON strategy_versions(agent_id, status, created_ts);
         """,
     ),
+    (
+        24,
+        """
+        -- spec-05 §4.2/#63 独立验证账户运行台账（写方=EVOQUANT 调度环）。
+        -- checkpoint 建验证版本时随建 role=validation 独立账户 + 本窗口行；窗口结束
+        -- 判定（10 交易日或 ≥trade_target 笔成交，先到为准，§4.2 参数可调）由调度器按
+        -- 真实结算日记入 sessions_done/trade_samples，满窗由 evoquant.maybe_adjudicate
+        -- 依据窗口内真实引擎记录（realized_pnl/规则级违规/熔断）出结论：
+        --   activate=通过（零违规 ∧ 期望 ≥ 现役同期 或 >0）→ spec-02 activate + 归档；
+        --   rollback=失败（违规 ∨ 期望 < -2%）→ spec-02 rollback + 归档；
+        --   sealed=窗口无成交样本，证据不足不出结论（防假激活）。
+        -- final_snapshot 为判定时账户/版本真实终态 JSON 留证（同 trial_archives 语义）。
+        CREATE TABLE IF NOT EXISTS strategy_validation_windows (
+            id                      TEXT PRIMARY KEY,
+            agent_id                TEXT NOT NULL REFERENCES agents(id),
+            version_no              TEXT NOT NULL,
+            status                  TEXT NOT NULL DEFAULT 'in_progress'
+                                    CHECK (status IN ('in_progress', 'done', 'void')),
+            validation_account_id   TEXT NOT NULL REFERENCES accounts(id),
+            main_account_id         TEXT NOT NULL REFERENCES accounts(id),
+            window_days             INTEGER NOT NULL DEFAULT 10
+                                    CHECK (window_days BETWEEN 1 AND 60),
+            trade_target            INTEGER NOT NULL DEFAULT 20
+                                    CHECK (trade_target BETWEEN 1 AND 500),
+            sessions_done           INTEGER NOT NULL DEFAULT 0,
+            trade_samples           INTEGER NOT NULL DEFAULT 0,
+            rule_violations         INTEGER NOT NULL DEFAULT 0,
+            fuse_events             INTEGER NOT NULL DEFAULT 0,
+            expectation             REAL,
+            baseline_expectation    REAL,
+            decision                TEXT NOT NULL DEFAULT ''
+                                    CHECK (decision IN ('', 'activate', 'rollback', 'sealed')),
+            decision_reason         TEXT NOT NULL DEFAULT '',
+            window_start_trade_date TEXT NOT NULL DEFAULT '',
+            final_snapshot          TEXT NOT NULL DEFAULT '{}',
+            decided_ts              TEXT NOT NULL DEFAULT '',
+            created_ts              TEXT NOT NULL,
+            updated_ts              TEXT NOT NULL,
+            UNIQUE (agent_id, version_no)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_validation_window_active
+            ON strategy_validation_windows(agent_id) WHERE status = 'in_progress';
+        CREATE INDEX IF NOT EXISTS idx_validation_window_status
+            ON strategy_validation_windows(status, updated_ts);
+
+        -- spec-05 §4.2 期望值（含费）取数：卖出成交记录每笔已实现净盈亏
+        -- realized_pnl = 卖出净额(amount-fee) − 摊薄含费成本(avg_cost×qty)，
+        -- 由引擎在真实卖出成交时写入（spec-01 记账产物），供版本窗口统计与
+        -- 现役同期比较（真实事件，不虚构）。买入行为 0。
+        ALTER TABLE trades ADD COLUMN realized_pnl REAL NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_trades_version_settle
+            ON trades(strategy_version_no, account_id, settle_date);
+
+        -- 验证窗会话台账：调度器在每个真实推进交易日（引擎确认过的结算日）登记一行，
+        -- 空成交日也计数（同 trial replay_sessions 语义，spec-05 §6.2 对齐），
+        -- (window_id, trade_date) 唯一 → 幂等重放不重复。窗口起点=首行交易日。
+        CREATE TABLE IF NOT EXISTS validation_sessions (
+            window_id  TEXT NOT NULL
+                       REFERENCES strategy_validation_windows(id),
+            account_id TEXT NOT NULL REFERENCES accounts(id),
+            trade_date TEXT NOT NULL,
+            created_ts TEXT NOT NULL,
+            UNIQUE (window_id, trade_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_validation_sessions_win
+            ON validation_sessions(window_id, trade_date);
+        """,
+    ),
 ]
 
 
