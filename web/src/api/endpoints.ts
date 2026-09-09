@@ -1106,3 +1106,31 @@ export interface MarketQuality {
 export function fetchQualityMonitor(days = 60): Promise<MarketQuality> {
   return apiGet<MarketQuality>(`/api/quality/monitor?days=${days}`);
 }
+
+// ---------- 性能监控现状快照（spec-04 §9，P3 占位） ----------
+
+export interface PerformanceSnapshot {
+  snapshot_ts: string;
+  uptime_s: number;
+  tasks: {
+    total: number;
+    status: Record<string, number>;
+    live: number;
+    stale_active: {
+      id: string;
+      agent_id: string;
+      role: string;
+      status: string;
+      age_s: number;
+      body_preview: string;
+    }[];
+  };
+  msg_1h: { delivered: number; user_requests: number; failed: number; scope: string };
+  approvals: { status: Record<string, number>; pending: number; next_expires_in_s: number | null };
+  last_settle: { trade_date: string; fresh_s: number } | null;
+  process: { ws_clients: number; engine_stub_delay_ms: number };
+}
+
+export function fetchPerformanceSnapshot(): Promise<PerformanceSnapshot> {
+  return apiGet<PerformanceSnapshot>("/api/performance/live");
+}
