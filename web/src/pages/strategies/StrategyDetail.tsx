@@ -688,7 +688,12 @@ export default function StrategyDetailPage() {
             />
           </Card>
 
-          <StrategyEvolutionCard evolution={evolution} memory={memory} loading={p2Loading} />
+          <StrategyEvolutionCard
+            evolution={evolution}
+            memory={memory}
+            windows={windows}
+            loading={p2Loading}
+          />
 
           <StrategyVersionsCard versions={versions} loading={p2Loading} />
 
