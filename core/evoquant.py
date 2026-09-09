@@ -401,6 +401,20 @@ def decide(state, w: dict, *, trade_date: str) -> dict:
         _audit(c, actor="strategy_agent",
                action="strategy.window.decide", result=decision,
                detail=f"{w['agent_id']} 验证窗 {w['version_no']} 收口：{reason}")
+        # spec-04 §5.3/§5.2：收口当日若已有结算日报 → 补写一版（版本递增留痕），
+        # data_section.annotations.window_decision 由 builder 从窗口终态派生（确定性），
+        # 无该日结算日报则缺失不虚构。
+        if c.execute(
+            "SELECT 1 FROM daily_reports WHERE agent_id=? AND trade_date=? LIMIT 1",
+            (w["validation_account_id"], trade_date),
+        ).fetchone():
+            from core import reporting  # noqa: PLC0415
+            rp = reporting.store_engine_report(
+                state, w["validation_account_id"], trade_date, conn=c)
+            _audit(c, actor="strategy_agent",
+                   action="report.window_decision", result=decision,
+                   detail=f"{w['agent_id']} 验证窗 {w['version_no']} 收口日报补版 "
+                          f"v{rp['version']}（判定注解 {decision}）")
     return {"id": w["id"], "agent_id": w["agent_id"],
             "version_no": w["version_no"], "reached": True,
             "decision": decision, "reason": reason, "sessions_done": int(sessions),

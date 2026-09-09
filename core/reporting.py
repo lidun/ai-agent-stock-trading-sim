@@ -16,7 +16,8 @@ null + annotations 标注，供缺勤日报"照常补齐可得部分"语义。
 - positions：二、持仓与盈亏 {items[]（快照口径）, totals}
 - tracking：三、卖出跟踪摘要（exit_trackings 推进态）
 - execution：五、策略执行数据 {orders_today（按 invalid_reason/终态聚合）, trades_filled}
-- annotations：{degraded[]（结算档位低于 l1 的票）, unsettled（未结算角标）, notes[]}
+- annotations：{degraded[]（结算档位低于 l1 的票）, unsettled（未结算角标）, notes[],
+  window_decision?（EVOQUANT 验证账户收口日派生注解：版本/判定/理由/期望值）}
 """
 from __future__ import annotations
 
@@ -179,6 +180,34 @@ def build_engine_data_section(state, account_id: str, trade_date: str, conn=None
         )
     if acct is None:
         annotations["notes"].append("账户不存在")
+    # spec-05 §4.2：EVOQUANT 验证账户收口当日 → annotations.window_decision 派生注解
+    # （状态源=窗口终态快照 final.last_advance，与收口判定同源，确定性可重读；普通日不携带）
+    wrow = conn.execute(
+        "SELECT version_no, decision, decision_reason, decided_ts, final_snapshot"
+        " FROM strategy_validation_windows WHERE validation_account_id=? AND status='done'"
+        " ORDER BY decided_ts DESC LIMIT 1",
+        (account_id,),
+    ).fetchone()
+    if wrow:
+        snap = {}
+        try:
+            snap = json.loads(wrow["final_snapshot"] or "{}")
+        except ValueError:
+            snap = {}
+        final = snap.get("final") or {}
+        if str(final.get("last_advance") or "") == trade_date:
+            annotations["window_decision"] = {
+                "version_no": wrow["version_no"],
+                "decision": wrow["decision"],
+                "reason": wrow["decision_reason"],
+                "expectation_pct": final.get("expectation_pct"),
+                "baseline_expectation_pct": final.get("baseline_expectation_pct"),
+                "sessions_done": final.get("sessions_done"),
+                "trade_samples": final.get("trade_samples"),
+                "rule_violations": final.get("rule_violations"),
+                "fuse_events": final.get("fuse_events"),
+                "decided_ts": wrow["decided_ts"],
+            }
 
     return {
         "schema_version": _SCHEMA_VERSION,
@@ -228,6 +257,12 @@ def render_engine_data_markdown(ds: dict) -> str:
         lines.append(f"- 数据降级：{sym}（L2 日线近似档，L1 分钟档缺口）")
     for note in anno.get("notes", []):
         lines.append(f"- 提示：{note}")
+    wd = anno.get("window_decision")
+    if wd:
+        dlabel = {"activate": "晋升现役", "rollback": "否决候选",
+                  "sealed": "封存留证"}.get(wd.get("decision"), wd.get("decision") or "收口")
+        lines.append(f"- EVOQUANT 验证窗收口：版本 {wd.get('version_no')} → {dlabel}"
+                     f"（{wd.get('reason') or '未记录理由'}）")
 
     ops = ds.get("operations", {})
     trades = ops.get("trades", [])

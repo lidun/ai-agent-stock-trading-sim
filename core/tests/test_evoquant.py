@@ -141,6 +141,15 @@ def test_window_activate_rollback_sealed_real_engine(authed_client):
     assert act1 and "窗口验证收口(activate)" in act1[0]["body"]
     assert "期望值(含费)" in act1[0]["body"] and "成交样本 " in act1[0]["body"]
     assert "违规 0" in act1[0]["body"] and "熔断 0" in act1[0]["body"]
+    # 收口日日报补写判定注解版：版本递增留痕 + annotations.window_decision 派生同源
+    from core import reporting  # noqa: PLC0415
+    rows = reporting.list_engine_reports(st, a1, "2026-09-08")
+    ver2 = next((r for r in rows if r["version"] == 2), None)
+    assert ver2 is not None
+    wd = ver2["data_section"]["annotations"].get("window_decision")
+    assert wd and wd["decision"] == "activate" and wd["version_no"] == "v1"
+    assert wd["expectation_pct"] is not None and wd["trade_samples"] >= 1
+    assert "EVOQUANT 验证窗收口" in ver2["merged_markdown"]
 
     # ---- 第 2 轮：v2 通过 → v1 自动降为 validated（回退候选）
     o2 = evoquant.open_validation(st, DEMO, version_no="v2", config=CFG,
