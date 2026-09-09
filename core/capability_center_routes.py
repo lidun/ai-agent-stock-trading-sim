@@ -71,3 +71,18 @@ def unbind_capability(capability_id: str, request: Request, session: SessionDep,
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, **out}
+
+
+@router.post("/capabilities/{capability_id}/deprecate")
+def deprecate_capability(capability_id: str, request: Request, session: SessionDep,
+                         payload: dict | None = Body(default=None)):
+    """管理侧停用（spec-05 §2.2 状态机 → deprecated，审计）。"""
+    actor = session["session"]["username"]
+    reason = (payload or {}).get("reason", "")
+    try:
+        out = capability_center.deprecate(
+            request.app.state, capability_id=capability_id,
+            reason=reason, audit_actor=actor)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, **out}

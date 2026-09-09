@@ -312,3 +312,40 @@ def unbind(state, *, capability_id: str, agent_id: str,
                  f"能力 {capability_id} 从 Agent {agent_id} 解绑（spec-05 §2.4）", ""),
             )
     return {"capability_id": capability_id, "agent_id": agent_id, "unbound_ts": ts}
+
+
+def deprecate(state, *, capability_id: str, reason: str = "",
+              audit_actor: str = "") -> dict:
+    """停用能力目录项（spec-05 §2.2 状态机 → deprecated，管理侧维护）。
+
+    停用后 catalog 可被 status=deprecated 过滤、bind() 拒绝新下发；存量在绑不动
+    （§2.4 存量引用留痕/通知迁移语义）。audit_actor 传入时同事务写 audit_logs。
+    幂等：已是 deprecated 直接返回现状。
+    """
+    cap = _require_capability(state, capability_id)
+    if cap is None:
+        raise LookupError(f"Capability {capability_id} 不存在")
+    if cap["status"] == "deprecated":
+        return {"capability_id": capability_id, "status": "deprecated",
+                "deprecated_ts": cap["updated_ts"], "already": True}
+    ts = _now_ts_iso()
+    c = state_conn(state)
+    from core.db import write_txn  # noqa: PLC0415
+    with write_txn(c) as cw:
+        cw.execute(
+            "UPDATE capabilities SET status='deprecated', updated_ts=? WHERE id=?",
+            (ts, capability_id),
+        )
+        if audit_actor:
+            detail_txt = f"能力 {capability_id} 停用（deprecated）"
+            if reason and str(reason).strip():
+                detail_txt += f"：{str(reason).strip()}"
+            detail_txt += "（spec-05 §2.2）"
+            cw.execute(
+                "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+                " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+                (ts, audit_actor, "capability.deprecate", "capabilities",
+                 capability_id, "deprecated", detail_txt, ""),
+            )
+    return {"capability_id": capability_id, "status": "deprecated",
+            "deprecated_ts": ts, "already": False}

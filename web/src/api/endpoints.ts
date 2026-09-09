@@ -958,6 +958,15 @@ export function unbindCapability(
   });
 }
 
+export function deprecateCapability(
+  capabilityId: string,
+  reason: string,
+): Promise<{ ok: boolean; capability_id: string; status: "deprecated"; deprecated_ts: string }> {
+  return apiPost(`/api/capabilities/${encodeURIComponent(capabilityId)}/deprecate`, {
+    reason,
+  });
+}
+
 export function fetchAgentCapabilityBindings(
   agentId: string,
   includeUnbound = false,

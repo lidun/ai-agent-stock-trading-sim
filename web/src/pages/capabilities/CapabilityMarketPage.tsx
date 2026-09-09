@@ -23,6 +23,7 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import { ReloadOutlined, SearchOutlined } from "@ant-design/icons";
 import {
+  deprecateCapability,
   fetchCapabilities,
   fetchCapabilityDetail,
   listAgents,
@@ -84,6 +85,10 @@ export default function CapabilityMarketPage() {
   const [applyAgent, setApplyAgent] = useState("");
   const [applyReason, setApplyReason] = useState("");
   const [applySending, setApplySending] = useState(false);
+
+  const [deprecateOpen, setDeprecateOpen] = useState(false);
+  const [deprecateReason, setDeprecateReason] = useState("");
+  const [deprecateSaving, setDeprecateSaving] = useState(false);
 
   useEffect(() => {
     listAgents()
@@ -176,6 +181,26 @@ export default function CapabilityMarketPage() {
       await reload();
     } catch (err) {
       message.error((err as Error).message ?? "解绑失败");
+    }
+  };
+
+  const doDeprecate = async (capabilityId: string) => {
+    setDeprecateSaving(true);
+    try {
+      const r = await deprecateCapability(capabilityId, deprecateReason.trim());
+      message.success(
+        r.status === "deprecated"
+          ? `已停用 ${capabilityId}（deprecated）——不再对新 Agent 下发，spec-05 §2.2/§2.4`
+          : "停用结果未知",
+      );
+      setDeprecateOpen(false);
+      setDeprecateReason("");
+      await refreshDetail(capabilityId);
+      await reload();
+    } catch (err) {
+      message.error((err as Error).message ?? "停用失败");
+    } finally {
+      setDeprecateSaving(false);
     }
   };
 
@@ -430,11 +455,25 @@ export default function CapabilityMarketPage() {
               </Typography.Paragraph>
             )}
 
-            <Flex justify="space-between" align="center" gap={8}>
-              <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
-                注册/绑定/解绑/回滚由管理 Agent + spec-04 审批流执行（spec-05 §2.3）；
-                子 Agent 申请下发经审批通过后在此自动绑定。
-              </Typography.Paragraph>
+            <Flex justify="space-between" align="center" gap={8} wrap>
+              <Flex gap={8} align="center" wrap>
+                {cap.status === "active" && (
+                  <Button
+                    size="small"
+                    danger
+                    onClick={() => {
+                      setDeprecateReason("");
+                      setDeprecateOpen(true);
+                    }}
+                  >
+                    停用（废弃）
+                  </Button>
+                )}
+                <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
+                  注册/绑定/解绑/回滚由管理 Agent + spec-04 审批流执行（spec-05 §2.3）；
+                  子 Agent 申请下发经审批通过后在此自动绑定。
+                </Typography.Paragraph>
+              </Flex>
               <Tooltip
                 title={
                   cap.status === "deprecated"
@@ -496,6 +535,39 @@ export default function CapabilityMarketPage() {
                 placeholder="说明该能力将如何被使用、解决什么问题"
                 value={applyReason}
                 onChange={(e) => setApplyReason(e.target.value)}
+              />
+            </div>
+          </Space>
+        )}
+      </Modal>
+
+      <Modal
+        title={cap ? `停用（废弃） · ${cap.name}` : ""}
+        open={deprecateOpen && cap !== null}
+        onCancel={() => setDeprecateOpen(false)}
+        okText="确认停用"
+        okButtonProps={{ danger: true }}
+        confirmLoading={deprecateSaving}
+        onOk={() => cap && void doDeprecate(cap.id)}
+      >
+        {cap && (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <Alert
+              type="warning"
+              showIcon
+              message="状态机 → deprecated（spec-05 §2.2/§2.4）"
+              description="停用后不再对新 Agent 下发（目录保留并可被“已废弃”过滤），存量绑定保留并进入迁移通知；留痕写 audit_logs 供追溯。"
+            />
+            <div>
+              <Typography.Text strong>停用理由（留痕）</Typography.Text>
+              <Input.TextArea
+                style={{ marginTop: 4 }}
+                rows={3}
+                maxLength={300}
+                showCount
+                placeholder="例如：沙箱环境过期 / 上游源停更 / 授权到期"
+                value={deprecateReason}
+                onChange={(e) => setDeprecateReason(e.target.value)}
               />
             </div>
           </Space>
