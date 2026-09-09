@@ -751,6 +751,36 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON capability_bindings(agent_id, unbound_ts);
         """,
     ),
+    (
+        23,
+        """
+        -- spec-02 §9 策略版本化存储（引擎 config 全量快照 + 演进状态机）。
+        -- EVOQUANT 消费方：checkpoint 建 draft → 验证通过 activate 晋升（validated_on），
+        -- 旧 active 降为 validated 候选；失败 rollback 标 rolled_back 并回最近 validated。
+        CREATE TABLE IF NOT EXISTS strategy_versions (
+            id             TEXT PRIMARY KEY,
+            agent_id       TEXT NOT NULL,
+            version_no     TEXT NOT NULL,
+            parent_version TEXT NOT NULL DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'draft'
+                           CHECK (status IN ('draft','validated','active','rolled_back')),
+            config         TEXT NOT NULL,
+            config_diff    TEXT NOT NULL DEFAULT '{}',
+            basis          TEXT NOT NULL DEFAULT '[]',
+            created_by     TEXT NOT NULL DEFAULT 'strategy_agent',
+            created_ts     TEXT NOT NULL,
+            trial_window   TEXT NOT NULL DEFAULT '{}',
+            validated_on   TEXT NOT NULL DEFAULT '',
+            failure_reason TEXT NOT NULL DEFAULT '',
+            rolled_back_to TEXT NOT NULL DEFAULT '',
+            UNIQUE (agent_id, version_no)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_versions_active
+            ON strategy_versions(agent_id) WHERE status = 'active';
+        CREATE INDEX IF NOT EXISTS idx_strategy_versions_status
+            ON strategy_versions(agent_id, status, created_ts);
+        """,
+    ),
 ]
 
 

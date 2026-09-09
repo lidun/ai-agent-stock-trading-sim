@@ -10,7 +10,8 @@ def test_seed_demo_idempotent(authed_client):
     second = seed_demo.seed(state)
     assert first == second
     assert first["charter_versions"] == 2
-    assert first["memory"] == 2
+    assert first["strategy_versions"] == 2
+    assert first["memory"] == 5  # 2 条人工演进 + EVOQUANT v1 checkpoint/activate + v2 checkpoint
     assert first["capabilities"] == 3
     assert first["bindings"] == 2
     assert first["kb"] == 2

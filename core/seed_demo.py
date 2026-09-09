@@ -105,6 +105,33 @@ def seed(state, *, demo: str = DEMO, manager: str = MANAGER) -> dict:
             bound_ids.append(cap["id"])
     assert len(bound_ids) <= 2  # 幂等断言：目录只 3 项、tool+datasource 在绑
 
+    # ---- 策略版本化演进链（spec-02 §9 / EVOQUANT）：v1 现役，v2 验证中 ----
+    from core import strategy_versions  # noqa: PLC0415
+    if strategy_versions.list_versions(state, demo)["total"] == 0:
+        strategy_versions.checkpoint(
+            state, demo, version_no="v1",
+            config={
+                "selection": {"filter": "dividend", "top": 30,
+                              "exclude": ["st", "pledge>50"]},
+                "risk": {"single_stock_cap": 0.1, "vol_target": [0.06, 0.09]},
+                "exit": {"rule": "div_yield<2.5% 或 60日新高回落>8% 触发复核"},
+            },
+            basis=["opt:demo-001", "KB-0001"], trial_window={},
+            created_by="manager")
+        strategy_versions.activate(state, demo, "v1", activated_by="manager")
+        strategy_versions.checkpoint(
+            state, demo, version_no="v2",
+            config={
+                "selection": {"filter": "dividend", "top": 30,
+                              "exclude": ["st", "pledge>50"]},
+                "risk": {"single_stock_cap": 0.1, "vol_target": [0.06, 0.09]},
+                "exit": {"rule": "跌破阈值先进 3 日观察窗，连续确认才卖"},
+            },
+            config_diff={"exit": {"window_days": 3}},
+            basis=["opt:demo-002", "KB-0001"],
+            trial_window={"window_days": 10, "cap_ceiling": 0.3},
+            created_by="manager")
+
     # ---- 知识库（spec-05 §3）：正/反两例 ----
     existing_kb = {r["name"] for r in kb.list_entries(state)}
     spec_pit = {
@@ -135,6 +162,7 @@ def seed(state, *, demo: str = DEMO, manager: str = MANAGER) -> dict:
         "charter_versions": state_conn(state).execute(
             "SELECT COUNT(*) n FROM strategy_charter_versions WHERE agent_id=?",
             (demo,)).fetchone()["n"],
+        "strategy_versions": strategy_versions.list_versions(state, demo)["total"],
         "memory": len(strategy_memory.list_strategy_memory(state, demo)["items"]),
         "capabilities": len(capability_center.catalog(state)["items"]),
         "bindings": len(capability_center.agent_bindings(state, demo)["items"]),

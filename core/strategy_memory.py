@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from datetime import datetime, timezone
 
 from core.db import state_conn
@@ -76,7 +77,7 @@ def _append(state, agent_id: str, *, version_no: str, body: str,
     """内部受控写入（测试/壳用；公开写方=引擎优化流，本片不开放路由）。"""
     _require_agent(state, agent_id)
     dedup = dedup_key or f"strategy:{version_no}:{hashlib.sha1(body.encode()).hexdigest()[:16]}"
-    rid = f"{agent_id}:mem:{version_no}:{int(datetime.now().timestamp() * 1000)}"
+    rid = f"{agent_id}:mem:{version_no}:{int(datetime.now().timestamp() * 1000)}:{secrets.token_hex(3)}"
     from core.db import write_txn  # noqa: PLC0415
     c = state_conn(state)
     with write_txn(c) as cw:
