@@ -188,6 +188,31 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
     };
   }, [agent]);
 
+  useEffect(() => {
+    if (!agent || agent.role === "manager") return;
+    let live = true;
+    let inflight = false;
+    const poll = async () => {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const w = await fetchValidationWindows(agent.id);
+        if (live) setWindows(w);
+      } catch {
+        // 单次失败静默降级，保留下一次轮询
+      } finally {
+        inflight = false;
+      }
+    };
+    const t = window.setInterval(() => {
+      void poll();
+    }, 8000);
+    return () => {
+      live = false;
+      window.clearInterval(t);
+    };
+  }, [agent]);
+
   const active = profile?.active ?? null;
   const versionRows = useMemo(
     () =>
