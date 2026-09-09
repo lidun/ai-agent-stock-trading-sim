@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-from core import accountstore, reporting
+from core import accountstore, narrative, reporting
 from core.auth import require_session
 
 router = APIRouter(prefix="/api", tags=["reports"])
@@ -62,6 +62,20 @@ def report_narrative_update(agent_id: str, trade_date: str, version: int,
     if updated is None:
         raise HTTPException(status_code=404, detail="该版本日报不存在")
     return {"ok": True, "report": updated}
+
+
+@router.post("/accounts/{agent_id}/reports/{trade_date}/narrative/generate")
+def report_narrative_generate(agent_id: str, trade_date: str, request: Request,
+                              session: SessionDep, force: bool = False):
+    """补写/重写该日 LLM 叙述段（spec-04 §5.2/§9.1：未配置/失败确定性降级不报错）。
+
+    返回确定性状态码：generated/skipped/not_settled/no_report/
+    not_configured/llm_failed/empty_output/invalid。
+    """
+    _ensure_account(request.app.state, agent_id)
+    actor = session["session"]["username"]
+    return narrative.generate_narrative(
+        request.app.state, agent_id, trade_date, force=force, actor=actor)
 
 
 @router.get("/accounts/{agent_id}/reports/{trade_date}/export")
