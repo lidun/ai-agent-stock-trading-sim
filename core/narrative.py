@@ -19,7 +19,7 @@ from datetime import datetime as _datetime
 from datetime import time as _time
 from datetime import timedelta as _td
 
-from core import llm, reporting
+from core import llm, perf_records, reporting
 from core.db import state_conn, write_txn
 
 _PROMPT_NARRATIVE = """你是策略子 Agent「{agent_name}」（id {agent_id}）的日报叙述撰写者，正在撰写 {trade_date} 的收盘日报叙述段（spec-04 §5.2 六段结构中的四~六段）。
@@ -149,6 +149,8 @@ def generate_narrative(state, account_id: str, trade_date: str, *,
         prev_narrative=_prev_narrative(state, account_id, trade_date),
     )
 
+    started_mono = _tm.monotonic()
+    task_id = f"report.narrative:{report['id']}"
     try:
         out = llm.chat(state, [
             {"role": "system", "content": "你是严谨的量化策略子 Agent 日报叙述员；只陈述可支撑的判断，明确区分事实、推演与拟议，不虚构数据。"},
@@ -158,23 +160,39 @@ def generate_narrative(state, account_id: str, trade_date: str, *,
         _audit(state, report, "not_configured", str(exc), usage=None)
         return {"ok": False, "code": "not_configured", "detail": str(exc)}
     except llm.LLMProviderError as exc:
+        perf_records.record_chat_usage(
+            state, agent_id=account_id, task_id=task_id, task_type="narrative",
+            provider="", model="", usage=None, ok=False,
+            started_mono=started_mono, detail=str(exc)[:400])
         _audit(state, report, "failed", str(exc), usage=None)
         return {"ok": False, "code": "llm_failed", "detail": str(exc)}
 
     narrative = (out.get("content") or "").strip()
     if not narrative:
+        perf_records.record_chat_usage(
+            state, agent_id=account_id, task_id=task_id, task_type="narrative",
+            provider=out.get("provider", ""), model=out.get("model", ""),
+            usage=out.get("usage"), ok=False, started_mono=started_mono,
+            detail="模型返回空叙述")
         _audit(state, report, "failed", "模型返回空叙述", usage=out.get("usage"))
         return {"ok": False, "code": "empty_output", "detail": "模型返回空叙述"}
+    perf = perf_records.record_chat_usage(
+        state, agent_id=account_id, task_id=task_id, task_type="narrative",
+        provider=out.get("provider", ""), model=out.get("model", ""),
+        usage=out.get("usage"), ok=True, started_mono=started_mono,
+        detail=f"narrative_len={len(narrative)}")
     try:
         reporting.update_narrative(
-            state, account_id, trade_date, report["version"], narrative, actor=actor)
+            state, account_id, trade_date, report["version"], narrative,
+            actor=actor, perf_id=perf["id"])
     except ValueError as exc:
         return {"ok": False, "code": "invalid", "detail": str(exc)}
     _audit(state, report, "ok", f"narrative_len={len(narrative)}",
            usage=out.get("usage"), model=out.get("model"))
     return {"ok": True, "code": "generated", "version": report["version"],
             "narrative_len": len(narrative), "model": out.get("model"),
-            "usage": out.get("usage")}
+            "usage": out.get("usage"), "perf_id": perf["id"],
+            "cost_yuan": perf["cost_yuan"]}
 
 
 def _audit(state, report: dict, result: str, detail: str,

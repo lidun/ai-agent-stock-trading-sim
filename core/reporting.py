@@ -449,9 +449,11 @@ def list_engine_reports(state, account_id: str, trade_date: str | None = None,
 
 
 def update_narrative(state, account_id: str, trade_date: str, version: int,
-                     narrative: str, actor: str) -> dict | None:
+                     narrative: str, actor: str, perf_id: str | None = None,
+                     ) -> dict | None:
     """写叙述段（spec-04 §5.2 narrative 由日报任务/人工写入；同版本原地更新留审计，
-    版本留痕语义由修订 v+1 承担）。返回更新后的版本概览；无该行返回 None。"""
+    版本留痕语义由修订 v+1 承担；perf_id 回填费用追溯 performance_records）。
+    返回更新后的版本概览；无该行返回 None。"""
     if not isinstance(narrative, str) or len(narrative) > 12000:
         raise ValueError("叙述段须为文本且不超过 12000 字")
     conn = state_conn(state)
@@ -464,11 +466,16 @@ def update_narrative(state, account_id: str, trade_date: str, version: int,
         if row is None:
             return None
         old = row["narrative"]
-        if old == narrative:
+        if old == narrative and perf_id is None:
             return {"id": row["id"], "account_id": account_id,
                     "trade_date": trade_date, "version": version, "unchanged": True}
-        c.execute(
-            "UPDATE daily_reports SET narrative=? WHERE id=?", (narrative, row["id"]))
+        if perf_id is None:
+            c.execute(
+                "UPDATE daily_reports SET narrative=? WHERE id=?", (narrative, row["id"]))
+        else:
+            c.execute(
+                "UPDATE daily_reports SET narrative=?, llm_perf_id=? WHERE id=?",
+                (narrative, perf_id, row["id"]))
         c.execute(
             "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
             " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",

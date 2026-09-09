@@ -227,7 +227,8 @@ def _config_secret(state) -> dict:
     key = _dec(state, row["api_key_enc"])
     if not key:
         raise LLMNotConfigured("模型服务密钥不可解密，请重新在设置页填入")
-    return {"base_url": row["base_url"], "model": row["model"], "api_key": key}
+    return {"base_url": row["base_url"], "model": row["model"], "api_key": key,
+            "provider": row["preset"] or "custom"}
 
 
 def _post_chat(cfg: dict, messages: list[dict], *, timeout_s: float) -> dict:
@@ -245,14 +246,22 @@ def _post_chat(cfg: dict, messages: list[dict], *, timeout_s: float) -> dict:
         choice = data["choices"][0]
         message = choice.get("message", {})
         usage = data.get("usage") or {}
+        ptd = usage.get("prompt_tokens_details") or {}
+        cached = 0
+        try:
+            cached = int(ptd.get("cached_tokens") or 0)
+        except (TypeError, ValueError):
+            cached = 0
         return {
             "content": message.get("content"),
             "finish_reason": choice.get("finish_reason"),
             "model": data.get("model") or cfg["model"],
+            "provider": cfg.get("provider", ""),
             "usage": {
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
+                "cached_tokens": cached,
             },
         }
     except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError) as exc:

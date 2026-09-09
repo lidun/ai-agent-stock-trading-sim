@@ -868,6 +868,53 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        26,
+        """
+        -- spec-02 §11 单价配置化不写死：价格变动仅改表；cache_read_per_1k 为缓存命中
+        -- 单价（无缓存机制的 provider 置 NULL，按 input 价计）。PK(provider, model)。
+        CREATE TABLE IF NOT EXISTS provider_pricing (
+            provider           TEXT NOT NULL,
+            model              TEXT NOT NULL,
+            input_per_1k       REAL NOT NULL DEFAULT 0,
+            output_per_1k      REAL NOT NULL DEFAULT 0,
+            cache_read_per_1k  REAL,
+            updated_ts         TEXT NOT NULL,
+            updated_by         TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (provider, model)
+        );
+
+        -- spec-02 §11 任务粒度性能与费用留痕（与账单可对）；daily_reports.llm_perf_id 追溯。
+        CREATE TABLE IF NOT EXISTS performance_records (
+            id              TEXT PRIMARY KEY,
+            task_id         TEXT NOT NULL,
+            agent_id        TEXT NOT NULL,
+            task_type       TEXT NOT NULL,
+            started_ts      TEXT,
+            ended_ts        TEXT,
+            duration_ms     INTEGER,
+            mem_peak_mb     REAL,
+            llm_calls       INTEGER NOT NULL DEFAULT 0,
+            tool_calls      INTEGER NOT NULL DEFAULT 0,
+            tokens_in       INTEGER NOT NULL DEFAULT 0,
+            cached_tokens   INTEGER NOT NULL DEFAULT 0,
+            tokens_out      INTEGER NOT NULL DEFAULT 0,
+            cost_yuan       REAL,
+            data_fetch_bytes INTEGER NOT NULL DEFAULT 0,
+            result          TEXT NOT NULL DEFAULT 'ok'
+                            CHECK (result IN ('ok', 'failed', 'high_cost')),
+            high_cost_flag  INTEGER NOT NULL DEFAULT 0,
+            provider        TEXT NOT NULL DEFAULT '',
+            model           TEXT NOT NULL DEFAULT '',
+            detail          TEXT NOT NULL DEFAULT '',
+            created_ts      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_perf_records_task
+            ON performance_records(task_id);
+        CREATE INDEX IF NOT EXISTS idx_perf_records_agent_time
+            ON performance_records(agent_id, created_ts);
+        """,
+    ),
 ]
 
 
