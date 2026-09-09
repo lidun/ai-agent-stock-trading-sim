@@ -31,7 +31,16 @@ Entries discovered by the Agent during task execution should follow this format:
 
 ## Entries
 
-[User Instruction Summary]
+[Project Knowledge Summary]
+- Date: 2026-09-09
+- Context: Discovered by Agent while implementing spec-03 行情采集链路（L0store/collector/source_chain v27 切片）并做实库迁移核对
+- Category: Environment Configuration / Troubleshooting & Debugging
+- Instructions:
+  - /workspace/core 下存在同名目录 core/core（含 data 子目录），从 /workspace/core 用裸 python 执行 `import core` 会命中该 namespace 包（无 db.py，报 No module named 'core.db'）而非真实包。Python 脚本一律在仓库根 /workspace 运行（测试已由 pyproject pythonpath=['..'] 保证，用 `python3 -m pytest core/tests -q`）；禁止在 /workspace/core 下直接跑 python -c / 脚本。
+  - 误在 /workspace/core 下运行会以默认 CORE_DATA_DIR=core/data 相对根目录创建出 core/core/data/aat.db 的“幽灵库”，核对迁移版本时须对 /workspace/core/data/aat.db（仓库根视角）执行。
+  - core/db.connect 要求 Path（Connections 内部会转 Path）；脚本传 str 会 AttributeError，先 `Path(...)` 包装。
+
+[Project Knowledge Summary]
 - Date: 2026-09-06（2026-09-08 演进记忆/能力域切片后用户重申并明确：继续）
 - Context: 完成多个开发切片后，用户补充推进方式约定；本次再强调"以后不用问先做哪个，按你的建议直接做"
 - Instructions:
