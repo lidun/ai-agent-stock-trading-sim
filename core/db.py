@@ -849,6 +849,25 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON validation_sessions(window_id, trade_date);
         """,
     ),
+    (
+        25,
+        """
+        CREATE TABLE IF NOT EXISTS llm_provider (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            kind          TEXT NOT NULL DEFAULT 'openai_compat',
+            preset        TEXT NOT NULL DEFAULT '',
+            base_url      TEXT NOT NULL DEFAULT '',
+            model         TEXT NOT NULL DEFAULT '',
+            api_key_enc   TEXT NOT NULL DEFAULT '',
+            api_key_hint  TEXT NOT NULL DEFAULT '',
+            updated_ts    TEXT NOT NULL,
+            updated_by    TEXT NOT NULL DEFAULT '',
+            last_test_ts  TEXT,
+            last_test_ok  INTEGER,
+            last_test_error TEXT NOT NULL DEFAULT ''
+        );
+        """,
+    ),
 ]
 
 

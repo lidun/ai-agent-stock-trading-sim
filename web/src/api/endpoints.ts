@@ -51,6 +51,33 @@ export function revokeSession(tokenHash: string): Promise<{ ok: true }> {
   return apiPost(`/api/auth/sessions/${encodeURIComponent(tokenHash)}/revoke`);
 }
 
+export interface LlmLastTest {
+  ts: string | null;
+  ok: boolean;
+  error: string | null;
+}
+
+export interface LlmProviderView {
+  configured: boolean;
+  kind: string;
+  preset: string;
+  base_url: string;
+  model: string;
+  api_key_set: boolean;
+  api_key_hint: string;
+  updated_ts: string;
+  updated_by: string;
+  last_test: LlmLastTest | null;
+}
+
+export interface LlmHealth {
+  configured: boolean;
+  api_key_set: boolean;
+  preset: string;
+  model: string;
+  last_test: LlmLastTest | null;
+}
+
 export interface Health {
   ok: boolean;
   service: string;
@@ -59,10 +86,39 @@ export interface Health {
   uptime_s: number;
   db: boolean;
   single_instance: boolean;
+  llm: LlmHealth;
 }
 
 export function fetchHealth(): Promise<Health> {
   return apiGet<Health>("/api/health");
+}
+
+export function fetchLlmProvider(): Promise<LlmProviderView> {
+  return apiGet<LlmProviderView>("/api/settings/llm-provider");
+}
+
+export function saveLlmProvider(input: {
+  preset?: string;
+  base_url?: string;
+  model?: string;
+  api_key?: string;
+}): Promise<{ ok: boolean; provider: LlmProviderView }> {
+  return apiPatch("/api/settings/llm-provider", input);
+}
+
+export function removeLlmProvider(): Promise<{ ok: boolean; provider: LlmProviderView }> {
+  return apiDelete("/api/settings/llm-provider");
+}
+
+export function testLlmProvider(): Promise<{
+  ok: boolean;
+  configured: boolean;
+  error?: string;
+  model?: string;
+  latency_ms?: number;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
+}> {
+  return apiPost("/api/settings/llm-provider/test");
 }
 
 // ---------- 对话域（spec-06 §6.1 / spec-02 §6.2 契约） ----------

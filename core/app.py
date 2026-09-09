@@ -32,6 +32,7 @@ from core.validation_windows_routes import router as validation_windows_router
 from core.capability_center_routes import router as capability_center_router
 from core.quality_routes import router as quality_router
 from core.performance_routes import router as performance_router
+from core.llm_routes import router as llm_router
 
 log = logging.getLogger("core")
 
@@ -114,6 +115,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(capability_center_router)
     app.include_router(quality_router)
     app.include_router(performance_router)
+    app.include_router(llm_router)
 
     if settings.eod_auto_settle:
         # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点

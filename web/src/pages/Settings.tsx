@@ -1,23 +1,38 @@
 import { useEffect, useState } from "react";
 import {
+  Button,
   Card,
   Descriptions,
+  Flex,
+  Form,
+  Input,
   List,
-  Button,
+  Select,
+  Space,
   Tag,
   Typography,
   App as AntApp,
-  Space,
 } from "antd";
-import { ReloadOutlined, SafetyOutlined } from "@ant-design/icons";
+import {
+  ApiOutlined,
+  ReloadOutlined,
+  SafetyOutlined,
+  ThunderboltOutlined,
+  DeleteOutlined,
+} from "@ant-design/icons";
 import { useAuth } from "../store/auth";
 import { useConnection } from "../hooks/useConnection";
 import {
-  listSessions,
-  revokeSession,
+  fetchLlmProvider,
   fetchHealth,
-  type SessionInfo,
+  listSessions,
+  removeLlmProvider,
+  revokeSession,
+  saveLlmProvider,
+  testLlmProvider,
   type Health,
+  type LlmProviderView,
+  type SessionInfo,
 } from "../api/endpoints";
 import { EmptyState } from "../components/EmptyState";
 
@@ -27,21 +42,53 @@ const CONN_LABEL: Record<string, string> = {
   offline: "中断重连中",
 };
 
+interface Preset {
+  key: string;
+  label: string;
+  base_url: string;
+  model: string;
+}
+
+const LLM_PRESETS: Preset[] = [
+  { key: "deepseek", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { key: "openai", label: "OpenAI", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  { key: "dashscope", label: "通义千问（DashScope 兼容）", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
+  { key: "moonshot", label: "Kimi（Moonshot）", base_url: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
+  { key: "zhipu", label: "智谱 GLM", base_url: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
+];
+
 export default function SettingsPage() {
   const user = useAuth((s) => s.user);
   const conn = useConnection();
-  const { message } = AntApp.useApp();
+  const { message, modal } = AntApp.useApp();
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [currentHash, setCurrentHash] = useState<string>("");
   const [health, setHealth] = useState<Health | null>(null);
   const [revoking, setRevoking] = useState(false);
 
+  const [llm, setLlm] = useState<LlmProviderView | null>(null);
+  const [preset, setPreset] = useState<string>("deepseek");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  const applyLlm = (v: LlmProviderView) => {
+    setLlm(v);
+    setPreset(v.preset || "deepseek");
+    setBaseUrl(v.base_url);
+    setModel(v.model);
+    setApiKey("");
+  };
+
   const load = async () => {
     try {
-      const [s, h] = await Promise.all([listSessions(), fetchHealth()]);
+      const [s, h, ll] = await Promise.all([listSessions(), fetchHealth(), fetchLlmProvider()]);
       setSessions(s.sessions);
       setCurrentHash(s.current_token_hash);
       setHealth(h);
+      applyLlm(ll);
     } catch (e) {
       message.error((e as Error).message ?? "加载失败");
     }
@@ -65,6 +112,71 @@ export default function SettingsPage() {
     }
   };
 
+  const choosePreset = (key: string) => {
+    const p = LLM_PRESETS.find((x) => x.key === key);
+    setPreset(key);
+    if (p) {
+      setBaseUrl(p.base_url);
+      setModel(p.model);
+    }
+  };
+
+  const saveProvider = async () => {
+    setSaving(true);
+    try {
+      const res = await saveLlmProvider({
+        preset,
+        base_url: baseUrl.trim(),
+        model: model.trim(),
+        ...(apiKey ? { api_key: apiKey.trim() } : {}),
+      });
+      applyLlm(res.provider);
+      message.success(res.provider.api_key_set ? "模型服务已保存（密钥加密落库）" : "模型服务已保存");
+    } catch (e) {
+      message.error((e as Error).message ?? "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const runTest = async () => {
+    setTesting(true);
+    try {
+      const res = await testLlmProvider();
+      if (res.ok) {
+        message.success(`连通成功 · ${res.model ?? model}（${res.latency_ms ?? "?"}ms）`);
+      } else {
+        message.error(res.error ?? "连通失败");
+      }
+      await load();
+    } catch (e) {
+      message.error((e as Error).message ?? "测试失败");
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const removeProvider = () => {
+    modal.confirm({
+      title: "移除模型服务配置",
+      content: "将删除已加密保存的 API Key、Base URL 与模型。确认移除？",
+      okButtonProps: { danger: true },
+      okText: "移除",
+      onOk: async () => {
+        try {
+          const res = await removeLlmProvider();
+          applyLlm(res.provider);
+          message.success("已移除模型服务配置");
+          await load();
+        } catch (e) {
+          message.error((e as Error).message ?? "移除失败");
+        }
+      },
+    });
+  };
+
+  const hasProviderConfig = Boolean(llm && (baseUrl.trim() || model.trim()));
+
   return (
     <div className="page">
       <Typography.Title level={4} style={{ marginTop: 0 }}>
@@ -82,12 +194,118 @@ export default function SettingsPage() {
               <Descriptions.Item label="SQLite 健康">
                 {health.db ? <Tag color="success">正常</Tag> : <Tag color="error">异常</Tag>}
               </Descriptions.Item>
+              <Descriptions.Item label="模型服务">
+                {health.llm?.configured ? (
+                  <Space size={4}>
+                    <Tag color="blue">{health.llm.model}</Tag>
+                    {health.llm.last_test ? (
+                      health.llm.last_test.ok ? (
+                        <Tag color="success">最近自检通过</Tag>
+                      ) : (
+                        <Tag color="error">最近自检失败</Tag>
+                      )
+                    ) : null}
+                  </Space>
+                ) : (
+                  <Tag>未配置</Tag>
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label="单实例锁">{String(health.single_instance)}</Descriptions.Item>
               <Descriptions.Item label="已运行">{health.uptime_s}s</Descriptions.Item>
             </Descriptions>
           ) : (
             <EmptyState title="加载中…" icon={<ReloadOutlined />} />
           )}
+        </Card>
+
+        <Card
+          title={
+            <Space>
+              <ApiOutlined />
+              模型服务
+            </Space>
+          }
+          extra={
+            llm?.configured ? (
+              <Space size={4}>
+                <Tag color="blue">已配置</Tag>
+                {llm.api_key_set && (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    密钥 {llm.api_key_hint}
+                  </Typography.Text>
+                )}
+              </Space>
+            ) : (
+              <Tag>未配置</Tag>
+            )
+          }
+        >
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+            Agent 的大模型能力（日报叙述段 / 市场判断 / 审批评审）经 OpenAI 兼容统一适配层调用（spec-04 §8）。
+            API Key 在 core 本地以 0600 密钥文件加密后落库，界面仅掩码展示，不回传明文。
+          </Typography.Paragraph>
+          <Form layout="vertical" size="small" style={{ maxWidth: 560 }}>
+            <Form.Item label="供应商预设">
+              <Select
+                value={preset}
+                options={LLM_PRESETS.map((p) => ({ value: p.key, label: p.label }))}
+                onChange={choosePreset}
+                placeholder="选择预设，可再手动修正下方端点与模型"
+              />
+            </Form.Item>
+            <Form.Item label="Base URL（OpenAI 兼容 /chat/completions 端点前缀）">
+              <Input
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                placeholder="https://api.deepseek.com/v1"
+              />
+            </Form.Item>
+            <Form.Item label="模型">
+              <Input
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="deepseek-chat"
+              />
+            </Form.Item>
+            <Form.Item
+              label={
+                llm?.api_key_set
+                  ? `API Key（已保存 ${llm.api_key_hint}，留空表示保留原密钥）`
+                  : "API Key"
+              }
+            >
+              <Input.Password
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={llm?.api_key_set ? "输入新密钥以替换" : "粘贴 provider API Key"}
+                autoComplete="new-password"
+              />
+            </Form.Item>
+            <Form.Item style={{ marginBottom: 0 }}>
+              <Flex gap={8} wrap>
+                <Button type="primary" loading={saving} disabled={!hasProviderConfig} onClick={() => void saveProvider()}>
+                  保存
+                </Button>
+                <Button icon={<ThunderboltOutlined />} loading={testing} disabled={!llm?.configured} onClick={() => void runTest()}>
+                  测试连通
+                </Button>
+                <Button danger ghost icon={<DeleteOutlined />} disabled={!llm?.api_key_set && !llm?.configured} onClick={removeProvider}>
+                  移除配置
+                </Button>
+                {llm?.last_test && (
+                  <Typography.Text
+                    type={llm.last_test.ok ? "success" : "danger"}
+                    style={{ fontSize: 12, alignSelf: "center" }}
+                    ellipsis
+                  >
+                    {llm.last_test.ok
+                      ? `最近自检通过（${(llm.last_test.ts ?? "").replace("T", " ").slice(0, 19) || "—"}）`
+                      : `最近自检失败：${llm.last_test.error ?? "未知错误"}`}
+                  </Typography.Text>
+                )}
+              </Flex>
+            </Form.Item>
+          </Form>
         </Card>
 
         <Card title="账户">

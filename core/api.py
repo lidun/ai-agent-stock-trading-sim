@@ -17,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from core import __version__
+from core import llm
 from core.auth import get_session, hash_token
 from core.db import state_conn
 from core.config import Settings
@@ -79,7 +80,18 @@ def health(request: Request):
             timespec="seconds"),
         "db": bool(state_conn(state).execute("SELECT 1").fetchone()[0] == 1),
         "single_instance": state.instance_acquired,
+        "llm": _safe_llm_health(state),
     }
+
+
+def _safe_llm_health(state):
+    """llm 配置态进健康检查（看门狗/UI 状态卡用）；表缺失等异常不阻断健康。"""
+    try:
+        return llm.provider_health(state)
+    except Exception as exc:  # pragma: no cover - 防御性，不因新表问题挂健康检查
+        log.warning("llm health 读取失败: %s", exc)
+        return {"configured": False, "api_key_set": False, "preset": "",
+                "model": "", "last_test": None}
 
 
 @api.get("/api/meta")
