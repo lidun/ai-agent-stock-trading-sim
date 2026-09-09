@@ -139,6 +139,8 @@ export default function StrategyDetailPage() {
   const [windows, setWindows] = useState<ValidationWindowList | null>(null);
   const [range, setRange] = useState<CurveRange>("all");
   const [p2Loading, setP2Loading] = useState(true);
+  const [reportScope, setReportScope] = useState<string>("main");
+  const [decisionDates, setDecisionDates] = useState<Record<string, { decision: string; version_no: string; reason?: string; decided_ts?: string }>>({});
 
   const strategyAgents = useMemo(() => agents.filter((a) => a.role === "strategy"), [agents]);
 
@@ -153,6 +155,61 @@ export default function StrategyDetailPage() {
     [strategyAgents, selectedId],
   );
 
+  const reportAccountOptions = useMemo(() => {
+    if (!agentInfo) return [];
+    const items = windows?.items ?? [];
+    const seen = new Set<string>();
+    const wins = items
+      .filter((w) => w.validation_account_id && !seen.has(w.validation_account_id) && seen.add(w.validation_account_id))
+      .sort((a, b) => (b.decided_ts || b.created_ts || "").localeCompare(a.decided_ts || a.created_ts || ""));
+    return [
+      { value: "main", label: `${agentInfo.name} · 主账户` },
+      ...wins.map((w) => ({
+        value: w.validation_account_id,
+        label: `验证窗 ${w.version_no} · ${w.validation_account_id}`,
+      })),
+    ];
+  }, [agentInfo, windows]);
+
+  const loadReportArea = useCallback(
+    async (accountId: string, isMain: boolean) => {
+      try {
+        const tl = await listReportTimeline(accountId);
+        setTimeline(tl.reports);
+        const recent = tl.reports.slice(0, 10);
+        const detail = await Promise.all(
+          recent.map((r) =>
+            fetchReportVersions(accountId, r.trade_date).then(
+              (d) => ({ date: r.trade_date, versions: d.versions }),
+              () => ({ date: r.trade_date, versions: [] }),
+            ),
+          ),
+        );
+        const unsettled: string[] = [];
+        const decisions: Record<string, { decision: string; version_no: string; reason?: string; decided_ts?: string }> = {};
+        for (const d of detail) {
+          for (const v of d.versions) {
+            const wd = v.data_section?.annotations?.window_decision;
+            if (wd && !decisions[d.date]) {
+              decisions[d.date] = {
+                decision: wd.decision,
+                version_no: wd.version_no,
+                reason: wd.reason,
+                decided_ts: wd.decided_ts,
+              };
+            }
+          }
+          if (d.versions.some((v) => v.data_section?.annotations?.unsettled)) unsettled.push(d.date);
+        }
+        setUnsettledDates(isMain ? unsettled : []);
+        setDecisionDates(decisions);
+      } catch (e) {
+        message.error((e as Error).message ?? "加载日报历史失败");
+      }
+    },
+    [message],
+  );
+
   const reload = useCallback(async () => {
     if (!selectedId) {
       setLoading(false);
@@ -160,41 +217,25 @@ export default function StrategyDetailPage() {
     }
     setLoading(true);
     try {
-      const [acct, h, o, t, tl, f] = await Promise.all([
+      const [acct, h, o, t, f] = await Promise.all([
         getAccount(selectedId),
         listAccountHoldings(selectedId),
         listAccountConditionOrders(selectedId),
         listAccountTrades(selectedId),
-        listReportTimeline(selectedId),
         listFrozen(selectedId),
       ]);
       setAccount(acct);
       setHoldings(h.holdings);
       setOrders(o.condition_orders);
       setTrades(t.trades);
-      setTimeline(tl.reports);
       setFrozen(f.frozen);
-
-      const recent = tl.reports.slice(0, 10);
-      const detail = await Promise.all(
-        recent.map((r) =>
-          fetchReportVersions(selectedId, r.trade_date).then(
-            (d) => ({ date: r.trade_date, versions: d.versions }),
-            () => ({ date: r.trade_date, versions: [] }),
-          ),
-        ),
-      );
-      setUnsettledDates(
-        detail
-          .filter((d) => d.versions.some((v) => v.data_section?.annotations?.unsettled))
-          .map((d) => d.date),
-      );
+      await loadReportArea(selectedId, true);
     } catch (e) {
       message.error((e as Error).message ?? "加载策略详情失败");
     } finally {
       setLoading(false);
     }
-  }, [selectedId, message]);
+  }, [selectedId, message, loadReportArea]);
 
   useEffect(() => {
     let active = true;
@@ -220,6 +261,25 @@ export default function StrategyDetailPage() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  useEffect(() => {
+    setReportScope("main");
+  }, [selectedId]);
+
+  const switchReportScope = (v: string) => {
+    if (!v || v === "main") {
+      setReportScope("main");
+      setUnsettledDates([]);
+      setDecisionDates({});
+      void reload();
+      return;
+    }
+    if (!reportAccountOptions.some((o) => o.value === v)) return;
+    setReportScope(v);
+    setUnsettledDates([]);
+    setDecisionDates({});
+    void loadReportArea(v, false);
+  };
 
   useEffect(() => {
     if (!selectedId) return;
@@ -680,11 +740,23 @@ export default function StrategyDetailPage() {
 
           <Card
             size="small"
-            title="日报历史"
+            title={reportScope === "main" ? "日报历史" : "日报历史 · 验证窗账户"}
             extra={
-              <Button size="small" type="link" onClick={() => navigate("/reports")}>
-                日报中心 <ArrowRightOutlined />
-              </Button>
+              <Flex gap={8} align="center">
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  账户
+                </Typography.Text>
+                <Select
+                  size="small"
+                  style={{ width: 220 }}
+                  value={reportScope}
+                  options={reportAccountOptions}
+                  onChange={switchReportScope}
+                />
+                <Button size="small" type="link" onClick={() => navigate("/reports")}>
+                  日报中心 <ArrowRightOutlined />
+                </Button>
+              </Flex>
             }
           >
             <Table<ReportTimelineEntry>
@@ -703,9 +775,24 @@ export default function StrategyDetailPage() {
                   },
                 },
                 {
-                  title: "角标", key: "badge", width: 120,
-                  render: (_, r) =>
-                    unsettledDates.includes(r.trade_date) ? <Tag color="orange">未结算</Tag> : <Typography.Text type="secondary">—</Typography.Text>,
+                  title: "角标", key: "badge", width: 190,
+                  render: (_, r) => {
+                    const wd = decisionDates[r.trade_date];
+                    if (wd) {
+                      const dlabel = { activate: "晋升现役", rollback: "否决候选", sealed: "封存留证" }[wd.decision] ?? wd.decision ?? "收口";
+                      return (
+                        <Tooltip
+                          title={`注解版 v${wd.version_no} → ${dlabel}（${wd.reason ?? "未记录理由"}）`}
+                        >
+                          <Tag color="purple" style={{ marginInlineEnd: 0 }}>EVOQUANT 收口</Tag>
+                        </Tooltip>
+                      );
+                    }
+                    if (unsettledDates.includes(r.trade_date)) {
+                      return <Tag color="orange">未结算</Tag>;
+                    }
+                    return <Typography.Text type="secondary">—</Typography.Text>;
+                  },
                 },
                 { title: "版本", dataIndex: "latest_version", width: 80, align: "right" },
                 { title: "最新生成", dataIndex: "latest_created_ts", render: (v: string) => fmtBeijingTime(v) },

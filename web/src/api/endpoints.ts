@@ -452,10 +452,24 @@ export interface ReportDataSectionSettlement {
   granularity_used: Record<string, string>;
 }
 
+export interface ReportWindowDecision {
+  version_no: string;
+  decision: string;
+  reason?: string;
+  expectation_pct: number | null;
+  baseline_expectation_pct: number | null;
+  sessions_done: number;
+  trade_samples: number;
+  rule_violations: number;
+  fuse_events: number;
+  decided_ts: string;
+}
+
 export interface ReportDataSectionAnnotations {
   degraded: string[];
   unsettled: boolean;
   notes: string[];
+  window_decision?: ReportWindowDecision;
 }
 
 /** data_section 只读视图（快照/事件明细以 merged_markdown 为准渲染；本类型按需取摘要角标） */
