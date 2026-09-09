@@ -1,4 +1,4 @@
-import { Flex, Table, Tag, Tooltip, Typography } from "antd";
+import { Flex, Progress, Table, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { ValidationWindow } from "../../api/endpoints";
 import { fmtBeijing } from "../../utils/time";
@@ -103,15 +103,29 @@ const columns: ColumnsType<ValidationWindow> = [
   },
   { title: "窗口状态", key: "status", width: 160, render: (_, w) => <WindowTag w={w} /> },
   {
-    title: "推进", key: "progress", width: 150, align: "right",
+    title: "推进", key: "progress", width: 200, align: "right",
     render: (_, w) => (
       <Flex vertical gap={2} align="end">
         <span>
           会话 {w.sessions_done}/{w.window_days}
         </span>
+        <Progress
+          percent={w.window_days ? Math.min(100, Math.round((w.sessions_done / w.window_days) * 100)) : 0}
+          size="small"
+          showInfo={false}
+          strokeColor="#1677ff"
+          style={{ width: 132, margin: 0 }}
+        />
         <Typography.Text type="secondary" style={{ fontSize: 11 }}>
           成交样本 {w.trade_samples}/{w.trade_target}
         </Typography.Text>
+        <Progress
+          percent={w.trade_target ? Math.min(100, Math.round((w.trade_samples / w.trade_target) * 100)) : 0}
+          size="small"
+          showInfo={false}
+          strokeColor={w.trade_samples >= w.trade_target ? "#52c41a" : "#722ed1"}
+          style={{ width: 132, margin: 0 }}
+        />
       </Flex>
     ),
   },
