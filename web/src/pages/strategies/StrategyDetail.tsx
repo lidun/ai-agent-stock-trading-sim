@@ -35,6 +35,7 @@ import {
   fetchStrategyMemory,
   fetchStrategyProfile,
   fetchStrategyVersions,
+  fetchValidationWindows,
   getAccount,
   listAccountConditionOrders,
   listAccountHoldings,
@@ -58,6 +59,7 @@ import {
   type StrategyProfile,
   type StrategyMemoryList,
   type StrategyVersionList,
+  type ValidationWindowList,
   type TradeInfo,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
@@ -66,6 +68,7 @@ import EquityCurveCard from "./EquityCurveCard";
 import StrategyEvolutionCard from "./StrategyEvolutionCard";
 import StrategyProfileCard from "./StrategyProfileCard";
 import StrategyVersionsCard from "./StrategyVersionsCard";
+import ValidationWindowsCard from "./ValidationWindowsCard";
 import SellTrackingCard from "./SellTrackingCard";
 
 const OT_LABEL: Record<string, string> = {
@@ -133,6 +136,7 @@ export default function StrategyDetailPage() {
   const [exitTracks, setExitTracks] = useState<ExitTrackingList | null>(null);
   const [memory, setMemory] = useState<StrategyMemoryList | null>(null);
   const [versions, setVersions] = useState<StrategyVersionList | null>(null);
+  const [windows, setWindows] = useState<ValidationWindowList | null>(null);
   const [range, setRange] = useState<CurveRange>("all");
   const [p2Loading, setP2Loading] = useState(true);
 
@@ -229,7 +233,8 @@ export default function StrategyDetailPage() {
       fetchExitTrackings(selectedId),
       fetchStrategyMemory(selectedId),
       fetchStrategyVersions(selectedId),
-    ]).then(([m, c, e, sp, et, mem, ver]) => {
+      fetchValidationWindows(selectedId),
+    ]).then(([m, c, e, sp, et, mem, ver, win]) => {
       if (!active) return;
       setMetrics(m.status === "fulfilled" ? m.value : null);
       setCurve(c.status === "fulfilled" ? c.value : null);
@@ -238,6 +243,7 @@ export default function StrategyDetailPage() {
       setExitTracks(et.status === "fulfilled" ? et.value : null);
       setMemory(mem.status === "fulfilled" ? mem.value : null);
       setVersions(ver.status === "fulfilled" ? ver.value : null);
+      setWindows(win.status === "fulfilled" ? win.value : null);
       if (m.status === "rejected" && c.status === "rejected" && e.status === "rejected") {
         console.warn("P2 数据源不可用（spec-06 §6.4），等 EOD 结算产出后再现。");
       }
@@ -685,6 +691,8 @@ export default function StrategyDetailPage() {
           <StrategyEvolutionCard evolution={evolution} memory={memory} loading={p2Loading} />
 
           <StrategyVersionsCard versions={versions} loading={p2Loading} />
+
+          <ValidationWindowsCard windows={windows} loading={p2Loading} />
 
           <SellTrackingCard data={exitTracks} loading={p2Loading} />
 

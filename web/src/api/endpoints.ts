@@ -1077,6 +1077,61 @@ export function fetchStrategyVersions(agentId: string): Promise<StrategyVersionL
   );
 }
 
+// ---------- EVOQUANT 验证窗台账（spec-05 §4.2/§4.3，只读） ----------
+
+export interface ValidationWindow {
+  id: string;
+  agent_id: string;
+  version_no: string;
+  status: "in_progress" | "done";
+  validation_account_id: string;
+  main_account_id: string;
+  window_days: number;
+  trade_target: number;
+  sessions_done: number;
+  trade_samples: number;
+  rule_violations: number;
+  fuse_events: number;
+  expectation: number | null;
+  baseline_expectation: number | null;
+  decision: string;
+  decision_reason: string;
+  window_start_trade_date: string | null;
+  final_snapshot: {
+    final?: {
+      decision: string;
+      reason: string;
+      window_start: string;
+      last_advance: string;
+      sessions_done: number;
+      trade_samples: number;
+      expectation_pct: number | null;
+      baseline_expectation_pct: number | null;
+      validation_ev_n: number;
+      baseline_ev_n: number;
+      rule_violations: number;
+      fuse_events: number;
+      activated: string;
+    };
+    validation_account?: Record<string, unknown>;
+    main_account?: Record<string, unknown>;
+  };
+  decided_ts: string;
+  created_ts: string;
+  updated_ts: string;
+}
+export interface ValidationWindowList {
+  agent_id: string;
+  total: number;
+  items: ValidationWindow[];
+}
+
+export function fetchValidationWindows(agentId: string): Promise<ValidationWindowList> {
+  return apiGet<ValidationWindowList>(
+    `/api/agents/${encodeURIComponent(agentId)}/validation-windows`,
+  );
+}
+
 // ---------- 市场与数据质量监控（spec-02 §7 / spec-03，只读聚合） ----------
 
 export interface QualityMonitorDay {

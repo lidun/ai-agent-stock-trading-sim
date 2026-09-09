@@ -292,3 +292,28 @@ def test_catchup_backfills_window_sessions(authed_client):
     assert w["status"] == "done" and w["decision"] == "sealed"
     assert w["sessions_done"] == 5
     assert accountstore.get_account(st, f"{DEMO}.validation")["status"] == "archived"
+
+
+def test_validation_windows_http_readonly(authed_client):
+    """验证窗台账只读 HTTP 面（spec-06：无写路由，判定由引擎推进）。"""
+    st = authed_client.app.state
+    evoquant.open_validation(st, DEMO, version_no="v1", config=CFG,
+                             window_days=10, trade_target=20)
+    c = authed_client
+
+    r = c.get(f"/api/agents/{DEMO}/validation-windows")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["agent_id"] == DEMO and body["total"] == 1
+    w = body["items"][0]
+    assert w["version_no"] == "v1" and w["status"] == "in_progress"
+    assert w["window_days"] == 10 and w["trade_target"] == 20
+    assert w["validation_account_id"] == f"{DEMO}.validation"
+
+    r1 = c.get(f"/api/agents/{DEMO}/validation-windows/v1")
+    assert r1.status_code == 200 and r1.json()["window"]["version_no"] == "v1"
+
+    assert c.get(f"/api/agents/{DEMO}/validation-windows/v9").status_code == 404
+    assert c.get("/api/agents/no-such-agent/validation-windows").status_code == 404
+    # 只读护栏：无 HTTP 写路由（CSRF 拦截 403 / 未注册 404-405 均表明不存在写端点）
+    assert c.post(f"/api/agents/{DEMO}/validation-windows").status_code in (403, 404, 405)
