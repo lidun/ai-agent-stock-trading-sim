@@ -1076,3 +1076,33 @@ export function fetchStrategyVersions(agentId: string): Promise<StrategyVersionL
     `/api/agents/${encodeURIComponent(agentId)}/strategy-versions`,
   );
 }
+
+// ---------- 市场与数据质量监控（spec-02 §7 / spec-03，只读聚合） ----------
+
+export interface QualityMonitorDay {
+  trade_date: string;
+  runs: number;
+  granularity: Record<string, number>;
+  symbols_total: number;
+}
+export interface MarketQuality {
+  generated_ts: string;
+  window_days: number;
+  settle_symbols_total: number;
+  days: QualityMonitorDay[];
+  trades: { total: number; by_quality: Record<string, number> };
+  exits: {
+    total: number;
+    tracking: number;
+    done: number;
+    conclusions: Record<string, number>;
+    by_quality: Record<string, number>;
+  };
+  accounts: { total: number; by_status: Record<string, number> };
+  feed: { source_family: string; cross_family_check: string; note: string };
+  eod_auto_settle: boolean;
+}
+
+export function fetchQualityMonitor(days = 60): Promise<MarketQuality> {
+  return apiGet<MarketQuality>(`/api/quality/monitor?days=${days}`);
+}

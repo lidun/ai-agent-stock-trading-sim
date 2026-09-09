@@ -11,6 +11,7 @@ import ApprovalCenterPage from "../pages/approvals/ApprovalCenter";
 import KnowledgePage from "../pages/knowledge/KnowledgePage";
 import CapabilityMarketPage from "../pages/capabilities/CapabilityMarketPage";
 import CharterManagePage from "../pages/charter/CharterManagePage";
+import MarketQualityMonitorPage from "../pages/quality/MarketQualityMonitorPage";
 import { ModulePlaceholder } from "../pages/Placeholder";
 import { NAV_ITEMS } from "../config/nav";
 
@@ -40,6 +41,8 @@ export const protectedChildren: RouteObject[] = [
         <CapabilityMarketPage />
       ) : n.key === "charter" ? (
         <CharterManagePage />
+      ) : n.key === "market" ? (
+        <MarketQualityMonitorPage />
       ) : (
         <ModulePlaceholder nav={n} />
       ),

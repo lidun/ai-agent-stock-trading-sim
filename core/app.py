@@ -29,6 +29,7 @@ from core.strategy_profile_routes import router as strategy_profile_router
 from core.strategy_memory_routes import router as strategy_memory_router
 from core.strategy_versions_routes import router as strategy_versions_router
 from core.capability_center_routes import router as capability_center_router
+from core.quality_routes import router as quality_router
 
 log = logging.getLogger("core")
 
@@ -108,6 +109,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(strategy_memory_router)
     app.include_router(strategy_versions_router)
     app.include_router(capability_center_router)
+    app.include_router(quality_router)
 
     if settings.eod_auto_settle:
         # EOD 结算自动触发（spec-04 §2.2 第 2 项）：core 常驻内唯一结算触发点

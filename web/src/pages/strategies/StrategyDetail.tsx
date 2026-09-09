@@ -689,8 +689,8 @@ export default function StrategyDetailPage() {
           <SellTrackingCard data={exitTracks} loading={p2Loading} />
 
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
-            关联视图已就位：持仓每行悬停/安全感标签可查该票已挂卖出保护单与最近结算日成交（spec-06 §6.4 B7）。
-            策略理念只读与卖出跟踪列表（P3，#15）已落地；P2+ 余项：能力包绑定（spec-05 §5 配置中心）、章程写入口（理念锁定变更需用户授权）、演进记忆（spec-02 memory_entries type=strategy）。
+            关联只读视图已就位：持仓保护单与结算日成交、理念章程、演进记忆、EVOQUANT 版本状态机（spec-02 §3.1 / §9）。
+            写方=引擎结算与能力/章程管理入口；读侧零 token，无需额外说明即可自解释。
           </Typography.Paragraph>
         </>
       ) : null}

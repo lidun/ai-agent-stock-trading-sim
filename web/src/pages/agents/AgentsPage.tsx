@@ -388,7 +388,7 @@ export default function AgentsPage() {
             Agent 看板
           </Typography.Title>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            模拟账户/净值/盈亏已接入（spec-01 份额法口径）；持仓与当日结算待撮合引擎落地后更新
+            账户/净值/盈亏随 EOD 结算落库（spec-01 份额法口径）；自动结算默认关闭，常驻启用设 CORE_EOD_AUTO_SETTLE=1
           </Typography.Text>
         </div>
         <Dropdown

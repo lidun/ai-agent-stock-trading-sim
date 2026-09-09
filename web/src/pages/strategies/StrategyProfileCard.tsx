@@ -86,8 +86,8 @@ export default function StrategyProfileCard({ profile, loading }: Props) {
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={
             <Typography.Text type="secondary" style={{ fontSize: 13 }}>
-              暂无策略章程落库 —— 理念由策略发布/管理 Agent 写入后展示（spec-05 §4.1 双层结构 +
-              锁定语义）；能力包绑定待 spec-05 §5 能力配置中心落地。写入口由后续切片提供。
+              暂无策略章程落库 —— 理念由发布/管理 Agent 写入后展示（spec-05 §4.1 双层结构 +
+              锁定语义）；能力包经能力市场申请、审批通过后自动下发（spec-05 §2.3）。
             </Typography.Text>
           }
           style={{ padding: "8px 0" }}
@@ -154,7 +154,7 @@ export default function StrategyProfileCard({ profile, loading }: Props) {
                 ))}
               </>
             ) : (
-              <Tag color="default">能力包：待 spec-05 §2 配置中心绑定</Tag>
+              <Tag color="default">能力包：未下发——能力市场申请 / 审批通过自动绑定（spec-05 §2.3）</Tag>
             )}
           </Flex>
           {profile.versions.length > 1 && (
