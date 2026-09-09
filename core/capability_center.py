@@ -279,8 +279,12 @@ def bind(state, *, capability_id: str, agent_id: str,
             "version": cap["version"], "bound_ts": ts}
 
 
-def unbind(state, *, capability_id: str, agent_id: str) -> dict:
-    """解绑能力（留痕，spec-05 §2.4 可查可回滚）：置 unbound_ts，不删行。"""
+def unbind(state, *, capability_id: str, agent_id: str,
+           audit_actor: str = "") -> dict:
+    """解绑能力（留痕，spec-05 §2.4 可查可回滚）：置 unbound_ts，不删行。
+
+    audit_actor 传入时同事务写 audit_logs（管理侧经路由解绑；空=脚本/种子不审计）。
+    """
     _require_agent(state, agent_id)
     cap = _require_capability(state, capability_id)
     if cap is None:
@@ -289,9 +293,22 @@ def unbind(state, *, capability_id: str, agent_id: str) -> dict:
     c = state_conn(state)
     from core.db import write_txn  # noqa: PLC0415
     with write_txn(c) as cw:
+        row = cw.execute(
+            "SELECT id FROM capability_bindings"
+            " WHERE unbound_ts='' AND capability_id=? AND agent_id=? LIMIT 1",
+            (capability_id, agent_id),
+        ).fetchone()
         cw.execute(
             "UPDATE capability_bindings SET unbound_ts=? WHERE unbound_ts=''"
             " AND capability_id=? AND agent_id=?",
             (ts, capability_id, agent_id),
         )
+        if audit_actor:
+            cw.execute(
+                "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+                " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+                (ts, audit_actor, "capability.unbind", "capability_bindings",
+                 row["id"] if row is not None else capability_id, "unbound",
+                 f"能力 {capability_id} 从 Agent {agent_id} 解绑（spec-05 §2.4）", ""),
+            )
     return {"capability_id": capability_id, "agent_id": agent_id, "unbound_ts": ts}

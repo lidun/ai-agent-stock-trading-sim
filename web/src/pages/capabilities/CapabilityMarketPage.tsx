@@ -9,6 +9,7 @@ import {
   Flex,
   Input,
   Modal,
+  Popconfirm,
   Radio,
   Select,
   Skeleton,
@@ -26,7 +27,9 @@ import {
   fetchCapabilityDetail,
   listAgents,
   submitApproval,
+  unbindCapability,
   type AgentInfo,
+  type CapabilityBindingBrief,
   type CapabilityDetail,
   type CapabilityItem,
 } from "../../api/endpoints";
@@ -151,6 +154,28 @@ export default function CapabilityMarketPage() {
       message.error((err as Error).message ?? "提交能力申请失败");
     } finally {
       setApplySending(false);
+    }
+  };
+
+  const refreshDetail = useCallback(async (id: string) => {
+    setDetailLoading(true);
+    try {
+      setDetail(await fetchCapabilityDetail(id));
+    } catch (err) {
+      message.error((err as Error).message ?? "刷新能力详情失败");
+    } finally {
+      setDetailLoading(false);
+    }
+  }, [message]);
+
+  const doUnbind = async (capabilityId: string, b: CapabilityBindingBrief) => {
+    try {
+      await unbindCapability(capabilityId, b.agent_id);
+      message.success(`已解绑 ${b.agent_name}（${b.agent_id}）——留痕可查，spec-05 §2.4`);
+      await refreshDetail(capabilityId);
+      await reload();
+    } catch (err) {
+      message.error((err as Error).message ?? "解绑失败");
     }
   };
 
@@ -379,6 +404,19 @@ export default function CapabilityMarketPage() {
                         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                           · 解绑于 {fmtBeijingTime(b.unbound_ts)}
                         </Typography.Text>
+                      )}
+                      {b.active && (
+                        <Popconfirm
+                          title="确认解绑该能力？"
+                          description="置 unbound_ts 留痕（可查可回滚），Agent 将不再持有该能力。"
+                          okText="解绑"
+                          okButtonProps={{ danger: true }}
+                          onConfirm={() => void doUnbind(cap.id, b)}
+                        >
+                          <Button size="small" danger style={{ marginLeft: "auto" }}>
+                            解绑
+                          </Button>
+                        </Popconfirm>
                       )}
                     </Flex>
                   ))}

@@ -949,6 +949,15 @@ export function fetchCapabilityDetail(id: string): Promise<CapabilityDetail> {
   return apiGet<CapabilityDetail>(`/api/capabilities/${encodeURIComponent(id)}`);
 }
 
+export function unbindCapability(
+  capabilityId: string,
+  agentId: string,
+): Promise<{ ok: boolean; capability_id: string; agent_id: string; unbound_ts: string }> {
+  return apiPost(`/api/capabilities/${encodeURIComponent(capabilityId)}/unbind`, {
+    agent_id: agentId,
+  });
+}
+
 export function fetchAgentCapabilityBindings(
   agentId: string,
   includeUnbound = false,
