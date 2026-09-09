@@ -16,16 +16,19 @@ import type { ColumnsType } from "antd/es/table";
 import { CrownOutlined, RobotOutlined } from "@ant-design/icons";
 import {
   fetchAgentCapabilityBindings,
+  fetchStrategyMemory,
   fetchStrategyProfile,
   fetchValidationWindows,
   type AgentCapabilityBindings,
   type AgentInfo,
   type CapabilityBindingItem,
+  type StrategyMemoryList,
   type StrategyProfile,
   type ValidationWindowList,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
 import ValidationWindowsTable from "../strategies/ValidationWindowsTable";
+import StrategyMemorySection from "../strategies/StrategyMemorySection";
 
 interface Props {
   agent: AgentInfo | null;
@@ -71,6 +74,7 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
   const [profile, setProfile] = useState<StrategyProfile | null>(null);
   const [bindings, setBindings] = useState<AgentCapabilityBindings | null>(null);
   const [windows, setWindows] = useState<ValidationWindowList | null>(null);
+  const [memory, setMemory] = useState<StrategyMemoryList | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -80,15 +84,18 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
     setProfile(null);
     setBindings(null);
     setWindows(null);
+    setMemory(null);
     Promise.allSettled([
       fetchStrategyProfile(agent.id),
       fetchAgentCapabilityBindings(agent.id, false),
       fetchValidationWindows(agent.id),
-    ]).then(([p, b, w]) => {
+      fetchStrategyMemory(agent.id),
+    ]).then(([p, b, w, m]) => {
       if (!live) return;
       setProfile(p.status === "fulfilled" ? p.value : null);
       setBindings(b.status === "fulfilled" ? b.value : null);
       setWindows(w.status === "fulfilled" ? w.value : null);
+      setMemory(m.status === "fulfilled" ? m.value : null);
       setLoading(false);
     });
     return () => {
@@ -393,6 +400,26 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
               ) : (
                 <ValidationWindowsTable dataSource={winRows} scrollY={260} />
               )}
+            </Card>
+          )}
+
+          {!isManager && (
+            <Card
+              size="small"
+              title="演进记忆 · EVOQUANT 优化流（引擎落账，只读）"
+              style={{ marginTop: 12 }}
+              extra={
+                memory && memory.total > 0 ? (
+                  <Tag color="purple" style={{ marginInlineEnd: 0 }}>{memory.total} 条</Tag>
+                ) : undefined
+              }
+            >
+              <StrategyMemorySection
+                memory={memory}
+                windows={windows}
+                loading={loading && !memory}
+                maxItems={8}
+              />
             </Card>
           )}
         </>
