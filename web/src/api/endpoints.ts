@@ -1278,3 +1278,50 @@ export interface PerformanceSnapshot {
 export function fetchPerformanceSnapshot(): Promise<PerformanceSnapshot> {
   return apiGet<PerformanceSnapshot>("/api/performance/live");
 }
+
+// ---------- LLM 费用台账（spec-02 §11 / spec-04 §5.5④，performance_records） ----------
+
+export interface UsageCostRow {
+  llm_calls: number;
+  tokens_in: number;
+  cached_tokens: number;
+  tokens_out: number;
+  cost_yuan: number | null;
+}
+
+export interface UsageDailyRow extends UsageCostRow {
+  date: string;
+}
+
+export interface UsageGroupRow extends UsageCostRow {
+  agent_id: string;
+  task_type: string;
+}
+
+export interface UsageLedgerRow {
+  id: string;
+  task_id: string;
+  agent_id: string;
+  task_type: string;
+  tokens_in: number;
+  cached_tokens: number;
+  tokens_out: number;
+  cost_yuan: number | null;
+  result: string;
+  provider: string;
+  model: string;
+  detail: string;
+  created_ts: string;
+}
+
+export function fetchUsageDaily(days = 14): Promise<{ days: UsageDailyRow[] }> {
+  return apiGet<{ days: UsageDailyRow[] }>(`/api/usage/daily?days=${days}`);
+}
+
+export function fetchUsageGroup(days = 14): Promise<{ rows: UsageGroupRow[] }> {
+  return apiGet<{ rows: UsageGroupRow[] }>(`/api/usage/group?days=${days}`);
+}
+
+export function fetchUsageLedger(limit = 30): Promise<{ rows: UsageLedgerRow[] }> {
+  return apiGet<{ rows: UsageLedgerRow[] }>(`/api/usage/ledger?limit=${limit}`);
+}
