@@ -17,10 +17,13 @@ import { CrownOutlined, RobotOutlined } from "@ant-design/icons";
 import {
   fetchAgentCapabilityBindings,
   fetchStrategyProfile,
+  fetchValidationWindows,
   type AgentCapabilityBindings,
   type AgentInfo,
   type CapabilityBindingItem,
   type StrategyProfile,
+  type ValidationWindow,
+  type ValidationWindowList,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
 
@@ -63,10 +66,103 @@ function BoundStatus({ item }: { item: CapabilityBindingItem }) {
   return <Tag color={meta.color}>{meta.text}</Tag>;
 }
 
+const WIN_DECISION: Record<string, { color: string; text: string }> = {
+  activate: { color: "green", text: "activate 晋升" },
+  rollback: { color: "red", text: "rollback 否决" },
+  sealed: { color: "default", text: "sealed 封存" },
+};
+
+function pct(v: number | null): string {
+  if (v == null || Number.isNaN(v)) return "—";
+  return `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+}
+
+const winColumns: ColumnsType<ValidationWindow> = [
+  {
+    title: "候选版本", key: "v", width: 90,
+    render: (_, w) => <Typography.Text code style={{ fontSize: 12 }}>{w.version_no}</Typography.Text>,
+  },
+  {
+    title: "状态", key: "st", width: 150,
+    render: (_, w) =>
+      w.status === "in_progress" ? (
+        <Tag color="blue">in_progress 验证中</Tag>
+      ) : (
+        (() => {
+          const m = WIN_DECISION[w.decision] ?? { color: "default", text: w.decision || "已收口" };
+          return <Tag color={m.color}>{m.text}</Tag>;
+        })()
+      ),
+  },
+  {
+    title: "推进", key: "p", width: 150, align: "right",
+    render: (_, w) => (
+      <Flex vertical gap={0} align="flex-end">
+        <Typography.Text style={{ fontSize: 12 }}>
+          会话 {w.sessions_done}/{w.window_days}
+        </Typography.Text>
+        <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+          成交样本 {w.trade_samples}/{w.trade_target}
+        </Typography.Text>
+      </Flex>
+    ),
+  },
+  {
+    title: "期望值 EV / 基线", key: "ev", width: 150, align: "right",
+    render: (_, w) => {
+      if (w.expectation == null) return <Typography.Text type="secondary">—</Typography.Text>;
+      return (
+        <Flex vertical gap={0} align="flex-end">
+          <Typography.Text
+            style={{ fontSize: 12, color: w.expectation > 0 ? "#cf1322" : w.expectation < 0 ? "#389e0d" : undefined }}
+          >
+            {pct(w.expectation)}
+          </Typography.Text>
+          {w.baseline_expectation != null && (
+            <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+              基线 {pct(w.baseline_expectation)}
+            </Typography.Text>
+          )}
+        </Flex>
+      );
+    },
+  },
+  {
+    title: "风控留痕", key: "risk", width: 90, align: "center",
+    render: (_, w) =>
+      w.rule_violations || w.fuse_events ? (
+        <Tag color="red">违规{w.rule_violations}/熔断{w.fuse_events}</Tag>
+      ) : (
+        <Typography.Text type="secondary">0/0</Typography.Text>
+      ),
+  },
+  {
+    title: "判定结论", key: "d", width: 300,
+    render: (_, w) =>
+      w.status === "in_progress" ? (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>未到期</Typography.Text>
+      ) : (
+        <Typography.Text ellipsis style={{ fontSize: 12 }} title={w.decision_reason || undefined}>
+          {w.decision_reason || "（未记录理由）"}
+        </Typography.Text>
+      ),
+  },
+  {
+    title: "关键时点", key: "t", width: 180,
+    render: (_, w) => (
+      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        {w.status === "in_progress" ? "开窗 " : "收口 "}
+        {fmtBeijingTime(w.status === "in_progress" ? w.created_ts : w.decided_ts)}
+      </Typography.Text>
+    ),
+  },
+];
+
 export default function AgentOverviewDrawer({ agent, onClose }: Props) {
   const { token } = antTheme.useToken();
   const [profile, setProfile] = useState<StrategyProfile | null>(null);
   const [bindings, setBindings] = useState<AgentCapabilityBindings | null>(null);
+  const [windows, setWindows] = useState<ValidationWindowList | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -75,13 +171,16 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
     setLoading(true);
     setProfile(null);
     setBindings(null);
+    setWindows(null);
     Promise.allSettled([
       fetchStrategyProfile(agent.id),
       fetchAgentCapabilityBindings(agent.id, false),
-    ]).then(([p, b]) => {
+      fetchValidationWindows(agent.id),
+    ]).then(([p, b, w]) => {
       if (!live) return;
       setProfile(p.status === "fulfilled" ? p.value : null);
       setBindings(b.status === "fulfilled" ? b.value : null);
+      setWindows(w.status === "fulfilled" ? w.value : null);
       setLoading(false);
     });
     return () => {
@@ -147,6 +246,9 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
   const isManager = agent?.role === "manager";
   const charterLoading = loading && !profile;
   const capLoading = loading && !bindings;
+  const winLoading = loading && !windows;
+  const winRows = windows?.items ?? [];
+  const winRunning = winRows.filter((w) => w.status === "in_progress").length;
 
   return (
     <Drawer
@@ -330,6 +432,43 @@ export default function AgentOverviewDrawer({ agent, onClose }: Props) {
               )}
             </Card>
           </Flex>
+
+          {!isManager && (
+            <Card
+              size="small"
+              title="EVOQUANT 验证窗（spec-05 §4.2/§4.3）"
+              style={{ marginTop: 12 }}
+              extra={
+                windows ? (
+                  <Tag
+                    color={winRunning ? "blue" : "default"}
+                    style={{ marginInlineEnd: 0 }}
+                  >
+                    {winRunning ? `在跑 ${winRunning} 窗 · 共 ${winRows.length}` : `窗 ×${winRows.length}`}
+                  </Tag>
+                ) : undefined
+              }
+            >
+              {winLoading ? (
+                <Skeleton active paragraph={{ rows: 3 }} />
+              ) : winRows.length === 0 ? (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="尚无验证窗——EVOQUANT 对候选版本发起验证后在此呈现推进与判定（sealed 封存/rollback 否决/activate 晋升）"
+                  style={{ padding: "20px 0" }}
+                />
+              ) : (
+                <Table<ValidationWindow>
+                  rowKey="id"
+                  size="small"
+                  columns={winColumns}
+                  dataSource={winRows}
+                  pagination={false}
+                  scroll={{ x: 1080, y: 260 }}
+                />
+              )}
+            </Card>
+          )}
         </>
       )}
     </Drawer>
