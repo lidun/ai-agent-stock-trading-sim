@@ -254,6 +254,31 @@ export default function StrategyDetailPage() {
     };
   }, [selectedId, range]);
 
+  useEffect(() => {
+    if (!selectedId) return;
+    let live = true;
+    let inflight = false;
+    const poll = async () => {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const w = await fetchValidationWindows(selectedId);
+        if (live) setWindows(w);
+      } catch {
+        // 单次失败静默降级，保留下一次轮询
+      } finally {
+        inflight = false;
+      }
+    };
+    const t = window.setInterval(() => {
+      void poll();
+    }, 10000);
+    return () => {
+      live = false;
+      window.clearInterval(t);
+    };
+  }, [selectedId]);
+
   const mainStatus = account?.status;
   const isFrozen = mainStatus === "paused_buy" || mainStatus === "halted";
   const isTrial = mainStatus === "trial" || agentInfo?.status === "trial";

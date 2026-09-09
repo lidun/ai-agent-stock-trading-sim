@@ -87,7 +87,7 @@ function windowTagLines(items: ValidationWindow[]): string {
   const running = items.filter((w) => w.status === "in_progress");
   const lines = running.map(
     (w) =>
-      `v${w.version_no} 验证中：会话 ${w.sessions_done}/${w.window_days} 日 · 成交样本 ${w.trade_samples}/${w.trade_target}`,
+      `${w.version_no} 验证中：会话 ${w.sessions_done}/${w.window_days} 日 · 成交样本 ${w.trade_samples}/${w.trade_target}`,
   );
   items
     .filter((w) => w.status === "done")
@@ -95,7 +95,7 @@ function windowTagLines(items: ValidationWindow[]): string {
     .forEach((w) => {
       const d = w.decision ? DECISION_LABEL[w.decision] ?? w.decision : "已收口";
       const reason = (w.decision_reason || "").slice(0, 40);
-      lines.push(`v${w.version_no} ${d}：${reason || "（未记录理由）"}`);
+      lines.push(`${w.version_no} ${d}：${reason || "（未记录理由）"}`);
     });
   return lines.join("\n") || "暂无窗口留证";
 }
@@ -558,15 +558,41 @@ export default function AgentsPage() {
                         const witems = windowsByAgent[agent.id] ?? [];
                         if (witems.length === 0) return null;
                         const running = witems.filter((w) => w.status === "in_progress");
+                        const openStrategy = () => {
+                          navigate(`/strategies?agent=${encodeURIComponent(agent.id)}`);
+                        };
+                        const tagStyle = { cursor: "pointer", marginInlineEnd: 0 } as const;
                         const tag =
                           running.length > 0 ? (
-                            <Tag color="blue" icon={<ExperimentOutlined />} style={{ marginInlineEnd: 0 }}>
+                            <Tag
+                              color="blue"
+                              icon={<ExperimentOutlined />}
+                              style={tagStyle}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openStrategy();
+                              }}
+                            >
                               {running.length} 窗验证中
                             </Tag>
                           ) : (
-                            <Tag style={{ marginInlineEnd: 0 }}>窗 ×{witems.length}</Tag>
+                            <Tag
+                              style={tagStyle}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openStrategy();
+                              }}
+                            >
+                              窗 ×{witems.length}
+                            </Tag>
                           );
-                        return <Tooltip title={windowTagLines(witems)}>{tag}</Tooltip>;
+                        return (
+                          <Tooltip
+                            title={`${windowTagLines(witems)}\n点击直达策略详情（台账 · 判定留证 · 资金曲线）`}
+                          >
+                            {tag}
+                          </Tooltip>
+                        );
                       })()}
                     </div>
                     <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
