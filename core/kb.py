@@ -1,9 +1,10 @@
 """知识与经验库（spec-05 §3：条目模型/状态机/权限软删，管理 Agent 评审由用户执行）。
 
 证据源=signal_registry 客观统计（spec-05 §3.2）——本模块承载条目生命周期与
-统计快照读写；状态晋升/降级的"数据结论"后续由日结算后确定性重算写入 kb_stats，
-管理 Agent/用户在本模块内完成评审确认（review_gate2_ref 留痕，decided_by=user，
-与审批域同一口径：LLM 未接入前由登录用户代行管理 Agent 评审）。
+统计快照读写；`recompute_stats` 在日结算后按 (concept_tag × env_bucket) 确定性
+重算 kb_stats（零 token，调度器紧随结算回调），管理 Agent/用户在本模块内完成
+评审确认（review_gate2_ref 留痕，decided_by=user，与审批域同一口径：LLM 未接入前
+由登录用户代行管理 Agent 评审）。
 
 - 入库双闸（§3.4）：闸1=事前可计算性（本模块确定性校验 computable_spec，
   记录 review_gate1_ref）；闸2=管理 Agent 逻辑评审（人工执行，复核留痕于
@@ -405,6 +406,96 @@ def upsert_stats(state, kb_id: str, *, env_bucket: str = "all",
         "SELECT * FROM kb_stats WHERE kb_id=? AND env_bucket=?", (kb_id, env_bucket),
     ).fetchone()
     return stats_row_to_dict(fresh)
+
+
+def _aggregate(rows) -> dict:
+    """按桶聚合前瞻收益：胜率/均盈/均亏（负值）/期望值（含费）。"""
+    vals = [float(r["fwd_return_pct"]) for r in rows if r["fwd_return_pct"] is not None]
+    n = len(vals)
+    stale_n = sum(1 for r in rows if "stale_close" in (r["quality"] or ""))
+    if n == 0:
+        return {"sample_n": 0, "win_rate": None, "avg_win": None,
+                "avg_loss": None, "expectancy": None, "stale_n": stale_n}
+    wins = [v for v in vals if v > 0]
+    losses = [v for v in vals if v < 0]
+    win_rate = len(wins) / n
+    avg_win = (sum(wins) / len(wins)) if wins else None
+    avg_loss = (sum(losses) / len(losses)) if losses else None
+    expectancy = win_rate * (avg_win or 0.0) + (len(losses) / n) * (avg_loss or 0.0)
+    return {
+        "sample_n": n, "win_rate": round(win_rate, 4),
+        "avg_win": round(avg_win, 4) if avg_win is not None else None,
+        "avg_loss": round(avg_loss, 4) if avg_loss is not None else None,
+        "expectancy": round(expectancy, 4), "stale_n": stale_n,
+    }
+
+
+def recompute_stats(state, *, kb_id: str | None = None, n_days: int = 10,
+                    window_days: int | None = None) -> dict:
+    """日结算后确定性重算 kb_stats（spec-05 §3.3「统计重算触发」，零 token）。
+
+    口径（§3.2/§3.3）：
+    - 证据源=signal_registry 已结清信号（fwd_return_pct 非空），trial_flag=1 排除；
+    - 按 (concept_tag × env_bucket) 单桶独立、不跨桶合并：positive 条目以
+      concept_tag=条目名 匹配 candidate/buy/sell 信号；pitfall 条目以
+      pitfall_id=条目 ID 匹配 pitfall_intercept 信号（#54 凭证），intercept_n /
+      exception_n 单列；条目 env_scope 非 all 时仅统计该桶；
+    - 胜率=正收益样本/样本数；均盈=正收益均值、均亏=负收益均值（负值）；期望值=
+      胜率×均盈 + 败率×均亏（含费）；stale_close 样本计入并 stale_n 单列（#34）；
+    - pitfall 的 fwd 统计语义为「被拦截标的的前瞻收益」（负=真避坑、正=误杀），
+      晋升方向由上层状态机按类型解读。
+    dispatch_n 不在重算范围（UCB 下发计数由参考卡下发侧维护）；window_days 透传。
+    """
+    c = state_conn(state)
+    if kb_id:
+        entries = c.execute("SELECT * FROM kb_entries WHERE id=?", (kb_id,)).fetchall()
+        if not entries:
+            raise LookupError(f"条目不存在：{kb_id}")
+    else:
+        entries = c.execute("SELECT * FROM kb_entries").fetchall()
+    buckets = 0
+    for e in entries:
+        if e["type"] == "pitfall":
+            rows = c.execute(
+                "SELECT env_bucket, fwd_return_pct, quality, exception"
+                " FROM signal_registry WHERE trial_flag=0"
+                " AND sig_type='pitfall_intercept' AND pitfall_id=?", (e["id"],),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT env_bucket, fwd_return_pct, quality, exception"
+                " FROM signal_registry WHERE trial_flag=0"
+                " AND sig_type IN ('candidate','buy','sell') AND concept_tag=?",
+                (e["name"],),
+            ).fetchall()
+        scope = (e["env_scope"] or "all").strip() or "all"
+        grouped: dict[str, list] = {}
+        for r in rows:
+            b = (r["env_bucket"] or "all").strip() or "all"
+            if scope != "all" and b != scope:
+                continue
+            grouped.setdefault(b, []).append(r)
+        if scope != "all":
+            grouped.setdefault(scope, [])
+        elif not grouped:
+            grouped["all"] = []
+        for b, rs in grouped.items():
+            agg = _aggregate(rs)
+            extra = {}
+            if e["type"] == "pitfall":
+                extra = {
+                    "intercept_n": sum(1 for r in rs if not r["exception"]),
+                    "exception_n": sum(1 for r in rs if r["exception"]),
+                }
+            upsert_stats(state, e["id"], env_bucket=b,
+                         sample_n=agg["sample_n"], win_rate=agg["win_rate"],
+                         avg_win=agg["avg_win"], avg_loss=agg["avg_loss"],
+                         expectancy=agg["expectancy"], stale_n=agg["stale_n"],
+                         window_days=window_days, actor="engine",
+                         note=f"日结算后确定性重算（N={n_days}，单桶不合并）",
+                         **extra)
+            buckets += 1
+    return {"entries": len(entries), "buckets": buckets}
 
 
 def list_stats(state, kb_id: str | None = None) -> list[dict]:

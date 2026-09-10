@@ -218,6 +218,21 @@ class EodSettleTrigger:
                     f"结清 {closed} 条，行情缺口 {gaps} 票")
         return {"signal_accounts": len(accounts), "closed": closed, "updated": updated}
 
+    def _recompute_kb(self) -> dict:
+        """日结算后确定性重算知识库统计（spec-05 §3.3，零 token，紧随结算回调）。
+
+        故障不阻断结算主流程（统计缺失由次日重算补齐）。
+        """
+        from core import kb  # noqa: PLC0415
+        try:
+            r = kb.recompute_stats(self.state)
+            self._audit("kb.stats.recompute_auto", "ok",
+                        f"日结算后重算 {r['entries']} 条目 / {r['buckets']} 桶")
+            return r
+        except Exception:  # noqa: BLE001 - 重算故障不阻断结算主流程
+            log.exception("kb_stats 重算失败（不影响结算）")
+            return {"entries": 0, "buckets": 0, "error": True}
+
     def _advance_windows(self, trade_date: str) -> list[dict]:
         """EVOQUANT 验证窗推进（spec-05 §4.3：验证窗口到期由调度器触发）。
 
@@ -280,8 +295,9 @@ class EodSettleTrigger:
         exits = self._advance_exits(dstr) if accounts else {}
         signals = self._advance_signals(dstr) if sig_accounts else {}
         self._done_dates.add(dstr)
+        kb_stats = self._recompute_kb()
         return {"date": dstr, "status": "no_pending", "exits": exits, "signals": signals,
-                "windows": self._advance_windows(dstr)}
+                "kb_stats": kb_stats, "windows": self._advance_windows(dstr)}
 
     def _settle_trading_day(self, dstr: str) -> dict:
         """实盘会话当天：探测交易日 → 推进卖出跟踪 → 跑当日结算。"""
@@ -306,8 +322,9 @@ class EodSettleTrigger:
             self._done_dates.add(dstr)
             self._audit("trade.eod_settle_auto", "ok",
                         f"{dstr} 结算完成，账户 {len(accounts_r)} 个")
+            kb_stats = self._recompute_kb()
             return {"date": dstr, "status": "settled", "accounts": accounts_r,
-                    "exits": exits, "signals": signals,
+                    "exits": exits, "signals": signals, "kb_stats": kb_stats,
                     "windows": self._advance_windows(dstr)}
         self._audit("trade.eod_settle_auto", "partial",
                     f"{dstr} 存在缺口账户 {len(errors)} 个，窗口内续试")
@@ -363,6 +380,7 @@ class EodSettleTrigger:
                 self._fill_catchup_absent(d, acct_errs)
             self._push_deliveries(d)
             self._done_dates.add(d)
+        self._recompute_kb()
         self._audit("trade.eod_catchup_auto", "ok" if not errs else "partial",
                     f"快进回放 {len(trading)} 个会话日（{trading[0]}..{trading[-1]}），"
                     f"缺口会话 {len(errs)} 个")
