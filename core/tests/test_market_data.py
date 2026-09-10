@@ -170,6 +170,34 @@ def test_get_replay_series_l2_day_range_fallback(authed_client):
     assert day is not None and day["close"] == "10.0"
 
 
+def test_l1_root_gate_short_cache_drops_to_l2(authed_client):
+    """本地 L1 根数 < 应有×(1−5%)（缺失>5%）→ L1 不就绪降 L2（spec-03 §4.1 A4）。"""
+    st = authed_client.app.state
+    l0store.minute_cache_put(st, "600000", DATE, _minute_bars(200), "fake")
+    s = market_data.get_replay_series(st, "600000", DATE, feed=Feed())
+    assert s["level"] == "l2" and s["official_close"] == Decimal("10.0")
+
+
+def test_l1_root_gate_within_tolerance_marks_degraded(authed_client):
+    """本地 L1 缺失 ≤5%（容差带内）→ 仍走 L1，当日标 degraded。"""
+    st = authed_client.app.state
+    l0store.minute_cache_put(st, "600000", DATE, _minute_bars(235), "fake")
+    s = market_data.get_replay_series(st, "600000", DATE, feed=Feed())
+    assert s["level"] == "l1" and len(s["series"]) == 235
+    assert s["quality"] == "degraded" and "缺 5 根" in s["notes"]
+
+
+def test_l1_cached_mismatch_official_drops_to_l2(authed_client):
+    """L1 缓存会话末价与官方收盘不一致 → 不抛错，兜 L2 日线区间。"""
+    st = authed_client.app.state
+    bars = _minute_bars()
+    bars[-1] = (bars[-1][0], Decimal("10.05"))
+    l0store.minute_cache_put(st, "600000", DATE, bars, "fake")
+    s = market_data.get_replay_series(st, "600000", DATE, feed=Feed())
+    assert s["level"] == "l2"
+    assert s["official_close"] == Decimal("10.0") and s["high"] == Decimal("10.2")
+
+
 class NoDayFeed(NoMinuteFeed):
     """当日与历史日线整体缺口（非交易日/数据未就绪 → 应显式 QuoteGap，不虚构）。"""
 

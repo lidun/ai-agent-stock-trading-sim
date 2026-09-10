@@ -7,7 +7,8 @@
   该票当日 quality=degraded（§4.2 #59，标记传播给结算/日报）。
 - 分钟/日线拉取落本地 SQLite 缓存（增量更新，spec-03 §6）；拉取源按 spec-03 §2.2
   默认链从“已配置源”解析（运行期配置腾讯，见 config.market_sources）。
-- 结算侧（settle_day/eodengine）沿用其现有适配器直供路径，本节不接管、不改行为。
+- 结算侧（settle_day/eodengine）经本节 settle_input 按票选档消费；本模块为
+  spec-03 §4.1 消费接口唯一入口（L0 本地序列 → L1 分钟 → L2 日线区间）。
 """
 from __future__ import annotations
 
@@ -240,8 +241,9 @@ def get_replay_series(state, symbol: str, trade_date: str, *, feed=None,
     """构造某票某交易日回放输入（spec-03 §4.1 get_replay_series）。
 
     选档：L0 就绪 → L0 判定序列（含 close_candidates 与官方收盘价偏差检测）；
-    L0 不就绪 → L1 分钟（缓存优先；会话末价与官方收盘不一致/缺口 → QuoteGapError
-    降 L2）；L2 日线区间兜底。任一档官方收盘价缺失 → 显式 QuoteGapError，不虚构。
+    L0 不就绪 → L1 分钟（缓存优先；本地根数 < 应有×(1−5%) → L1 不就绪降 L2；
+    缺失 ≤5% → 仍走 L1 但标 degraded；会话末价与官方收盘不一致 → 降 L2）；
+    L2 日线区间兜底。任一档官方收盘价缺失 → 显式 QuoteGapError，不虚构。
     """
     ready = is_ready(state, symbol, trade_date)
     if ready["l0_ready"]:
@@ -271,7 +273,13 @@ def get_replay_series(state, symbol: str, trade_date: str, *, feed=None,
         pm = pull_minute(state, symbol, trade_date, feed=feed, source=source)
     except (QuoteGapError, QuoteSourceError) as exc:
         return _l2_series(state, symbol, trade_date, feed=feed, source=source)
-    last_close = pm["bars"][-1][1] if pm["bars"] else None
+    need = int(Decimal(L1_EXPECTED_MINUTES) * (1 - L1_MISSING_TOLERANCE))
+    bars = pm["bars"] or []
+    if not bars or len(bars) < need:
+        # L1 根数核验不过（缺失 >5%，spec-03 §4.1 A4）→ L1 不就绪降 L2，
+        # 防本地缺段样本带着漏触发继续走 L1 而无标记。
+        return _l2_series(state, symbol, trade_date, feed=feed, source=source)
+    last_close = bars[-1][1]
     if pm.get("official_close") is not None:
         official, prev, close_src = pm["official_close"], pm["prev_close"], pm["source"]
     else:
@@ -279,13 +287,19 @@ def get_replay_series(state, symbol: str, trade_date: str, *, feed=None,
         if oc is None:
             raise QuoteGapError(f"{symbol} {trade_date} L1 无官方收盘价，拒绝供给")
         if last_close is not None and abs(last_close - oc["official_close"]) > Decimal("0.001"):
-            raise QuoteGapError(f"{symbol} L1 分钟末价与官方收盘不一致，降 L2")
+            return _l2_series(state, symbol, trade_date, feed=feed, source=source)
         official, prev, close_src = oc["official_close"], None, oc["source"]
-    series = [(f"{trade_date}T{m}:00", c) for m, c in pm["bars"]]
+    series = [(f"{trade_date}T{m}:00", c) for m, c in bars]
     l0store.set_official_close_source(state, trade_date, close_src)
+    missing = L1_EXPECTED_MINUTES - len(bars)
+    if missing > 0:
+        # 缺失 ≤5%（本地根数在容差带内）→ 仍走 L1，但该票当日标 degraded
+        quality, notes = "degraded", f"L1（分钟近似，缺 {missing} 根）"
+    else:
+        quality, notes = "ok", "L1（分钟近似）"
     return {
         "level": "l1", "series": series, "close_candidates": [],
         "official_close": official, "official_close_source": close_src,
         "prev_close": prev, "session_date": trade_date,
-        "source": pm["source"], "quality": "ok", "notes": "L1（分钟近似）",
+        "source": pm["source"], "quality": quality, "notes": notes,
     }
