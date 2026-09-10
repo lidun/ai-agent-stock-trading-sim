@@ -12,6 +12,8 @@
 - 软删（§3.7）：仅删除=软删+审计；历史 kb_stats 保留。
 - 候选参考卡（§3.5/§3.9）：`dispatch_cards` 出列 UCB1 排序卡片并递增
   kb_stats.dispatch_n（n_i 载体），soft-deleted 与 invalid/sealed 退出下发。
+- 验证进度（§3.2 B3）：`evidence_eta` 按「近 window_days 交易日该桶入信号频率」
+  外推达门槛所需交易日，供 spec-04 §5.5② 月体检报告消费。
 """
 from __future__ import annotations
 
@@ -678,6 +680,79 @@ def dispatch_cards(state, *, env_bucket: str = "all", limit: int = 8,
                        f"{x['kb_id']}#{x['env_bucket']}" for x in picked))
     return {"env_bucket": bucket, "c": c, "limit": int(limit),
             "total_dispatch_n": total_n, "cards": picked}
+
+
+EVIDENCE_WINDOW_DAYS = 30
+
+
+def evidence_eta(state, *, min_n: int = 30, window_days: int = EVIDENCE_WINDOW_DAYS,
+                 eps: float = 1e-6) -> dict:
+    """概念验证进度与预计可验证时间外推（spec-05 §3.2 B3，spec-04 §5.5② 数据源）。
+
+    `预计交易日 = (min_n − 当前桶 n) ÷ max(近 window_days 个交易日该桶入信号频率, ε)`；
+    入信号频率=窗口内该桶登记信号数（trial_flag=1 排除）÷ 窗口交易日数；近期无入信号
+    （freq=0）→ 无法外推；当前桶 n≥min_n → 样本充足（预计 0 日）。只读、确定性，供
+    spec-04 月体检报告「概念验证进度」消费。
+    """
+    conn = state_conn(state)
+    dates = [r["reg_date"] for r in conn.execute(
+        "SELECT DISTINCT reg_date FROM signal_registry WHERE reg_date!=''"
+        " ORDER BY reg_date DESC").fetchall()]
+    window = dates[:max(int(window_days), 1)]
+    cutoff = window[-1] if window else ""
+    window_len = len(window)
+    buckets: list[dict] = []
+    for e in conn.execute("SELECT * FROM kb_entries").fetchall():
+        orient = "avoid" if e["type"] == "pitfall" else "forward"
+        scope = (e["env_scope"] or "all").strip() or "all"
+        reg = _entry_reg_signals(conn, e)
+        recent_by_bucket: dict[str, int] = {}
+        for r in reg:
+            b = (r["env_bucket"] or "all").strip() or "all"
+            if scope != "all" and b != scope:
+                continue
+            if cutoff and r["reg_date"] >= cutoff:
+                recent_by_bucket[b] = recent_by_bucket.get(b, 0) + 1
+        stats = conn.execute(
+            "SELECT env_bucket, sample_n FROM kb_stats WHERE kb_id=?", (e["id"],)
+        ).fetchall()
+        stat_map = {s["env_bucket"]: int(s["sample_n"] or 0) for s in stats}
+        all_buckets = set(recent_by_bucket) | set(stat_map)
+        if scope != "all":
+            all_buckets = {b for b in all_buckets if b == scope}
+        for b in sorted(all_buckets):
+            n = stat_map.get(b, 0)
+            recent_n = recent_by_bucket.get(b, 0)
+            freq = recent_n / window_len if window_len else 0.0
+            if n >= min_n:
+                eta, reason = 0, "样本充足，已达可验证门槛"
+            elif freq <= 0:
+                eta, reason = None, "暂无入信号，无法外推"
+            else:
+                eta = math.ceil((min_n - n) / max(freq, eps))
+                reason = f"近 {window_len} 交易日入信号频率 {freq:.4f}/日"
+            buckets.append({
+                "kb_id": e["id"], "name": e["name"], "type": e["type"],
+                "status": e["status"], "env_bucket": b, "orientation": orient,
+                "sample_n": n, "min_n": min_n, "recent_n": recent_n,
+                "freq": round(freq, 4), "eta_days": eta, "reason": reason,
+            })
+    return {"as_of": dates[0] if dates else "", "window_days": int(window_days),
+            "window_len": window_len, "window_cutoff": cutoff,
+            "min_n": min_n, "buckets": buckets}
+
+
+def _entry_reg_signals(c, e) -> list:
+    """条目匹配信号的 (env_bucket, reg_date)（trial_flag=1 排除）。"""
+    if e["type"] == "pitfall":
+        return c.execute(
+            "SELECT env_bucket, reg_date FROM signal_registry WHERE trial_flag=0"
+            " AND sig_type='pitfall_intercept' AND pitfall_id=?", (e["id"],),
+        ).fetchall()
+    return c.execute(
+        "SELECT env_bucket, reg_date FROM signal_registry WHERE trial_flag=0"
+        " AND sig_type IN ('candidate','buy','sell') AND concept_tag=?", (e["name"],),
+    ).fetchall()
 
 
 def list_stats(state, kb_id: str | None = None) -> list[dict]:
