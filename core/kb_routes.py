@@ -5,6 +5,9 @@
 - GET    /api/kb/candidates         状态机数据结论候选（§3.2/§3.3 晋升/失效）
 - POST   /api/kb/reference-cards     候选参考卡下发（§3.5/§3.9 UCB，dispatch_n 计数）
 - GET    /api/kb/evidence-eta        概念验证进度/预计可验证时间外推（§3.2 B3）
+- GET    /api/kb/tag-aliases         概念标签归并映射表（§3.11 append-only）
+- GET    /api/kb/free-tags           未归并自由标签（探索口径）+ 归并候选提议（§3.11）
+- POST   /api/kb/tag-aliases         写归并映射（alias→规范 positive 条目，§3.11）
 - GET    /api/kb/{id}               条目详情（含各环境桶 kb_stats）
 - POST   /api/kb                    入库申请（初始 observing；闸1 确定性校验）
 - PATCH  /api/kb/{id}               元信息修改（name/description/env_scope/severity）
@@ -81,6 +84,39 @@ def kb_reference_cards(request: Request, session: SessionDep,
 def kb_evidence_eta(request: Request, session: SessionDep, min_n: int = 30,
                     window_days: int = kb.EVIDENCE_WINDOW_DAYS):
     return kb.evidence_eta(request.app.state, min_n=min_n, window_days=window_days)
+
+
+@router.get("/kb/tag-aliases")
+def kb_tag_aliases(request: Request, session: SessionDep,
+                   canonical_kb_id: str = ""):
+    return {"aliases": kb.list_tag_aliases(request.app.state,
+                                           canonical_kb_id=canonical_kb_id)}
+
+
+@router.get("/kb/free-tags")
+def kb_free_tags(request: Request, session: SessionDep, min_signals: int = 1,
+                 limit: int = 20):
+    return {
+        "free_tags": kb.unmerged_free_tags(request.app.state),
+        "proposals": kb.propose_tag_merges(request.app.state, min_signals=min_signals,
+                                           limit=limit),
+    }
+
+
+@router.post("/kb/tag-aliases")
+def kb_tag_merge(request: Request, session: SessionDep,
+                 payload: dict | None = Body(default=None)):
+    actor = session["session"]["username"]
+    body = payload or {}
+    try:
+        return kb.merge_tag(
+            request.app.state, alias=body.get("alias", ""),
+            canonical_kb_id=body.get("canonical_kb_id", ""),
+            actor=actor, reason=body.get("reason", ""))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/kb/{kb_id}")

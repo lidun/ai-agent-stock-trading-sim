@@ -1061,6 +1061,24 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON signal_registry(account_id, reg_date);
         """,
     ),
+    (
+        30,
+        """
+        -- spec-05 §3.11 概念标签治理：月度归并映射（append-only）。自由标签 alias →
+        -- 规范条目 canonical_kb_id，统计按 canonical 归并、不回写历史信号行（保
+        -- append-only 与可追溯）。每个 alias 只映射一个 canonical（PK 约束）；同
+        -- canonical 可多 alias。merged_by/merged_ts/reason 留痕管理 Agent 确认。
+        CREATE TABLE IF NOT EXISTS kb_tag_aliases (
+            alias           TEXT PRIMARY KEY,
+            canonical_kb_id TEXT NOT NULL REFERENCES kb_entries(id),
+            merged_by       TEXT NOT NULL DEFAULT '',
+            merged_ts       TEXT NOT NULL,
+            reason          TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_kb_tag_aliases_canonical
+            ON kb_tag_aliases(canonical_kb_id);
+        """,
+    ),
 ]
 
 

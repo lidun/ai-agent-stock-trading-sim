@@ -14,6 +14,9 @@
   kb_stats.dispatch_n（n_i 载体），soft-deleted 与 invalid/sealed 退出下发。
 - 验证进度（§3.2 B3）：`evidence_eta` 按「近 window_days 交易日该桶入信号频率」
   外推达门槛所需交易日，供 spec-04 §5.5② 月体检报告消费。
+- 概念标签治理（§3.11）：`merge_tag` 写 kb_tag_aliases 月度归并映射（append-only），
+  统计按 canonical 归并（`_canonical_tags`，不回写历史信号行）；`unmerged_free_tags`/
+  `propose_tag_merges` 提供探索占比与归并候选。
 """
 from __future__ import annotations
 
@@ -444,6 +447,18 @@ def _aggregate(rows, *, invert: bool = False) -> dict:
     }
 
 
+def _canonical_tags(c, entry) -> list[str]:
+    """positive 条目的全部归并 concept_tag：规范名 + 映射到它的自由标签别名（§3.11）。
+
+    统计按 canonical 归并（不回写历史信号行，映射表口径统一换算）。
+    """
+    tags = {entry["name"]}
+    for r in c.execute("SELECT alias FROM kb_tag_aliases WHERE canonical_kb_id=?",
+                       (entry["id"],)).fetchall():
+        tags.add(r["alias"])
+    return sorted(tags)
+
+
 def recompute_stats(state, *, kb_id: str | None = None, n_days: int = 10,
                     window_days: int | None = None) -> dict:
     """日结算后确定性重算 kb_stats（spec-05 §3.3「统计重算触发」，零 token）。
@@ -476,11 +491,13 @@ def recompute_stats(state, *, kb_id: str | None = None, n_days: int = 10,
                 " AND sig_type='pitfall_intercept' AND pitfall_id=?", (e["id"],),
             ).fetchall()
         else:
+            tags = _canonical_tags(c, e)
+            ph = ",".join("?" * len(tags))
             rows = c.execute(
                 "SELECT env_bucket, fwd_return_pct, quality, exception"
                 " FROM signal_registry WHERE trial_flag=0"
-                " AND sig_type IN ('candidate','buy','sell') AND concept_tag=?",
-                (e["name"],),
+                f" AND sig_type IN ('candidate','buy','sell')"
+                f" AND concept_tag IN ({ph})", tags,
             ).fetchall()
         scope = (e["env_scope"] or "all").strip() or "all"
         grouped: dict[str, list] = {}
@@ -513,16 +530,18 @@ def recompute_stats(state, *, kb_id: str | None = None, n_days: int = 10,
 
 
 def _entry_signals(c, e) -> list:
-    """条目对应的已登记信号行（positive 按 concept_tag=条目名；pitfall 按 pitfall_id）。"""
+    """条目对应的已登记信号行（positive 按 concept_tag 归并；pitfall 按 pitfall_id）。"""
     cols = "env_bucket, fwd_return_pct, fwd_end_date, quality, exception"
     if e["type"] == "pitfall":
         return c.execute(
             f"SELECT {cols} FROM signal_registry WHERE trial_flag=0"
             " AND sig_type='pitfall_intercept' AND pitfall_id=?", (e["id"],),
         ).fetchall()
+    tags = _canonical_tags(c, e)
+    ph = ",".join("?" * len(tags))
     return c.execute(
         f"SELECT {cols} FROM signal_registry WHERE trial_flag=0"
-        " AND sig_type IN ('candidate','buy','sell') AND concept_tag=?", (e["name"],),
+        f" AND sig_type IN ('candidate','buy','sell') AND concept_tag IN ({ph})", tags,
     ).fetchall()
 
 
@@ -743,16 +762,123 @@ def evidence_eta(state, *, min_n: int = 30, window_days: int = EVIDENCE_WINDOW_D
 
 
 def _entry_reg_signals(c, e) -> list:
-    """条目匹配信号的 (env_bucket, reg_date)（trial_flag=1 排除）。"""
+    """条目匹配信号的 (env_bucket, reg_date)（trial_flag=1 排除，positive 按归并）。"""
     if e["type"] == "pitfall":
         return c.execute(
             "SELECT env_bucket, reg_date FROM signal_registry WHERE trial_flag=0"
             " AND sig_type='pitfall_intercept' AND pitfall_id=?", (e["id"],),
         ).fetchall()
+    tags = _canonical_tags(c, e)
+    ph = ",".join("?" * len(tags))
     return c.execute(
         "SELECT env_bucket, reg_date FROM signal_registry WHERE trial_flag=0"
-        " AND sig_type IN ('candidate','buy','sell') AND concept_tag=?", (e["name"],),
+        f" AND sig_type IN ('candidate','buy','sell') AND concept_tag IN ({ph})", tags,
     ).fetchall()
+
+
+def merge_tag(state, *, alias: str, canonical_kb_id: str, actor: str = "manager",
+              reason: str = "") -> dict:
+    """写 kb_tag_aliases 月度归并映射（append-only，spec-05 §3.11）。
+
+    - alias 归一（strip）；canonical 必须是 positive 条目（pitfall 无语义标签归并）；
+    - 同 alias 已映射到同一 canonical → 幂等返回 created=False；
+    - 同 alias 已映射到不同 canonical → 拒绝（append-only，需人工复核后另处理）；
+    - 落映射后统计按 canonical 归并，不回写历史信号行。
+    """
+    a = (alias or "").strip()
+    if not a:
+        raise ValueError("alias 不能为空")
+    e = get_entry(state, canonical_kb_id)
+    if not e or e["type"] == "pitfall":
+        raise ValueError(f"canonical 必须是 positive 条目：{canonical_kb_id}")
+    if a == e["name"]:
+        raise ValueError("alias 与规范名相同，无需归并")
+    c = state_conn(state)
+    ts = _now_iso()
+    with write_txn(c) as t:
+        row = t.execute("SELECT canonical_kb_id FROM kb_tag_aliases WHERE alias=?",
+                        (a,)).fetchone()
+        if row:
+            if row["canonical_kb_id"] == e["id"]:
+                return {"alias": a, "canonical_kb_id": e["id"], "created": False}
+            raise ValueError(
+                f"alias 已映射到 {row['canonical_kb_id']}，append-only 需人工复核")
+        t.execute(
+            "INSERT INTO kb_tag_aliases (alias, canonical_kb_id, merged_by,"
+            " merged_ts, reason) VALUES (?,?,?,?,?)",
+            (a, e["id"], actor, ts, (reason or "")[:400]))
+        _audit(t, ts=ts, actor=actor, action="kb.tag.merge", object_id=e["id"],
+               result="ok", detail=f"alias={a} reason={reason}")
+    return {"alias": a, "canonical_kb_id": e["id"], "created": True}
+
+
+def list_tag_aliases(state, *, canonical_kb_id: str = "") -> list[dict]:
+    """归并映射表（新→旧）；可按 canonical 过滤。"""
+    sql = "SELECT * FROM kb_tag_aliases"
+    params: list = []
+    if canonical_kb_id:
+        sql += " WHERE canonical_kb_id=?"
+        params.append(canonical_kb_id)
+    sql += " ORDER BY merged_ts DESC, alias ASC"
+    return [dict(r) for r in state_conn(state).execute(sql, params).fetchall()]
+
+
+def unmerged_free_tags(state) -> list[dict]:
+    """未命中规范条目、也未被归并的自由 concept_tag（探索观察口径，§3.11）。
+
+    返回 [{concept_tag, signals, buckets{桶: n}}]（按信号数降序）。未归并自由标签独立
+    统计、作探索观察，不入状态机晋升证据。
+    """
+    c = state_conn(state)
+    names = {r["name"] for r in c.execute("SELECT name FROM kb_entries").fetchall()}
+    mapped = {r["alias"] for r in
+              c.execute("SELECT alias FROM kb_tag_aliases").fetchall()}
+    rows = c.execute(
+        "SELECT concept_tag, env_bucket, COUNT(*) AS n FROM signal_registry"
+        " WHERE trial_flag=0 AND concept_tag != ''"
+        " AND sig_type IN ('candidate','buy','sell')"
+        " GROUP BY concept_tag, env_bucket").fetchall()
+    agg: dict[str, dict] = {}
+    for r in rows:
+        tag = r["concept_tag"]
+        if tag in names or tag in mapped:
+            continue
+        b = agg.setdefault(tag, {"concept_tag": tag, "signals": 0, "buckets": {}})
+        b["signals"] += int(r["n"] or 0)
+        b["buckets"][r["env_bucket"] or "all"] = int(r["n"] or 0)
+    return sorted(agg.values(), key=lambda x: (-x["signals"], x["concept_tag"]))
+
+
+def propose_tag_merges(state, *, min_signals: int = 1, limit: int = 20) -> list[dict]:
+    """月度归并候选提议（确定性预筛，供 LLM/管理 Agent 复核，§3.11）。
+
+    对每个未归并自由标签与 positive 条目名做包含关系打分（零 token）；LLM 提议+
+    管理 Agent 确认后由 `merge_tag` 落映射。
+    """
+    c = state_conn(state)
+    entries = c.execute(
+        "SELECT id, name FROM kb_entries WHERE type!='pitfall'"
+        " AND COALESCE(deleted_ts,'')=''").fetchall()
+    out: list[dict] = []
+    for f in unmerged_free_tags(state):
+        if f["signals"] < int(min_signals):
+            continue
+        tag = f["concept_tag"]
+        best = None
+        for e in entries:
+            name = e["name"]
+            if tag in name or name in tag:
+                score = round(min(len(tag), len(name)) / max(len(tag), len(name)), 4)
+            else:
+                continue
+            if best is None or score > best["score"]:
+                best = {"alias": tag, "suggested_kb_id": e["id"],
+                        "suggested_name": name, "score": score,
+                        "signals": f["signals"]}
+        if best:
+            out.append(best)
+    out.sort(key=lambda x: (-x["score"], -x["signals"], x["alias"]))
+    return out[:max(1, int(limit))]
 
 
 def list_stats(state, kb_id: str | None = None) -> list[dict]:
