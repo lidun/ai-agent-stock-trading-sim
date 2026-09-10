@@ -408,9 +408,19 @@ def upsert_stats(state, kb_id: str, *, env_bucket: str = "all",
     return stats_row_to_dict(fresh)
 
 
-def _aggregate(rows) -> dict:
-    """按桶聚合前瞻收益：胜率/均盈/均亏（负值）/期望值（含费）。"""
-    vals = [float(r["fwd_return_pct"]) for r in rows if r["fwd_return_pct"] is not None]
+def _aggregate(rows, *, invert: bool = False) -> dict:
+    """按桶聚合前瞻收益：胜率/均盈/均亏（负值）/期望值（含费）。
+
+    invert=True 用于避坑条目：以「被拦截标的前瞻收益取负」为收益，使期望值越大越优
+    （被拦截后下跌=真避坑为正，上涨=误杀为负，spec-05 §3.3）。
+    """
+    def _val(r):
+        if r["fwd_return_pct"] is None:
+            return None
+        v = float(r["fwd_return_pct"])
+        return -v if invert else v
+
+    vals = [x for x in (_val(r) for r in rows) if x is not None]
     n = len(vals)
     stale_n = sum(1 for r in rows if "stale_close" in (r["quality"] or ""))
     if n == 0:
@@ -496,6 +506,94 @@ def recompute_stats(state, *, kb_id: str | None = None, n_days: int = 10,
                          **extra)
             buckets += 1
     return {"entries": len(entries), "buckets": buckets}
+
+
+def _entry_signals(c, e) -> list:
+    """条目对应的已登记信号行（positive 按 concept_tag=条目名；pitfall 按 pitfall_id）。"""
+    cols = "env_bucket, fwd_return_pct, fwd_end_date, quality, exception"
+    if e["type"] == "pitfall":
+        return c.execute(
+            f"SELECT {cols} FROM signal_registry WHERE trial_flag=0"
+            " AND sig_type='pitfall_intercept' AND pitfall_id=?", (e["id"],),
+        ).fetchall()
+    return c.execute(
+        f"SELECT {cols} FROM signal_registry WHERE trial_flag=0"
+        " AND sig_type IN ('candidate','buy','sell') AND concept_tag=?", (e["name"],),
+    ).fetchall()
+
+
+def evaluate_candidates(state, *, min_n: int = 30, rolling_days: int = 60,
+                        n_days: int = 10) -> dict:
+    """按 kb_stats 口径给出状态机数据结论候选（spec-05 §3.2/§3.3，不改状态）。
+
+    - 晋升候选 promote_valid：状态 observing/validating，单桶全量 n≥min_n 且
+      （按条目类型的）期望值 > 0；positive 以 fwd 正为胜，pitfall 以被拦截标的
+      下跌（取负）为真避坑；
+    - 失效候选 invalidate：状态 valid/validating，滚动 rolling_days 个已结清交易日
+      窗口期望值 < 0（含 n>0）；
+    - 证据不足（n<min_n）计入 insufficient_buckets，不产生候选。
+    状态实际迁移仍须管理 Agent/用户经 transition_kb 确认（review_gate2_ref 留痕）。
+    """
+    c = state_conn(state)
+    dates = [r["fwd_end_date"] for r in c.execute(
+        "SELECT DISTINCT fwd_end_date FROM signal_registry WHERE fwd_end_date!=''"
+        " ORDER BY fwd_end_date DESC").fetchall()]
+    as_of = dates[0] if dates else ""
+    if not dates:
+        cutoff = ""
+    elif len(dates) >= rolling_days:
+        cutoff = dates[rolling_days - 1]
+    else:
+        cutoff = dates[-1]
+    candidates: list[dict] = []
+    insufficient = 0
+    for e in c.execute("SELECT * FROM kb_entries").fetchall():
+        orient = "avoid" if e["type"] == "pitfall" else "forward"
+        scope = (e["env_scope"] or "all").strip() or "all"
+        rows = _entry_signals(c, e)
+        grouped: dict[str, list] = {}
+        for r in rows:
+            b = (r["env_bucket"] or "all").strip() or "all"
+            if scope != "all" and b != scope:
+                continue
+            grouped.setdefault(b, []).append(r)
+        if not grouped:
+            grouped = {scope if scope != "all" else "all": []}
+        for b, rs in grouped.items():
+            eff = [r for r in rs if not r["exception"]] if orient == "avoid" else rs
+            agg = _aggregate(eff, invert=(orient == "avoid"))
+            if agg["sample_n"] < min_n:
+                insufficient += 1
+                continue
+            roll = [r for r in eff
+                    if cutoff and r["fwd_end_date"] and r["fwd_end_date"] >= cutoff]
+            ragg = _aggregate(roll, invert=(orient == "avoid"))
+            action = ""
+            reason = ""
+            if (e["status"] in ("valid", "validating") and ragg["sample_n"] > 0
+                    and (ragg["expectancy"] or 0.0) < 0):
+                action = "invalidate"
+                reason = (f"滚动 {rolling_days} 交易日期望值 {ragg['expectancy']:.4f} < 0"
+                          f"（n={ragg['sample_n']}）")
+            elif e["status"] in ("observing", "validating") and (agg["expectancy"] or 0.0) > 0:
+                action = "promote_valid"
+                reason = f"单桶 n={agg['sample_n']}≥{min_n} 且期望值 {agg['expectancy']:.4f} > 0"
+            if action:
+                candidates.append({
+                    "kb_id": e["id"], "name": e["name"], "type": e["type"],
+                    "status": e["status"], "env_bucket": b, "action": action,
+                    "orientation": orient, "reason": reason,
+                    "sample_n": agg["sample_n"], "win_rate": agg["win_rate"],
+                    "avg_win": agg["avg_win"], "avg_loss": agg["avg_loss"],
+                    "expectancy": agg["expectancy"], "stale_n": agg["stale_n"],
+                    "intercept_n": sum(1 for r in rs if not r["exception"]),
+                    "exception_n": sum(1 for r in rs if r["exception"]),
+                    "rolling_n": ragg["sample_n"],
+                    "rolling_expectancy": ragg["expectancy"],
+                })
+    return {"min_n": min_n, "rolling_days": rolling_days, "n_days": n_days,
+            "as_of": as_of, "window_cutoff": cutoff,
+            "insufficient_buckets": insufficient, "candidates": candidates}
 
 
 def list_stats(state, kb_id: str | None = None) -> list[dict]:

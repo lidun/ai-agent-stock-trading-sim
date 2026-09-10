@@ -2,6 +2,7 @@
 
 - GET    /api/kb                    条目列表（type/status/source/kw/软删过滤）
 - GET    /api/kb/stats              统计快照列表（可选 kb_id 过滤）
+- GET    /api/kb/candidates         状态机数据结论候选（§3.2/§3.3 晋升/失效）
 - GET    /api/kb/{id}               条目详情（含各环境桶 kb_stats）
 - POST   /api/kb                    入库申请（初始 observing；闸1 确定性校验）
 - PATCH  /api/kb/{id}               元信息修改（name/description/env_scope/severity）
@@ -51,6 +52,13 @@ def kb_list(request: Request, session: SessionDep,
 @router.get("/kb/stats")
 def kb_stats_list(request: Request, session: SessionDep, kb_id: str | None = None):
     return {"stats": kb.list_stats(request.app.state, kb_id=kb_id)}
+
+
+@router.get("/kb/candidates")
+def kb_candidates(request: Request, session: SessionDep,
+                  min_n: int = 30, rolling_days: int = 60):
+    return kb.evaluate_candidates(request.app.state, min_n=min_n,
+                                  rolling_days=rolling_days)
 
 
 @router.get("/kb/{kb_id}")
