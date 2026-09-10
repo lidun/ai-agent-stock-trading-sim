@@ -64,7 +64,7 @@ export default function MetricSummaryCard({ metrics, loading }: Props) {
             />
             <div>
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                {labelTip("信号胜率", m?.signal?.note ?? "卖出决策信号（spec-01 §8 signal_registry 落库后替换）")}
+                {labelTip("信号胜率", m?.signal?.note ?? "主账户信号注册表已结清信号（spec-01 §8）")}
               </Typography.Text>
               <div style={{ fontSize: 26, fontWeight: 600, color: colorOfSign((m.signal.win_rate_pct ?? 50) - 50) }}>
                 {m.signal.win_rate_pct != null ? `${m.signal.win_rate_pct.toFixed(1)}%` : "—"}
@@ -80,10 +80,18 @@ export default function MetricSummaryCard({ metrics, loading }: Props) {
             </div>
           </Flex>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            信号样本：{m.signal.done} 笔已了结（卖对 {m.signal.win_n} / 卖平 {m.signal.tie_n} / 卖早{" "}
-            {m.signal.early_n}），了结均前向收益 {pctText(m.signal.avg_fwd_return_pct, false)}，相对沪深300 超额{" "}
-            {pctText(m.signal.avg_excess_pct)}。指标口径：份额法 + 卖出信号注册表（spec-06 §6.4 P2，口径标注 B4）。
+            信号样本：{m.signal.done} 条已结清（胜 {m.signal.win_n} / 平 {m.signal.tie_n} / 负{" "}
+            {m.signal.early_n}），了结均前向收益 {pctText(m.signal.avg_fwd_return_pct, false)}。
+            指标口径：份额法 + 信号注册表（spec-06 §6.4 P2，口径标注 B4）。
           </Typography.Text>
+          {m.exit && m.exit.done > 0 && (
+            <Typography.Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 4 }}>
+              卖出决策（exit_trackings）：{m.exit.done} 笔（卖对 {m.exit.win_n} / 卖平{" "}
+              {m.exit.tie_n} / 卖早 {m.exit.early_n}），均前向收益{" "}
+              {pctText(m.exit.avg_fwd_return_pct, false)}，相对沪深300 超额{" "}
+              {pctText(m.exit.avg_excess_pct)}。
+            </Typography.Text>
+          )}
         </>
       )}
     </Card>

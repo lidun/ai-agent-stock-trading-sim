@@ -8,9 +8,11 @@
 - 沪深300 基准：index_quotes 表本版未建（spec-03 §2），经 quotes_tencent.day_rows
   现拉 sh000300（引擎 EXIT_BENCH_SYMBOL 同码），按各曲线交易日期对齐归一为
   累计收益 %。源不可用 → benchmark.available=false，曲线降级为仅净值。
-- 信号胜率：signal_registry 本版未建（spec-01 §8 注释明示），真实承载=exit_trackings
-  （卖出成交自动登记、settle_exits 推进/结清给出 fwd/excess/conclusion，spec-01 §8.1），
-  以"卖出决策"维度聚合替代，UI 口径标注。累计收益/最大回撤全程由主账户净值算。
+- 信号胜率：以 signal_registry 已结清信号（N 日前瞻收益正/零/负）为主口径
+  （spec-01 §8、spec-06 §6.4），trial_flag=1 样本排除（spec-05 §3.2）；另并行给出
+  exit_trackings 卖出决策细分（卖出成交自动登记、settle_exits 推进/结清给出
+  fwd/excess/conclusion，spec-01 §8.1），两口径字段独立。累计收益/最大回撤全程由
+  主账户净值算。
 - 策略演进：账户角色账本（main 现役 / trial·validation 验证）+ trial_archives 验收
   结论（launch/reject 快照，accountstore.finish_trial 一次写入）——spec-02 §9 多代
   版本链引擎侧尚未落地，UI 如实展示已有账户维度。
@@ -192,7 +194,13 @@ def _drawdown(navs: list[float]) -> float | None:
 
 
 def metrics(state, agent_id: str) -> dict:
-    """指标摘要卡：累计收益率/最大回撤（主账户净值）/卖出信号胜率（exit_trackings）。"""
+    """指标摘要卡：累计收益率/最大回撤（主账户净值）/信号胜率（signal_registry）。
+
+    信号胜率口径（spec-06 §6.4 P2 / spec-01 §8）：主账户 signal_registry 已结清
+    信号（fwd_end_date 非空）按 N 日前瞻收益正/零/负计胜/平/负，胜率=胜/(胜+负)；
+    trial_flag=1 的试运行样本默认排除，防污染（spec-05 §3.2）。卖出决策细分仍以
+    exit_trackings 单独呈现（结论含对沪深300 超额的卖对/卖平/卖早）。
+    """
     from core.accountstore import accounts_for_agent  # noqa: PLC0415
     accounts = accounts_for_agent(state, agent_id)
     if not accounts:
@@ -210,31 +218,58 @@ def metrics(state, agent_id: str) -> dict:
     signal: dict = {
         "n": 0, "done": 0, "win_n": 0, "tie_n": 0, "early_n": 0,
         "win_rate_pct": None, "avg_fwd_return_pct": None, "avg_excess_pct": None,
-        "note": "口径：exit_trackings 卖出决策客观统计（signal_registry 本版未建，"
-                "spec-01 §8.1）——卖对/卖平/卖早结论由 N 日前瞻收益对沪深300超额判定",
+        "note": "口径：signal_registry 主账户已结清信号（spec-01 §8，N 日前瞻收益"
+                "正/零/负），trial 样本排除（spec-05 §3.2）",
+    }
+    exit_stats: dict = {
+        "n": 0, "done": 0, "win_n": 0, "tie_n": 0, "early_n": 0,
+        "win_rate_pct": None, "avg_fwd_return_pct": None, "avg_excess_pct": None,
+        "note": "口径：exit_trackings 卖出决策客观统计——卖对/卖平/卖早结论由 N 日前瞻"
+                "收益对沪深300 超额判定（spec-06 §6.4 细分）",
     }
     if main:
         c = state_conn(state)
-        rows = c.execute(
-            "SELECT conclusion, fwd_return_pct, excess_pct, status FROM exit_trackings"
-            " WHERE account_id=? AND status='done'", (main["id"],)).fetchall()
-        signal["n"] = len(rows)
-        done = [r for r in rows if r["conclusion"]]
+        reg = c.execute(
+            "SELECT fwd_end_date, fwd_return_pct FROM signal_registry"
+            " WHERE account_id=? AND trial_flag=0", (main["id"],)).fetchall()
+        signal["n"] = len(reg)
+        done = [r for r in reg if r["fwd_end_date"] and r["fwd_return_pct"] is not None]
         signal["done"] = len(done)
-        counts = {"卖对": 0, "卖平": 0, "卖早": 0}
         for r in done:
-            counts[r["conclusion"]] = counts.get(r["conclusion"], 0) + 1
-        signal["win_n"] = counts["卖对"]
-        signal["tie_n"] = counts["卖平"]
-        signal["early_n"] = counts["卖早"]
-        decided = counts["卖对"] + counts["卖早"]
+            v = r["fwd_return_pct"]
+            if v > 0:
+                signal["win_n"] += 1
+            elif v < 0:
+                signal["early_n"] += 1
+            else:
+                signal["tie_n"] += 1
+        decided = signal["win_n"] + signal["early_n"]
         if decided > 0:
-            signal["win_rate_pct"] = round(counts["卖对"] / decided * 100, 2)
+            signal["win_rate_pct"] = round(signal["win_n"] / decided * 100, 2)
         if done:
             signal["avg_fwd_return_pct"] = round(
                 sum(r["fwd_return_pct"] for r in done) / len(done), 2)
-            signal["avg_excess_pct"] = round(
-                sum(r["excess_pct"] for r in done) / len(done), 2)
+
+        rows = c.execute(
+            "SELECT conclusion, fwd_return_pct, excess_pct, status FROM exit_trackings"
+            " WHERE account_id=? AND status='done'", (main["id"],)).fetchall()
+        exit_stats["n"] = len(rows)
+        ex_done = [r for r in rows if r["conclusion"]]
+        exit_stats["done"] = len(ex_done)
+        counts = {"卖对": 0, "卖平": 0, "卖早": 0}
+        for r in ex_done:
+            counts[r["conclusion"]] = counts.get(r["conclusion"], 0) + 1
+        exit_stats["win_n"] = counts["卖对"]
+        exit_stats["tie_n"] = counts["卖平"]
+        exit_stats["early_n"] = counts["卖早"]
+        ex_decided = counts["卖对"] + counts["卖早"]
+        if ex_decided > 0:
+            exit_stats["win_rate_pct"] = round(counts["卖对"] / ex_decided * 100, 2)
+        if ex_done:
+            exit_stats["avg_fwd_return_pct"] = round(
+                sum(r["fwd_return_pct"] for r in ex_done) / len(ex_done), 2)
+            exit_stats["avg_excess_pct"] = round(
+                sum(r["excess_pct"] for r in ex_done) / len(ex_done), 2)
     return {
         "agent_id": agent_id,
         "as_of": as_of,
@@ -243,6 +278,7 @@ def metrics(state, agent_id: str) -> dict:
         "settle_days": len(pts),
         "nav_last": round(navs[-1], 6) if navs else None,
         "signal": signal,
+        "exit": exit_stats,
     }
 
 

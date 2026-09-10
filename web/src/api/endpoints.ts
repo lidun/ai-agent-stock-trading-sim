@@ -864,6 +864,7 @@ export interface StrategyMetrics {
   settle_days: number;
   nav_last: number | null;
   signal: SignalStats;
+  exit: SignalStats;
 }
 
 export interface EvolutionTrial {

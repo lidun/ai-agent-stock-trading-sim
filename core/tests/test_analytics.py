@@ -37,20 +37,49 @@ def _seed_exits(st, account_id: str = DEMO) -> None:
          -1.5, -2.0, "卖早", 11.0, 8.0, "2026-09-02T15:00:00Z"))
 
 
-def test_metrics_from_reports_and_exits(authed_client):
+def _seed_signals(st, account_id: str = DEMO) -> None:
+    """主账户 3 条已结清（+3.2/0/-1.5）+ 1 条在途 + 1 条 trial 样本（应排除）。"""
+    c = state_conn(st)
+    base = ("INSERT INTO signal_registry (id, account_id, sig_type, symbol, reg_date,"
+            " concept_tag, env_bucket, exception, pitfall_id, fwd_return_pct,"
+            " fwd_end_date, quality, strategy_version_no, trial_flag, ref_price,"
+            " last_close, sessions_done, last_seen, created_ts)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+    def ins(sid, fwd, end, trial=0):
+        c.execute(base, (sid, account_id, "buy", "600000", "2026-08-20", "AI", "up",
+                         0, "", fwd, end, "", "v1", trial, 10.0, 10.0, 10,
+                         "2026-09-03", "2026-08-20T15:00:00Z"))
+
+    ins("sg-win", 3.2, "2026-09-03")
+    ins("sg-flat", 0.0, "2026-09-03")
+    ins("sg-loss", -1.5, "2026-09-03")
+    ins("sg-open", None, "")
+    ins("sg-trial", 9.9, "2026-09-03", trial=1)
+
+
+def test_metrics_from_reports_signals_and_exits(authed_client):
     st = authed_client.app.state
     _seed_curve(st)
+    _seed_signals(st)
     _seed_exits(st)
     m = analytics.metrics(st, DEMO)
     assert m["as_of"] == "2026-09-04"
     assert m["settle_days"] == 4
     assert m["cum_return_pct"] == 1.0          # (1.01-1)*100
     assert m["max_drawdown_pct"] == 3.92       # 峰值 1.02 → 谷 0.98：0.04/1.02*100
-    assert m["signal"]["done"] == 2
+    # 信号胜率：signal_registry 口径（trial 排除，在途不计入已结清）
+    assert m["signal"]["n"] == 4
+    assert m["signal"]["done"] == 3
     assert m["signal"]["win_n"] == 1 and m["signal"]["early_n"] == 1
+    assert m["signal"]["tie_n"] == 1
     assert m["signal"]["win_rate_pct"] == 50.0
-    assert abs(m["signal"]["avg_fwd_return_pct"] - (3.2 + -1.5) / 2) < 1e-6
-    assert abs(m["signal"]["avg_excess_pct"] - (2.1 + -2.0) / 2) < 1e-6
+    assert m["signal"]["avg_fwd_return_pct"] == 0.57   # (3.2+0-1.5)/3 四舍五入
+    # 卖出决策细分：exit_trackings 口径，字段独立
+    assert m["exit"]["done"] == 2
+    assert m["exit"]["win_n"] == 1 and m["exit"]["early_n"] == 1
+    assert m["exit"]["win_rate_pct"] == 50.0
+    assert abs(m["exit"]["avg_excess_pct"] - (2.1 + -2.0) / 2) < 1e-6
 
 
 def test_equity_curve_series_and_bench(authed_client, monkeypatch):
