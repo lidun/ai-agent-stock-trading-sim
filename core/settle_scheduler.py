@@ -20,7 +20,8 @@ import logging
 from datetime import date, datetime, time, timedelta, timezone
 from time import monotonic
 
-from core import accountstore, approval, eodengine, quotes_tencent, reporting, settle_day
+from core import (accountstore, approval, eodengine, quotes_tencent, reporting,
+                  settle_day, signalstore)
 from core.auth import audit
 from core.db import state_conn
 
@@ -162,6 +163,61 @@ class EodSettleTrigger:
                     f"行情缺口 {gaps} 票")
         return {"tracked_accounts": len(accounts), "closed": closed, "updated": updated}
 
+    def _signal_state(self, trade_date: str) -> tuple[list[str], list[str]]:
+        """在途信号（未结清且登记日早于今日）的义务账户与证券（spec-01 §8）。"""
+        conn = state_conn(self.state)
+        accounts = [r["account_id"] for r in conn.execute(
+            "SELECT DISTINCT account_id FROM signal_registry"
+            " WHERE fwd_end_date='' AND reg_date < ?", (trade_date,)
+        ).fetchall()]
+        symbols = [r["symbol"] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM signal_registry"
+            " WHERE fwd_end_date='' AND reg_date < ?", (trade_date,)
+        ).fetchall()]
+        return accounts, symbols
+
+    def _signal_base_prices(self, account_id: str, trade_date: str) -> dict[str, float]:
+        """在途信号中未给登记日基准价的（策略侧候选未传价）兜底取登记日官方收盘。"""
+        conn = state_conn(self.state)
+        rows = conn.execute(
+            "SELECT DISTINCT symbol, reg_date FROM signal_registry"
+            " WHERE account_id=? AND fwd_end_date='' AND ref_price<=0 AND reg_date < ?",
+            (account_id, trade_date),
+        ).fetchall()
+        out: dict[str, float] = {}
+        for r in rows:
+            ohlc = self._day_ohlc(r["symbol"], r["reg_date"])
+            if ohlc:
+                out[r["symbol"]] = ohlc["close"]
+        return out
+
+    def _advance_signals(self, trade_date: str) -> dict:
+        """当日信号前瞻推进（spec-01 §8：N 交易日结清，幂等，缺价不虚构）。
+
+        为在途信号的证券拉取当日官方收盘，调用 signalstore.settle_due 逐账户推进；
+        登记日基准价缺失的策略侧候选以其登记日官方收盘兜底。
+        """
+        accounts, symbols = self._signal_state(trade_date)
+        if not accounts:
+            return {"signal_accounts": 0, "closed": 0, "updated": 0}
+        market: dict[str, dict] = {}
+        for sym in symbols:
+            ohlc = self._day_ohlc(sym, trade_date)
+            if ohlc:
+                market[sym] = ohlc
+        updated = closed = 0
+        for acct in accounts:
+            base = self._signal_base_prices(acct, trade_date)
+            r = signalstore.settle_due(self.state, acct, trade_date,
+                                       market=market, base_prices=base)
+            updated += r.get("updated", 0)
+            closed += r.get("closed", 0)
+        gaps = len(symbols) - sum(1 for s in symbols if s in market)
+        self._audit("trade.eod_signal_settle_auto", "ok",
+                    f"{trade_date} 信号账户 {len(accounts)} 个，推进 {updated} 条，"
+                    f"结清 {closed} 条，行情缺口 {gaps} 票")
+        return {"signal_accounts": len(accounts), "closed": closed, "updated": updated}
+
     def _advance_windows(self, trade_date: str) -> list[dict]:
         """EVOQUANT 验证窗推进（spec-05 §4.3：验证窗口到期由调度器触发）。
 
@@ -213,7 +269,8 @@ class EodSettleTrigger:
         if has_pending:
             return self._settle_trading_day(dstr)
         accounts, _ = self._tracking_state(dstr)
-        if not accounts and not self._window_pending():
+        sig_accounts, _ = self._signal_state(dstr)
+        if not accounts and not sig_accounts and not self._window_pending():
             # 空日快路径：仅一次本地 SQL，不发起任何行情网络请求
             return {"date": dstr, "status": "no_pending"}
         snap_day = self._probe_trade_date()
@@ -221,8 +278,9 @@ class EodSettleTrigger:
             return {"date": dstr, "status": "not_trading_session",
                     "snapshot_date": snap_day.isoformat() if snap_day else None}
         exits = self._advance_exits(dstr) if accounts else {}
+        signals = self._advance_signals(dstr) if sig_accounts else {}
         self._done_dates.add(dstr)
-        return {"date": dstr, "status": "no_pending", "exits": exits,
+        return {"date": dstr, "status": "no_pending", "exits": exits, "signals": signals,
                 "windows": self._advance_windows(dstr)}
 
     def _settle_trading_day(self, dstr: str) -> dict:
@@ -236,6 +294,10 @@ class EodSettleTrigger:
         accounts, _ = self._tracking_state(dstr)
         if accounts:
             exits = self._advance_exits(dstr)
+        signals = {}
+        sig_accounts, _ = self._signal_state(dstr)
+        if sig_accounts:
+            signals = self._advance_signals(dstr)
         report = settle_day.run_day(self.state, dstr, feed=self.feed,
                                     corp_events=self._corp_events_for(dstr))
         accounts_r = report.get("accounts", [])
@@ -245,11 +307,12 @@ class EodSettleTrigger:
             self._audit("trade.eod_settle_auto", "ok",
                         f"{dstr} 结算完成，账户 {len(accounts_r)} 个")
             return {"date": dstr, "status": "settled", "accounts": accounts_r,
-                    "exits": exits, "windows": self._advance_windows(dstr)}
+                    "exits": exits, "signals": signals,
+                    "windows": self._advance_windows(dstr)}
         self._audit("trade.eod_settle_auto", "partial",
                     f"{dstr} 存在缺口账户 {len(errors)} 个，窗口内续试")
         return {"date": dstr, "status": "retry_gap", "errors": errors,
-                "accounts": accounts_r, "exits": exits}
+                "accounts": accounts_r, "exits": exits, "signals": signals}
 
     def catchup_missed(self, *, now: datetime | None = None,
                        start: date | None = None,
@@ -283,13 +346,17 @@ class EodSettleTrigger:
             exits = {}
             if self._tracking_state(d)[0]:
                 exits = self._advance_exits(d)
+            signals = {}
+            if self._signal_state(d)[0]:
+                signals = self._advance_signals(d)
             report = settle_day.run_day(self.state, d, feed=self.feed,
                                         account_ids=account_ids,
                                         corp_events=self._corp_events_for(d))
             accts = report.get("accounts", [])
             acct_errs = [a for a in accts if a.get("error")]
             windows = [] if acct_errs else self._advance_windows(d)
-            dates.append({"date": d, "exits": exits, "error": bool(acct_errs),
+            dates.append({"date": d, "exits": exits, "signals": signals,
+                          "error": bool(acct_errs),
                           "accounts": accts, "windows": windows})
             if acct_errs:
                 errs.append({"date": d, "errors": acct_errs})

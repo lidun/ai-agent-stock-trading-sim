@@ -1022,6 +1022,45 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE settlement_log ADD COLUMN quality_marks TEXT;
         """,
     ),
+    (
+        29,
+        """
+        -- spec-01 §2.5/§8 信号注册表（引擎登记切片）：候选入选/买入成交/卖出成交/
+        -- 避坑拦截登记 sig_type/symbol/reg_date/concept_tag/env_bucket/quality 与
+        -- strategy_version_no/trial_flag；N（默认 10）个交易日后由引擎结算前瞻收益。
+        -- 列口径：fwd_return_pct 为登记日基准（ref_price，官方收盘）到结清日收盘的涨跌
+        -- 百分数；last_close 为最近可得价（停牌/退市 stale 结清用，不虚构）；exception/
+        -- pitfall_id 服务避坑拦截（#54）；sessions_done/last_seen 为无日历表下的交易日
+        -- 推进幂等（与 exit_trackings 同法）；fwd_end_date 非空即已结清。
+        CREATE TABLE IF NOT EXISTS signal_registry (
+            id                  TEXT PRIMARY KEY,
+            account_id          TEXT NOT NULL REFERENCES accounts(id),
+            sig_type            TEXT NOT NULL
+                                CHECK (sig_type IN ('candidate', 'buy', 'sell',
+                                                    'pitfall_intercept')),
+            symbol              TEXT NOT NULL,
+            reg_date            TEXT NOT NULL,
+            concept_tag         TEXT NOT NULL DEFAULT '',
+            env_bucket          TEXT NOT NULL DEFAULT '',
+            exception           INTEGER NOT NULL DEFAULT 0,
+            pitfall_id          TEXT NOT NULL DEFAULT '',
+            fwd_return_pct      REAL,
+            fwd_end_date        TEXT NOT NULL DEFAULT '',
+            quality             TEXT NOT NULL DEFAULT '',
+            strategy_version_no TEXT NOT NULL DEFAULT '',
+            trial_flag          INTEGER NOT NULL DEFAULT 0,
+            ref_price           REAL NOT NULL DEFAULT 0,
+            last_close          REAL NOT NULL DEFAULT 0,
+            sessions_done       INTEGER NOT NULL DEFAULT 0,
+            last_seen           TEXT NOT NULL DEFAULT '',
+            created_ts          TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_signal_registry_due
+            ON signal_registry(sig_type, fwd_end_date, reg_date);
+        CREATE INDEX IF NOT EXISTS idx_signal_registry_acct
+            ON signal_registry(account_id, reg_date);
+        """,
+    ),
 ]
 
 

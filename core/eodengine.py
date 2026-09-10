@@ -42,14 +42,18 @@
   L2 为日线近似档：created_at ≥ 当日 15:00 的 order 不参与当日判定。
 
  未支持（命中即抛 EngineGapError，不写任何数据）：篮子/组合/封板确认事件类（seal_confirm，
-需盘口/封单数据）、volume 量能类、signal_registry（候选/买入等信号注册需策略侧供给通道，
-本版未建）、公司行动除送转/现金分红外（§6.6：送转 split、现金分红 dividend 已支持——
-settle_account 收 corp_events 于事务首步确定性应用，分红净额经 corp_cash 并入守恒式一，
-tax=True 启用 §6.4 简化档红利税；配股/退市整理归 spec-01 §6.6 后续切片）。
+需盘口/封单数据）、volume 量能类、公司行动除送转/现金分红外（§6.6：送转 split、现金分红
+dividend 已支持——settle_account 收 corp_events 于事务首步确定性应用，分红净额经 corp_cash
+并入守恒式一，tax=True 启用 §6.4 简化档红利税；配股/退市整理归 spec-01 §6.6 后续切片）。
 
-卖出跟踪（§8.1）引擎侧已实现：卖出成交自动登记 exit_trackings；跟踪推进与结清由
-settle_exits 在结算日调用（N=10 交易日结清，确定性/零 token，停牌缺价→最近可得价 stale
-结清标注，不虚构价）。signal_registry 的卖出登记语义在 §8.1 内以 exit_trackings 承载。
+信号注册（spec-01 §8）：买入/卖出成交在结算事务内自动登记 signal_registry（信号类型
+buy/sell，登记日基准=当日官方收盘，quality 取票级 degraded 标记，trial_flag 按账户角色），
+候选入选/避坑拦截由策略侧经 core.signalstore.register_candidate/register_pitfall 登记；
+N 日前瞻收益结清见 core.signalstore.settle_due（调度器在结算会话日推进）。
+
+卖出跟踪（§8.1）引擎侧已实现：卖出成交自动登记 exit_trackings（同时登记 signal_registry
+的 sell 信号）；跟踪推进与结清由 settle_exits 在结算日调用（N=10 交易日结清，确定性/零
+token，停牌缺价→最近可得价 stale 结清标注，不虚构价）。
 
 熔断日买入冻结（§7 D5）引擎侧语义：settle_account 收 circuit_freeze=True 表示该账户当日
 处于熔断——当日买入类单（direction=buy）整日跳过判定：不成交、不推进、不触发 invalid/
@@ -67,7 +71,7 @@ from datetime import date as _date
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
-from core import reporting
+from core import reporting, signalstore
 from core.db import state_conn, write_txn
 
 log = logging.getLogger(__name__)
@@ -1150,6 +1154,18 @@ def settle_account(
             )
             return row["id"]
 
+        def _signal_trial_flag() -> int:
+            """试运行/独立验证账户样本标 trial_flag=1（spec-05 统计默认排除）。"""
+            try:
+                return 0 if (acct["role"] or "main") == "main" else 1
+            except (KeyError, IndexError):
+                return 0
+
+        def _signal_quality(symbol: str, trade_quality: str) -> str:
+            """登记质量 = 票级 degraded_reason（spec-03 §7 传播）优先，其次成交档质量。"""
+            q = ((quality_marks or {}).get(symbol) or {}).get("degraded_reason") or ""
+            return q or (trade_quality or "")
+
         def write_trade(o: dict, side: str, qty: int, price: Decimal, ts: str, fees: dict,
                         *, quality: str = "", basis_used: str | None = None) -> str:
             tid = "t" + secrets.token_hex(10)
@@ -1168,6 +1184,16 @@ def settle_account(
                     basis_used or feed_kind(o["symbol"]), quality, trade_date,
                     o["reason"], o["strategy_version_no"] or version_no,
                 ),
+            )
+            try:
+                ref = require_close(o["symbol"])
+            except EngineError:
+                ref = price
+            signalstore.register(
+                state, account_id, side, o["symbol"], trade_date,
+                quality=_signal_quality(o["symbol"], quality),
+                strategy_version_no=o["strategy_version_no"] or version_no,
+                trial_flag=_signal_trial_flag(), ref_price=float(ref), conn=c,
             )
             return tid
 
