@@ -1011,6 +1011,17 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        28,
+        """
+        -- spec-03 §7 quality 传播：结算日志记录票级数据质量标记（JSON {symbol:
+        -- {quality, degraded_reason, notes}}，仅 quality != ok 的票），供日报数据段
+        -- annotations.quality_marks 呈现；旧行 NULL 视为无标记。数据源 = 数据服务
+        -- 消费接口（settle_input 返回，settle_day 汇总结算时注入），本列与日报同事务
+        -- 落盘（结算与首版日报一致）。既有行无需迁移。
+        ALTER TABLE settlement_log ADD COLUMN quality_marks TEXT;
+        """,
+    ),
 ]
 
 

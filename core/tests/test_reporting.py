@@ -62,6 +62,29 @@ def test_data_section_l2_settle_flags_degraded(authed_client):
     assert ds["settlement"]["granularity_used"] == {"600000": "l2"}
 
 
+def test_data_section_propagates_quality_marks(authed_client):
+    """L1 分钟档缺根（≤容差）→ 仍走 L1 但票级 degraded 随结算落库并进日报数据段。"""
+    st = authed_client.app.state
+    from test_settle_day import _insert_buy_order
+    from core import settle_day
+    from _feedkit import L1SparseFeed
+    _insert_buy_order(st, order_id="b-qm", qty=100,
+                      trigger={"op": "le", "price": 999},
+                      created=f"{DATE}T09:00:00")
+    rep = settle_day.run_day(st, DATE, feed=L1SparseFeed(drop=5), account_ids=[DEMO])
+    acct = rep["accounts"][0]
+    assert not acct.get("error") and not acct.get("skipped"), acct
+    ds = reporting.build_engine_data_section(st, DEMO, DATE)
+    qm = ds["annotations"]["quality_marks"]
+    assert qm["600000"]["quality"] == "degraded"
+    assert qm["600000"]["degraded_reason"] == "coverage_gap"
+    assert "缺 3 根" in qm["600000"]["notes"]
+    assert ds["settlement"]["granularity_used"] == {"600000": "l1"}
+    assert ds["annotations"]["degraded"] == []          # 档位降级与数据质量两轴独立
+    md = reporting.render_engine_data_markdown(ds)
+    assert "数据质量：600000 coverage_gap" in md
+
+
 def test_data_section_unsettled_day_reports_missing(authed_client):
     """无结算产物日：settlement.done=false、unsettled 标注、快照欠档不虚构。"""
     st = authed_client.app.state

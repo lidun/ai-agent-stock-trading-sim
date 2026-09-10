@@ -232,7 +232,7 @@ def _l2_series(state, symbol: str, trade_date: str, *, feed=None,
         "prev_close": Decimal(prev[-1]["close"]),
         "session_date": trade_date, "source": src,
         "high": Decimal(row["high"]), "low": Decimal(row["low"]),
-        "quality": "ok", "notes": "L2（日线区间近似）",
+        "quality": "ok", "notes": "L2（日线区间近似）", "degraded_reason": None,
     }
 
 
@@ -252,22 +252,24 @@ def get_replay_series(state, symbol: str, trade_date: str, *, feed=None,
         if oc is None:
             raise QuoteGapError(f"{symbol} {trade_date} 官方收盘价缺失（L0 档拒绝供给）")
         candidates = _close_candidates(state, symbol, trade_date)
-        quality = "ok"
-        notes = "L0"
+        quality, notes, reason = "ok", "L0", None
         if candidates:
             _mark_close_deviation(state, symbol, trade_date,
                                   candidates[-1][1], oc["official_close"])
-            cov = l0store.get_coverage(state, symbol, trade_date)
-            if cov and cov["quality"] == "degraded" and \
-                    cov["degraded_reason"] == "close_deviation":
-                quality = "degraded"
-                notes = cov["notes"]
+        # 票级标记统一以 l0_coverage 为准（spec-03 §4.2/§7 传播）：L0 偏差检测命中、
+        # 或采集/抽检已落 degraded（coverage_gap/cross_check_hit 等）都向结算/日报透传。
+        cov = l0store.get_coverage(state, symbol, trade_date)
+        if cov and cov["quality"] == "degraded":
+            quality = "degraded"
+            reason = cov["degraded_reason"] or None
+            notes = cov["notes"]
         return {
             "level": "l0", "series": series, "close_candidates": candidates,
             "official_close": oc["official_close"],
             "official_close_source": oc["source"],
             "prev_close": None, "session_date": trade_date,
             "source": oc["source"], "quality": quality, "notes": notes,
+            "degraded_reason": reason,
         }
     try:
         pm = pull_minute(state, symbol, trade_date, feed=feed, source=source)
@@ -294,12 +296,13 @@ def get_replay_series(state, symbol: str, trade_date: str, *, feed=None,
     missing = L1_EXPECTED_MINUTES - len(bars)
     if missing > 0:
         # 缺失 ≤5%（本地根数在容差带内）→ 仍走 L1，但该票当日标 degraded
-        quality, notes = "degraded", f"L1（分钟近似，缺 {missing} 根）"
+        quality, notes, reason = "degraded", f"L1（分钟近似，缺 {missing} 根）", "coverage_gap"
     else:
-        quality, notes = "ok", "L1（分钟近似）"
+        quality, notes, reason = "ok", "L1（分钟近似）", None
     return {
         "level": "l1", "series": series, "close_candidates": [],
         "official_close": official, "official_close_source": close_src,
         "prev_close": prev, "session_date": trade_date,
         "source": pm["source"], "quality": quality, "notes": notes,
+        "degraded_reason": reason,
     }

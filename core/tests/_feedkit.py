@@ -73,6 +73,18 @@ class L2OnlyFeed(FakeFeed):
                 "session_date": trade_date, "source": "tencent"}
 
 
+class L1SparseFeed(FakeFeed):
+    """L1 分钟档缺若干根（缺失 ≤ 容差带）→ market_data 仍走 L1 但标 degraded。"""
+
+    def __init__(self, drop: int = 5):
+        self._drop = drop
+
+    def replay_day(self, symbol, trade_date):
+        r = super().replay_day(symbol, trade_date)
+        r["bars"] = r["bars"][: -self._drop] if self._drop else r["bars"]
+        return r
+
+
 class ReadySessionFeed(FakeFeed):
     """快照日期指向 fixture 交易日（自动触发需探测通过）。"""
 

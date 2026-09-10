@@ -16,7 +16,9 @@ null + annotations 标注，供缺勤日报"照常补齐可得部分"语义。
 - positions：二、持仓与盈亏 {items[]（快照口径）, totals}
 - tracking：三、卖出跟踪摘要（exit_trackings 推进态）
 - execution：五、策略执行数据 {orders_today（按 invalid_reason/终态聚合）, trades_filled}
-- annotations：{degraded[]（结算档位低于 l1 的票）, unsettled（未结算角标）, notes[],
+- annotations：{degraded[]（结算档位低于 l1 的票）, quality_marks{}(票级数据质量标记
+  degraded：symbol → {quality, degraded_reason, notes}，spec-03 §7 传播到结算/日报),
+  unsettled（未结算角标）, notes[],
   window_decision?（EVOQUANT 验证账户收口日派生注解：版本/判定/理由/期望值）}
 """
 from __future__ import annotations
@@ -63,7 +65,8 @@ def build_engine_data_section(state, account_id: str, trade_date: str, conn=None
     ).fetchone()
 
     sl = conn.execute(
-        "SELECT granularity_used, positions_snapshot, status FROM settlement_log"
+        "SELECT granularity_used, positions_snapshot, status, quality_marks"
+        " FROM settlement_log"
         " WHERE account_id=? AND trade_date=? ORDER BY settle_key LIMIT 1",
         (account_id, trade_date),
     ).fetchone()
@@ -169,8 +172,15 @@ def build_engine_data_section(state, account_id: str, trade_date: str, conn=None
             granularity_used = {}
     degraded = sorted(sym for sym, lvl in granularity_used.items()
                       if lvl in _DEGRADED_LEVELS)
+    quality_marks = {}
+    if sl and sl["quality_marks"]:
+        try:
+            quality_marks = json.loads(sl["quality_marks"])
+        except ValueError:
+            quality_marks = {}
     annotations = {
         "degraded": degraded,
+        "quality_marks": quality_marks,
         "unsettled": not bool(sl),
         "notes": [],
     }
@@ -255,6 +265,13 @@ def render_engine_data_markdown(ds: dict) -> str:
         lines.append("- 结算档位：" + "、".join(f"{k}={v}" for k, v in sorted(g.items())))
     for sym in anno.get("degraded", []):
         lines.append(f"- 数据降级：{sym}（L2 日线近似档，L1 分钟档缺口）")
+    for sym, qm in sorted((anno.get("quality_marks") or {}).items()):
+        if sym in anno.get("degraded", []):
+            continue                       # 档位降级行已覆盖，避免重复申报
+        reason = qm.get("degraded_reason") or "degraded"
+        note = qm.get("notes") or ""
+        suffix = f"（{note}）" if note else ""
+        lines.append(f"- 数据质量：{sym} {reason}{suffix}")
     for note in anno.get("notes", []):
         lines.append(f"- 提示：{note}")
     wd = anno.get("window_decision")

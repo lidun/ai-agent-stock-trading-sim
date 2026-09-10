@@ -142,7 +142,10 @@ def _build_feeds(state, feed, orders: list[dict], held_symbols: list[str],
 
     suspend_val[sym] = {"close": .., "prev": ..}（当日停牌票，参考数据供给的停牌前
     最后官方收盘/前收）——停牌票不做当日行情拉取，估值收盘/前收直接注入，防虚构。
-    返回 (series_map, l1_map, l2_map, close_map, prev_close_map)。
+    返回 (series_map, l1_map, l2_map, close_map, prev_close_map, quality_marks)；
+    quality_marks[sym]（仅当日有判定供给且 quality != ok 的票，spec-03 §7 票级标记：
+    收盘偏差 close_deviation / 根数缺失 coverage_gap / 采集抽检 cross_check_hit 等），
+    随结算日志与日报数据段消费。
     """
     suspend_val = suspend_val or {}
     series_map: dict = {}
@@ -150,6 +153,7 @@ def _build_feeds(state, feed, orders: list[dict], held_symbols: list[str],
     l2_map: dict = {}
     close_map: dict = {}
     prev_close_map: dict = {}
+    quality_marks: dict = {}
     order_syms = sorted({o["symbol"] for o in orders})
     held_set = set(held_symbols)
     for sym in order_syms:
@@ -176,6 +180,12 @@ def _build_feeds(state, feed, orders: list[dict], held_symbols: list[str],
         close_map[sym] = float(inp["official_close"])
         if inp.get("prev_close") is not None:
             prev_close_map[sym] = float(inp["prev_close"])
+        if inp.get("quality") == "degraded":
+            quality_marks[sym] = {
+                "quality": "degraded",
+                "degraded_reason": inp.get("degraded_reason") or "degraded",
+                "notes": inp.get("notes") or "",
+            }
     for sym in sorted(held_set - set(order_syms)):
         if sym in suspend_val:
             sv = suspend_val[sym]
@@ -188,7 +198,7 @@ def _build_feeds(state, feed, orders: list[dict], held_symbols: list[str],
                 f"{sym} {trade_date} 官方收盘/前收缺失（纯持仓估值）")
         close_map[sym] = float(pair["official_close"])
         prev_close_map[sym] = float(pair["prev_close"])
-    return series_map, l1_map, l2_map, close_map, prev_close_map
+    return series_map, l1_map, l2_map, close_map, prev_close_map, quality_marks
 
 
 def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
@@ -214,9 +224,9 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
         relevant = {o["symbol"] for o in orders} | set(held)
         suspend_val = {s: v for s, v in suspend_map.items() if s in relevant}
         try:
-            series_map, l1_map, l2_map, close_map, prev_close_map = _build_feeds(
-                state, feed, orders, held, trade_date, suspend_val=suspend_val
-            )
+            series_map, l1_map, l2_map, close_map, prev_close_map, quality_marks = \
+                _build_feeds(state, feed, orders, held, trade_date,
+                             suspend_val=suspend_val)
         except (eodengine.EngineError, eodengine.EngineGapError,
                 quotes_tencent.QuoteGapError, quotes_tencent.QuoteSourceError) as exc:
             results.append({"account_id": aid, "error": True,
@@ -229,6 +239,7 @@ def run_day(state, trade_date: str, *, feed=DEFAULT_FEED,
                 close_map=close_map, prev_close_map=prev_close_map,
                 suspend_map={s: v["close"] for s, v in suspend_val.items()},
                 corp_events=corp_events,
+                quality_marks=quality_marks,
             )
         except (eodengine.EngineError, eodengine.EngineGapError) as exc:
             results.append({"account_id": aid, "error": True, "reason": str(exc)})

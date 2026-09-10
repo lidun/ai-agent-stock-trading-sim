@@ -882,9 +882,14 @@ def settle_account(
     fee: dict | None = None,
     exit_market: dict[str, dict] | None = None,
     corp_events: dict[str, dict] | None = None,
+    quality_marks: dict | None = None,
 ) -> dict:
     """对单个账户执行一日 EOD 结算（单 SQLite 事务原子写入）。
 
+    quality_marks[symbol] = {quality, degraded_reason, notes}（仅 quality != ok 的票，
+    spec-03 §7 票级数据质量标记，由数据服务消费接口给出、settle_day 汇总结算时注入）：
+    随 settlement_log 同事务落 quality_marks 列，供日报数据段 annotations.quality_marks
+    呈现——结算档位（l0/l1/l2）与数据质量（degraded）两轴独立。
     series_map[symbol] = [(本地墙钟 naive ISO, price), ...]（升序 L0 采样点）。
     l1_map[symbol] = [(本地墙钟 naive ISO, close), ...] 或 [(ts, open, high, low, close), ...]
     （升序 1 分钟条，spec-01 §3.3 L1 判定）。
@@ -1886,11 +1891,13 @@ def settle_account(
         } for r in pos_rows]
         c.execute(
             "INSERT INTO settlement_log(id, settle_key, trade_date, account_id, granularity_used,"
-            " status, created_at, positions_snapshot) VALUES (?,?,?,?,?,?,?,?)",
+            " status, created_at, positions_snapshot, quality_marks)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 "sl" + secrets.token_hex(10), settle_key, trade_date, account_id,
                 json.dumps(granularity_used, ensure_ascii=False), "done", now,
                 json.dumps(positions_snapshot, ensure_ascii=False),
+                json.dumps(quality_marks or {}, ensure_ascii=False),
             ),
         )
         # 数据段日报首版随结算同事务落盘（spec-04 §5.2/§5.3：引擎结算产物直接生成，零
