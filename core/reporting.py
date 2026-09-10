@@ -725,8 +725,8 @@ def build_daily_summary_body(state, trade_date: str) -> str | None:
 
 
 def build_monthly_report_body(state, year: int, month: int) -> str | None:
-    """§5.5 月度《策略体检报告》（确定性 ①净值/回撤 ③健康度；②/④待 spec-05/02
-    供给，⑤ LLM 点评占位）。month=自然月；月内无 main 账户日报 → None。"""
+    """§5.5 月度《策略体检报告》（确定性 ①净值/回撤 ②验证进度 ③健康度；④待 spec-02
+    消费留痕，⑤ LLM 点评占位）。month=自然月；月内无 main 账户日报 → None。"""
     mkey = f"{year:04d}-{month:02d}"
     conn = state_conn(state)
     rows = _latest_rows_by_account(conn, month=mkey)
@@ -735,8 +735,8 @@ def build_monthly_report_body(state, year: int, month: int) -> str | None:
     lines = [
         f"# 月度《策略体检报告》· {mkey}",
         "",
-        "> 确定性生成（spec-04 §5.5：①-③零 token 直接拼装；②概念验证进度待 spec-05"
-        " 供给、④费用月报待 spec-02 消费留痕、⑤下一步建议待管理 Agent LLM——均占位）。",
+        "> 确定性生成（spec-04 §5.5：①-③零 token 直接拼装；②概念验证进度由 spec-05"
+        " evidence_eta 供给、④费用月报待 spec-02 消费留痕、⑤下一步建议待管理 Agent LLM）。",
         "",
     ]
     per_acc: dict[str, list[dict]] = {}
@@ -782,12 +782,38 @@ def build_monthly_report_body(state, year: int, month: int) -> str | None:
                      + "；".join(f"{e['actor']}×{e['n']}" for e in errs))
     else:
         lines.append("- 结算/数据异常审计：本月无。")
+    lines += _render_evidence_progress(state)
     lines += [
-        "- ②概念验证进度：待 spec-05 供给（试运行验证统计）。",
         "- ④费用月报：待 spec-02 §11 消费留痕接入。",
         "- ⑤下一步建议：待管理 Agent LLM 撰写（P1 占位）。",
     ]
     return "\n".join(lines)
+
+
+def _render_evidence_progress(state, *, limit: int = 8) -> list[str]:
+    """②概念验证进度（spec-05 §3.2 B3 evidence_eta 供给，spec-04 §5.5②）。"""
+    from core import kb  # noqa: PLC0415
+    ev = kb.evidence_eta(state)
+    buckets = ev["buckets"]
+    sufficient = [b for b in buckets if b["eta_days"] == 0]
+    pending = [b for b in buckets if b["eta_days"] != 0]
+    head = (f"- ②概念验证进度（spec-05 §3.2）：充足 {len(sufficient)} 桶，"
+            f"在途 {len(pending)} 桶，窗口 {ev['window_len']} 交易日"
+            + (f"（as_of {ev['as_of']}）。" if ev["as_of"] else "。"))
+    out = [head]
+    for b in pending[:limit]:
+        label = kb.STATUS_LABEL.get(b["status"], b["status"])
+        if b["eta_days"] is None:
+            tail = f"n={b['sample_n']}/{b['min_n']}，{b['reason']}"
+        else:
+            tail = (f"n={b['sample_n']}/{b['min_n']}，近 {ev['window_len']} 交易日频率 "
+                    f"{b['freq']}/日，预计 {b['eta_days']} 交易日达门槛")
+        out.append(f"  - {b['name']}（{b['kb_id']}·{label}）桶 {b['env_bucket']}：{tail}")
+    if len(pending) > limit:
+        out.append(f"  - …另 {len(pending) - limit} 桶（详见 /api/kb/evidence-eta）")
+    if not buckets:
+        out.append("  - 暂无条目统计。")
+    return out
 
 
 def _push_to_manager(state, *, kind: str, scope_key: str, msg_type: str,

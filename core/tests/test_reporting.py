@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from core import eodengine, reporting
+from core import eodengine, kb, reporting, signalstore
 from core.db import state_conn
 from _feedkit import L2OnlyFeed, DATE
 
@@ -306,6 +306,20 @@ def test_monthly_report_deterministic_and_guard(authed_client):
     # 无数据月（2026-08 无 main 日报）→ 不生成不推送
     assert reporting.build_monthly_report_body(st, 2026, 8) is None
     assert reporting.push_monthly_report(st, 2026, 8) is None
+
+
+def test_monthly_report_includes_concept_progress(authed_client):
+    """§5.5② 概念验证进度由 spec-05 evidence_eta 供给（不再占位）。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    ent = kb.create_entry(st, type_="positive", name="月报概念", description="x")
+    kb.upsert_stats(st, ent["id"], env_bucket="cn_a_main", sample_n=20, win_rate=0.5,
+                    expectancy=1.0)
+    signalstore.register(st, DEMO, "buy", "600000", "2026-09-04",
+                         concept_tag="月报概念", env_bucket="cn_a_main", ref_price=10.0)
+    body = reporting.build_monthly_report_body(st, 2026, 9)
+    assert "②概念验证进度" in body and "在途 1 桶" in body
+    assert "月报概念" in body and "预计 10 交易日达门槛" in body
 
 
 def test_push_settings_switch_gates_report_direct(authed_client):
