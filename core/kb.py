@@ -10,11 +10,13 @@
   记录 review_gate1_ref）；闸2=管理 Agent 逻辑评审（人工执行，复核留痕于
   review_gate2_ref，启动验证时填写）。
 - 软删（§3.7）：仅删除=软删+审计；历史 kb_stats 保留。
-- UCB 排序载体 n_i=kb_stats.dispatch_n（§3.9），本模块读写不计算排序。
+- 候选参考卡（§3.5/§3.9）：`dispatch_cards` 出列 UCB1 排序卡片并递增
+  kb_stats.dispatch_n（n_i 载体），soft-deleted 与 invalid/sealed 退出下发。
 """
 from __future__ import annotations
 
 import json
+import math
 import secrets
 from datetime import datetime, timezone
 
@@ -594,6 +596,88 @@ def evaluate_candidates(state, *, min_n: int = 30, rolling_days: int = 60,
     return {"min_n": min_n, "rolling_days": rolling_days, "n_days": n_days,
             "as_of": as_of, "window_cutoff": cutoff,
             "insufficient_buckets": insufficient, "candidates": candidates}
+
+
+UCB_C_DEFAULT = 1.0
+_DISPATCH_EXCLUDED_STATUS = ("invalid", "sealed")
+
+
+def ucb_score(expectancy, dispatch_n, total_n, c: float = UCB_C_DEFAULT):
+    """UCB1 排序分（spec-05 §3.9）：`expectancy + c·√(ln N_total / n_i)`。
+
+    n_i=该 (条目×桶) 的 kb_stats.dispatch_n，N_total=全部下发次数。未下发过
+    （n_i≤0）返回 None，调用方按「优先探索」排在首位。无 epsilon 项。
+    """
+    n_i = int(dispatch_n or 0)
+    if n_i <= 0:
+        return None
+    exp = float(expectancy or 0.0)
+    return exp + float(c) * math.sqrt(math.log(max(int(total_n), 1)) / n_i)
+
+
+def dispatch_cards(state, *, env_bucket: str = "all", limit: int = 8,
+                   c: float = UCB_C_DEFAULT, actor: str = "engine",
+                   record: bool = True) -> dict:
+    """生成候选参考卡并按 UCB1 排序（spec-05 §3.5/§3.9「参考非指令」）。
+
+    - 卡片按 (条目×环境桶) 出列：KB-id/名称/类型/状态/桶×期望值×样本/适用环境/来源，
+      多样并列，不提供「唯一最优」；
+    - 软删（§3.7）与失效/封存（失效名单 §3.8）条目退出下发；
+    - 上下取向：positive 期望值即 fwd 期望，pitfall 取负（真避坑为正）；
+    - record=True 时对出列卡片 kb_stats.dispatch_n += 1（§3.9 n_i 载体）并审计。
+    """
+    conn = state_conn(state)
+    entries = conn.execute("SELECT * FROM kb_entries WHERE deleted_ts=''").fetchall()
+    eligible = [e for e in entries if e["status"] not in _DISPATCH_EXCLUDED_STATUS]
+    bucket = (env_bucket or "all").strip() or "all"
+    stats_by_kb: dict[str, list] = {}
+    total_n = 0
+    for e in eligible:
+        rows = conn.execute("SELECT * FROM kb_stats WHERE kb_id=?", (e["id"],)).fetchall()
+        stats_by_kb[e["id"]] = rows
+        total_n += sum(int(r["dispatch_n"] or 0) for r in rows)
+    cards: list[dict] = []
+    for e in eligible:
+        orient = -1.0 if e["type"] == "pitfall" else 1.0
+        scope = (e["env_scope"] or "all").strip() or "all"
+        for r in stats_by_kb[e["id"]]:
+            b = r["env_bucket"]
+            if scope != "all" and b != scope:
+                continue
+            if bucket != "all" and b != bucket:
+                continue
+            exp = r["expectancy"]
+            exp_o = None if exp is None else orient * float(exp)
+            cards.append({
+                "kb_id": e["id"], "name": e["name"], "type": e["type"],
+                "type_label": TYPE_LABEL.get(e["type"], e["type"]),
+                "status": e["status"],
+                "status_label": STATUS_LABEL.get(e["status"], e["status"]),
+                "env_bucket": b, "source": e["source"],
+                "sample_n": r["sample_n"], "win_rate": r["win_rate"],
+                "expectancy": exp_o, "stale_n": r["stale_n"],
+                "dispatch_n": int(r["dispatch_n"] or 0),
+                "score": ucb_score(exp_o, r["dispatch_n"], total_n, c),
+                "note": "参考非指令：候选经验，多样并列（spec-05 §3.5）",
+            })
+    cards.sort(key=lambda x: (0 if x["score"] is None else 1,
+                              -(x["score"] if x["score"] is not None else 0.0),
+                              x["kb_id"], x["env_bucket"]))
+    picked = cards[:max(int(limit), 0)]
+    if record and picked:
+        now = _now_iso()
+        with write_txn(conn) as cw:
+            for card in picked:
+                cw.execute(
+                    "UPDATE kb_stats SET dispatch_n=dispatch_n+1, updated_ts=?"
+                    " WHERE kb_id=? AND env_bucket=?",
+                    (now, card["kb_id"], card["env_bucket"]))
+            _audit(cw, ts=now, actor=actor, action="kb.dispatch", object_id=bucket,
+                   result=str(len(picked)),
+                   detail="候选参考卡下发：" + ",".join(
+                       f"{x['kb_id']}#{x['env_bucket']}" for x in picked))
+    return {"env_bucket": bucket, "c": c, "limit": int(limit),
+            "total_dispatch_n": total_n, "cards": picked}
 
 
 def list_stats(state, kb_id: str | None = None) -> list[dict]:
