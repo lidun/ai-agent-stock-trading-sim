@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from core import l0store, market_data
 from core.quotes_tencent import QuoteGapError
 
@@ -166,3 +168,55 @@ def test_get_replay_series_l2_day_range_fallback(authed_client):
     assert l0store.get_official_close_source(st, DATE) == "fake"
     day = l0store.daily_cache_get(st, "600000", DATE)
     assert day is not None and day["close"] == "10.0"
+
+
+class NoDayFeed(NoMinuteFeed):
+    """当日与历史日线整体缺口（非交易日/数据未就绪 → 应显式 QuoteGap，不虚构）。"""
+
+    def day_rows(self, symbol, start, end):
+        raise QuoteGapError(f"{symbol} {start}..{end} 日线整体未就绪")
+
+
+class PrevOnlyFeed(NoMinuteFeed):
+    """有前收、当日无日线 → daily_pair=None；settle_input 应拒供（prev_close 不虚构）。"""
+
+    def day_rows(self, symbol, start, end):
+        return [
+            {"date": PREV, "open": Decimal("9.8"), "close": Decimal("9.9"),
+             "high": Decimal("10.1"), "low": Decimal("9.7"),
+             "volume": Decimal("1")},
+        ]
+
+
+def test_daily_pair_cached_and_missing_day(authed_client):
+    st = authed_client.app.state
+    p = market_data.daily_pair(st, "600000", DATE, feed=Feed())
+    assert p["official_close"] == Decimal("10.0")
+    assert p["prev_close"] == Decimal("9.9")
+    cached = market_data.daily_pair(st, "600000", DATE, feed=Feed())
+    assert cached["cached"] is True and cached["source"] == "fake"
+    assert market_data.daily_pair(st, "600000", PREV, feed=PrevOnlyFeed()) is None
+    with pytest.raises(QuoteGapError):                # 未缓存日整体缺口 → 显式异常
+        market_data.daily_pair(st, "600000", "2026-09-10", feed=NoDayFeed())
+
+
+def test_settle_input_l0_enriches_prev_close(authed_client):
+    """settle_day 选档入口：L0 档补 prev_close（settle_input，spec-03 §4.1 接线）。"""
+    st = authed_client.app.state
+    l0store.upsert_l0_ticks(st, _full_day_rows())
+    l0store.update_coverage(st, "600000", DATE)
+    inp = market_data.settle_input(st, "600000", DATE, feed=Feed())
+    assert inp["level"] == "l0" and len(inp["series"]) == 4800
+    assert inp["official_close"] == Decimal("10.0")
+    assert inp["prev_close"] == Decimal("9.9")       # L0 档前收来自日线前一日
+    assert inp["source"] == "fake" and inp["quality"] == "ok"
+
+
+def test_settle_input_l2_fallback_and_gap(authed_client):
+    st = authed_client.app.state
+    inp = market_data.settle_input(st, "600000", DATE, feed=NoMinuteFeed())
+    assert inp["level"] == "l2" and inp["prev_close"] == Decimal("9.9")
+    with pytest.raises(QuoteGapError):
+        market_data.settle_input(st, "600000", DATE, feed=NoDayFeed())
+    with pytest.raises(QuoteGapError):                # 有前收无当日 → 拒供，不虚构
+        market_data.settle_input(st, "600000", DATE, feed=PrevOnlyFeed())

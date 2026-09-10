@@ -47,6 +47,13 @@ class FakeFeed:
         return {"official_close": float(close), "prev_close": float(prev_close),
                 "session_date": trade_date, "source": "tencent"}
 
+    def day_rows(self, symbol, start, end):
+        """日线区间（market_data 官方收盘/前收与 L2 兜底走 day_rows，非 replay_l2）。"""
+        if symbol != SYMBOL:
+            raise q.QuoteGapError(f"{symbol} 无日线区间 fixture")
+        rows = q.parse_day_rows((FIX / "tencent_day_sh600000.json").read_text("utf-8"))
+        return [r for r in rows if start <= str(r["date"]) <= end]
+
     def realtime_batch(self, symbols):
         return {}
 

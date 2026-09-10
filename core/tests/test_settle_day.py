@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
-from core import settle_day
+from core import l0store, settle_day
 from core.db import state_conn, write_txn
 from _feedkit import FakeFeed, L2OnlyFeed
 
@@ -164,3 +165,39 @@ def test_settle_day_suspended_symbol_skips_feed_and_keeps_others(authed_client):
     assert conn.execute(
         "SELECT status FROM condition_orders WHERE id='sd-susp'"
     ).fetchone()["status"] == "expired"
+
+
+def _l0_session_rows():
+    """09-04 全时段 3 秒采样（覆盖率 100%），盘中 09:35-09:40 触及 9.28 后回 9.43。"""
+    rows = []
+    price = "9.43"
+    for start in (datetime(2026, 9, 4, 9, 30), datetime(2026, 9, 4, 13, 0)):
+        end = start.replace(hour=11, minute=30) if start.hour == 9 \
+            else start.replace(hour=15, minute=0)
+        t = start
+        while t < end:
+            px = "9.28" if datetime(2026, 9, 4, 9, 35) <= t < datetime(2026, 9, 4, 9, 40) \
+                else price
+            rows.append({"symbol": "600000", "trade_date": DATE,
+                         "ts": t.isoformat(timespec="seconds"), "price": px,
+                         "prev_close": "9.4", "pct_chg": "0", "cum_turnover": "0",
+                         "status": "normal", "is_extended": 0, "source": "fake"})
+            t += timedelta(seconds=3)
+    return rows
+
+
+def test_settle_day_l0_local_series_e2e(authed_client):
+    """本地 L0 高覆盖（≥90%）→ settle_day 走数据服务 L0 档：series_map 成交、basis_used='l0'。"""
+    st = authed_client.app.state
+    l0store.upsert_l0_ticks(st, _l0_session_rows())
+    l0store.update_coverage(st, "600000", DATE)
+    _insert_buy_order(st, order_id="sd-l0", trigger={"op": "le", "price": 9.28})
+    report = settle_day.run_day(st, DATE, feed=FakeFeed())
+    acct = [a for a in report["accounts"] if a["account_id"] == DEMO][0]
+    assert acct.get("error") is not True and acct.get("skipped") is not True
+    conn = state_conn(st)
+    tr = conn.execute("SELECT * FROM trades WHERE order_id='sd-l0'").fetchone()
+    assert tr is not None and tr["basis_used"] == "l0" and tr["price"] == 9.28
+    assert tr["trade_time"] >= f"{DATE}T09:35:00"
+    sl = conn.execute("SELECT * FROM settlement_log WHERE account_id=?", (DEMO,)).fetchone()
+    assert json.loads(sl["granularity_used"]) == {"600000": "l0"}

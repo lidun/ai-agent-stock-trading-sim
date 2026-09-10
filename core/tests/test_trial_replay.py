@@ -263,12 +263,12 @@ def test_finish_launch_hard_gates_reject_immature(authed_client):
 
 
 class _GapFeed(MultiDayL2Feed):
-    """单日缺口 feed：2026-09-02 L2 供给失败 → 该日结算异常。"""
+    """单日缺口 feed：2026-09-02 日线整体供给失败 → 该日结算异常（轴请求不受影响）。"""
 
-    def replay_l2(self, symbol, trade_date):
-        if trade_date == "2026-09-02":
+    def day_rows(self, symbol, start, end):
+        if end == "2026-09-02":
             raise q.QuoteGapError("2026-09-02 分钟/日线双缺口（测试注入）")
-        return super().replay_l2(symbol, trade_date)
+        return super().day_rows(symbol, start, end)
 
 
 def test_finish_launch_rejects_settlement_abnormal_day(authed_client):

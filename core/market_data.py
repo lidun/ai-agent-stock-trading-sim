@@ -129,6 +129,55 @@ def is_ready(state, symbol: str, trade_date: str, *, l0_min: Decimal = L0_READY_
     }
 
 
+def daily_pair(state, symbol: str, trade_date: str, *, feed=None,
+               source: str = "") -> dict | None:
+    """当日与前一交易日官方收盘（估值/前收用；spec-03 §4.1 prev_close 口径）。
+
+    本地日线缓存优先；未命中按 20 日历日窗口拉取并写缓存。当日无日线 → None；
+    有当日行但窗口内无前收 → None（prev_close_map 可缺省，不虚构）。"""
+    start = (date.fromisoformat(trade_date) - timedelta(days=_DAY_RANGE_DAYS)
+             ).isoformat()
+    cached = l0store.daily_cache_range(state, symbol, start, trade_date)
+    if cached:
+        on = [r for r in cached if r["trade_date"] == trade_date]
+        prev = [r for r in cached if r["trade_date"] < trade_date]
+        if on and prev:
+            return {"official_close": Decimal(on[-1]["close"]),
+                    "prev_close": Decimal(prev[-1]["close"]),
+                    "source": on[-1]["source"] or prev[-1]["source"],
+                    "cached": True}
+    rows = _fetch_day_rows(state, symbol, start, trade_date, feed=feed, source=source)
+    on = [r for r in rows if str(r["date"]) == trade_date]
+    if not on:
+        return None
+    prev = [r for r in rows if str(r["date"]) < trade_date]
+    if not prev:
+        return None
+    src, _ = _pair(state, feed, source, "l2")
+    row = on[-1]
+    l0store.daily_cache_put(state, symbol, trade_date, row, src)
+    l0store.set_official_close_source(state, trade_date, src)
+    return {"official_close": Decimal(row["close"]),
+            "prev_close": Decimal(prev[-1]["close"]),
+            "source": src, "cached": False}
+
+
+def settle_input(state, symbol: str, trade_date: str, *, feed=None,
+                 source: str = "") -> dict:
+    """单票 EOD 回放输入（spec-03 §4.1 供 settle_day 票级选档接线）。
+
+    L0（覆盖率 ≥90% 的本地 3 秒序列）→ L1（分钟，缓存优先/源拉取，末价须与官方
+    收盘对齐）→ L2（日线区间）；官方收盘价任一档缺失 → QuoteGapError（不虚构）。
+    prev_close 在数据服务可给时补充（L0 档前收来自日线前一日，防估值/基准缺列）。
+    """
+    r = get_replay_series(state, symbol, trade_date, feed=feed, source=source)
+    if r.get("prev_close") is None:
+        pair = daily_pair(state, symbol, trade_date, feed=feed, source=source)
+        if pair is not None:
+            r["prev_close"] = pair["prev_close"]
+    return r
+
+
 def _l0_series(state, symbol: str, trade_date: str) -> list[tuple[str, Decimal]]:
     return [(r["ts"], Decimal(r["price"]))
             for r in l0store.get_l0_ticks(state, symbol, trade_date)]

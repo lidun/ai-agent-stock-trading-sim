@@ -50,7 +50,7 @@ def _tracking_row(st, *, day="2026-09-03", symbol="600000", px=11.0, bench=3000.
 
 
 class GapReplayFeed(ReadySessionFeed):
-    """快照就绪但 L1 供给缺口（模拟数据未就绪）。"""
+    """快照就绪但 L0/L1/L2 当日数据整体未就绪（模拟数据未就绪）。"""
 
     def replay_day(self, symbol, trade_date):
         from core import quotes_tencent as q
@@ -59,6 +59,12 @@ class GapReplayFeed(ReadySessionFeed):
     def daily_pair(self, symbol, trade_date):
         from core import quotes_tencent as q
         raise q.QuoteGapError(f"{symbol} {trade_date} 日线对未就绪")
+
+    def day_rows(self, symbol, start, end):
+        from core import quotes_tencent as q
+        if end == DATE:
+            raise q.QuoteGapError(f"{symbol} 截止 {end} 当日数据整体未就绪")
+        return super().day_rows(symbol, start, end)
 
 
 class StaleSessionFeed(ReadySessionFeed):
@@ -333,7 +339,18 @@ def test_window_close_backfills_absent_for_gap_account(authed_client):
 
 
 class GapMinuteFeed(DayRowsFeed):
-    """交易日轴齐备但分钟/日线估值档缺口（历史回放的数据缺口日场景）。"""
+    """交易日轴齐备但 2026-09-03 当日 L0/L1/L2 数据缺口（历史回放的数据缺口日场景）。
+
+    轴请求（end=until，>09-03）照常列出 09-03；对该日的定价请求（end==09-03）
+    拒供 → 结算缺口 → 当日缺勤日报。"""
+
+    _GAP_DAY = "2026-09-03"
+
+    def day_rows(self, symbol, start, end):
+        from core import quotes_tencent as q
+        if end == self._GAP_DAY:
+            raise q.QuoteGapError(f"{symbol} 截止 {end} 当日数据整体未就绪")
+        return super().day_rows(symbol, start, end)
 
     def replay_day(self, symbol, trade_date):
         from core import quotes_tencent as q
