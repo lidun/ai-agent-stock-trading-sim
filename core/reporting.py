@@ -725,8 +725,8 @@ def build_daily_summary_body(state, trade_date: str) -> str | None:
 
 
 def build_monthly_report_body(state, year: int, month: int) -> str | None:
-    """§5.5 月度《策略体检报告》（确定性 ①净值/回撤 ②验证进度 ③健康度；④待 spec-02
-    消费留痕，⑤ LLM 点评占位）。month=自然月；月内无 main 账户日报 → None。"""
+    """§5.5 月度《策略体检报告》（确定性 ①净值/回撤 ②验证进度 ③健康度 ④费用；⑤ LLM
+    点评占位）。month=自然月；月内无 main 账户日报 → None。"""
     mkey = f"{year:04d}-{month:02d}"
     conn = state_conn(state)
     rows = _latest_rows_by_account(conn, month=mkey)
@@ -735,8 +735,9 @@ def build_monthly_report_body(state, year: int, month: int) -> str | None:
     lines = [
         f"# 月度《策略体检报告》· {mkey}",
         "",
-        "> 确定性生成（spec-04 §5.5：①-③零 token 直接拼装；②概念验证进度由 spec-05"
-        " evidence_eta 供给、④费用月报待 spec-02 消费留痕、⑤下一步建议待管理 Agent LLM）。",
+        "> 确定性生成（spec-04 §5.5：①-④零 token 直接拼装；②概念验证进度由 spec-05"
+        " evidence_eta 供给、④费用月报由 spec-02 §11 留痕聚合、⑤下一步建议待管理 Agent"
+        " LLM）。",
         "",
     ]
     per_acc: dict[str, list[dict]] = {}
@@ -783,11 +784,35 @@ def build_monthly_report_body(state, year: int, month: int) -> str | None:
     else:
         lines.append("- 结算/数据异常审计：本月无。")
     lines += _render_evidence_progress(state)
+    lines += _render_cost_month(state, mkey)
     lines += [
-        "- ④费用月报：待 spec-02 §11 消费留痕接入。",
         "- ⑤下一步建议：待管理 Agent LLM 撰写（P1 占位）。",
     ]
     return "\n".join(lines)
+
+
+def _render_cost_month(state, month_key: str, *, limit: int = 12) -> list[str]:
+    """④费用月报（spec-02 §11 留痕供给，spec-04 §5.5④ 元/Agent/任务类型）。"""
+    from core import perf_records  # noqa: PLC0415
+    data = perf_records.month_summary(state, month_key)
+    total = data["total"]
+    if total["llm_calls"] == 0:
+        return ["- ④费用月报（spec-02 §11）：本月无 LLM 调用留痕。"]
+    def _cost(v, unpriced):
+        if v is None:
+            return "未计价"
+        return f"{v:.4f} 元" + (f"（另 {unpriced} 次未计价）" if unpriced else "")
+    head = (f"- ④费用月报（spec-02 §11）：{total['llm_calls']} 次调用，"
+            f"tokens in/out {total['tokens_in']}/{total['tokens_out']}，"
+            f"合计 {_cost(total['cost_yuan'], total['unpriced_calls'])}。")
+    out = [head]
+    for it in data["items"][:limit]:
+        out.append(
+            f"  - {it['agent_id']} × {it['task_type']}：{it['llm_calls']} 次，"
+            f"{_cost(it['cost_yuan'], it['unpriced_calls'])}")
+    if len(data["items"]) > limit:
+        out.append(f"  - …另 {len(data['items']) - limit} 组（详见费用台账）")
+    return out
 
 
 def _render_evidence_progress(state, *, limit: int = 8) -> list[str]:

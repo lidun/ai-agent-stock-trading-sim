@@ -2,6 +2,8 @@
 合/归属聚合、narrative 记账回填 llm_perf_id、失败路径 failed 记账、pricing 路由。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from core import narrative, perf_records, reporting
 from core.db import state_conn
 from test_reporting import DEMO, _buy
@@ -68,6 +70,36 @@ def test_daily_and_group_summary(authed_client):
     led = perf_records.ledger(st, limit=10)
     assert len(led) == 2 and led[0]["task_id"] == "t1"
     assert any(x["result"] == "failed" for x in led)
+
+
+def test_month_summary_groups_and_unpriced(authed_client):
+    st = authed_client.app.state
+    perf_records.pricing_upsert(st, actor="test", provider="deepseek", model="m",
+                                input_per_1k=1.0, output_per_1k=2.0,
+                                cache_read_per_1k=0.5)
+    _rec(st, task_id="a", model="m")
+    _rec(st, task_id="b", model="m")
+    _rec(st, task_id="c", task_type="chat")             # deepseek-chat 无单价 → 未计价
+    mkey = datetime.now(timezone.utc).strftime("%Y-%m")
+    data = perf_records.month_summary(st, mkey)
+    assert data["month"] == mkey
+    assert data["total"]["llm_calls"] == 3
+    assert data["total"]["unpriced_calls"] == 1
+    narr = next(i for i in data["items"] if i["task_type"] == "narrative")
+    assert narr["llm_calls"] == 2 and narr["cost_yuan"] is not None
+    assert perf_records.month_summary(st, "1999-01")["total"]["llm_calls"] == 0
+
+
+def test_monthly_report_includes_cost_month(authed_client):
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    perf_records.pricing_upsert(st, actor="test", provider="deepseek",
+                                model="deepseek-chat", input_per_1k=1.0,
+                                output_per_1k=2.0, cache_read_per_1k=0.5)
+    _rec(st)
+    body = reporting.build_monthly_report_body(st, 2026, 9)
+    assert "④费用月报" in body and "1 次调用" in body
+    assert "待 spec-02" not in body
 
 
 def test_narrative_success_links_perf_id(authed_client, monkeypatch):

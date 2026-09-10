@@ -223,3 +223,39 @@ def agent_task_summary(state, *, days: int = 14) -> list[dict]:
             b["cost_yuan"] = round((b["cost_yuan"] or 0.0)
                                    + float(r["cost_yuan"]), 4)
     return [agg[k] for k in sorted(agg)]
+
+
+def month_summary(state, month_key: str) -> dict:
+    """自然月（created_ts LIKE 'YYYY-MM%'）按 Agent×任务类型聚合费用（spec-04 §5.5④）。
+
+    返回 {items, total}：cost_yuan NULL 为未计价（不折算为 0），unpriced_calls 单列；
+    total 为该月全部调用汇总（元/Agent/任务类型三维的合计）。"""
+    prefix = (month_key or "").strip()[:7]
+    rows = state_conn(state).execute(
+        "SELECT agent_id, task_type, tokens_in, cached_tokens, tokens_out, cost_yuan"
+        " FROM performance_records WHERE created_ts LIKE ?", (prefix + "%",),
+    ).fetchall()
+
+    def _blank(agent_id, task_type):
+        return {"agent_id": agent_id, "task_type": task_type, "llm_calls": 0,
+                "tokens_in": 0, "cached_tokens": 0, "tokens_out": 0,
+                "cost_yuan": None, "unpriced_calls": 0}
+
+    def _acc(b, r):
+        b["llm_calls"] += 1
+        b["tokens_in"] += int(r["tokens_in"] or 0)
+        b["cached_tokens"] += int(r["cached_tokens"] or 0)
+        b["tokens_out"] += int(r["tokens_out"] or 0)
+        if r["cost_yuan"] is None:
+            b["unpriced_calls"] += 1
+        else:
+            b["cost_yuan"] = round((b["cost_yuan"] or 0.0) + float(r["cost_yuan"]), 4)
+
+    agg: dict[tuple, dict] = {}
+    total = _blank("", "")
+    for r in rows:
+        _acc(agg.setdefault((r["agent_id"], r["task_type"]),
+                            _blank(r["agent_id"], r["task_type"])), r)
+        _acc(total, r)
+    items = [agg[k] for k in sorted(agg)]
+    return {"month": prefix, "items": items, "total": total}
