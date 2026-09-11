@@ -92,6 +92,18 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
         lock_s=settings.login_lock_seconds,
     )
 
+    # spec-04 §2.3/§2.6 崩溃恢复：单实例锁下上一进程遗留的 running 任务判 failed 可重跑
+    @app.on_event("startup")
+    async def _recover_crashed_tasks():
+        try:
+            from core import tasks
+            recovered = tasks.recover_on_startup(app.state)
+            if recovered:
+                log.info("崩溃恢复：%d 个 running 遗留任务判 failed（可重跑）",
+                         len(recovered))
+        except Exception:  # noqa: BLE001 - 恢复失败不阻断启动
+            log.exception("崩溃恢复扫描失败")
+
     # 中间件注册（后注册先执行：CSRF 校验在安全头外层之前）
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(CsrfMiddleware)

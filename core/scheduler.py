@@ -71,6 +71,7 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
          deferrable_limit: int = 10, actor: str = "scheduler") -> dict:
     """执行一次 tick：过期清扫 + 空闲窗口可延迟任务执行（幂等）。"""
     now_utc = now or datetime.now(timezone.utc)
+    recovered = tasks.recover_crashed(state, now=now_utc, actor=actor)
     expired = approval.expire_overdue(state, now_utc)
     timed_out = tasks.scan_interrupt_timeouts(state, now=now_utc, actor=actor)
     window = idle_window(state, now=now_utc, capacity=capacity)
@@ -87,7 +88,8 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
     result = {
         "ts": now_utc.astimezone(_BJ).isoformat(timespec="seconds"),
         "expired_approvals": expired, "interrupt_timed_out": len(timed_out),
-        "interrupts": timed_out, "idle": window["idle"],
+        "interrupts": timed_out, "recovered_tasks": len(recovered),
+        "recovered": recovered, "idle": window["idle"],
         "window": {k: v for k, v in window.items() if k != "capacity"},
         "capacity": window["capacity"], "deferrable": ran,
         "manager_mode": (mgr or {}).get("mode", ""),
@@ -97,7 +99,8 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
             "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
             " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
             (_now_iso(), actor, "scheduler.tick", "task_schedule", "", "ok",
-             f"过期审批 {expired}，interrupt 超时 {len(timed_out)}，"
+             f"崩溃恢复 {len(recovered)}，过期审批 {expired}，"
+             f"interrupt 超时 {len(timed_out)}，"
              f"空闲={window['idle']}，可延迟执行 {ran['done']}/{ran['claimed']}", ""),
         )
     return result

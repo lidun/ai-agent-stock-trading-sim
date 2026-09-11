@@ -22,6 +22,9 @@ RESOURCE_CLASSES = ("scan", "llm-heavy", "light")
 # spec-04 §3.3：interrupt 挂起超时（默认 30 分钟，可配）→ 保守拒绝恢复
 INTERRUPT_TIMEOUT_MINUTES = 30
 
+# spec-04 §2.3：崩溃恢复心跳超时（running 且无心跳超过阈值 → failed 可重跑）
+CRASH_STALE_MINUTES = 30
+
 # spec-04 §2.1 task_type 枚举（含可延迟组 §2.5 成员：经验提取/kb_stats刷新/分层摘要补跑…）
 TASK_TYPES = (
     "选股", "挂单", "结算", "日报", "总汇报", "复盘", "摘要补跑", "备份",
@@ -101,6 +104,7 @@ def _row(r) -> dict:
         "dedup_key": r["dedup_key"], "payload": _loads(r["payload"]),
         "interrupt_entered_ts": r["interrupt_entered_ts"],
         "approval_id": r["approval_id"], "interrupt_note": r["interrupt_note"],
+        "heartbeat_ts": r["heartbeat_ts"],
         "created_ts": r["created_ts"],
     }
 
@@ -154,8 +158,9 @@ def claim_due(state, *, task_type: str = "", deferrable_only: bool = False,
         for tid in ids:
             c.execute(
                 "UPDATE task_schedule SET status='running', started_ts=?,"
-                " attempt_count=attempt_count+1 WHERE id=? AND status='pending'",
-                (now, tid))
+                " heartbeat_ts=?, attempt_count=attempt_count+1"
+                " WHERE id=? AND status='pending'",
+                (now, now, tid))
         for tid in ids:
             row = c.execute("SELECT * FROM task_schedule WHERE id=?", (tid,)).fetchone()
             claimed.append(_row(row))
@@ -171,7 +176,8 @@ def requeue(state, task_id: str, *, reason: str = "",
     with write_txn(state_conn(state)) as c:
         c.execute(
             "UPDATE task_schedule SET status='pending', started_ts='',"
-            " attempt_count=MAX(attempt_count-1, 0) WHERE id=? AND status='running'",
+            " heartbeat_ts='', attempt_count=MAX(attempt_count-1, 0)"
+            " WHERE id=? AND status='running'",
             (task_id,),
         )
     return get_task(state, task_id)
@@ -270,6 +276,63 @@ def scan_interrupt_timeouts(state, *, timeout_minutes: int = INTERRUPT_TIMEOUT_M
                     "approval_id": approval_id, "approval_closed": closed,
                     "note": note})
     return out
+
+
+def heartbeat(state, task_id: str, *, now: str = "",
+              actor: str = "scheduler") -> dict | None:
+    """刷新 running 任务心跳（spec-04 §2.3：长任务保活，防崩溃恢复误杀）。"""
+    with write_txn(state_conn(state)) as c:
+        c.execute(
+            "UPDATE task_schedule SET heartbeat_ts=? WHERE id=? AND status='running'",
+            (now or _now_iso(), task_id),
+        )
+    return get_task(state, task_id)
+
+
+def _recover(state, rows, *, reason: str, actor: str) -> list[dict]:
+    ts = _now_iso()
+    out: list[dict] = []
+    for r in rows:
+        with write_txn(state_conn(state)) as c:
+            c.execute(
+                "UPDATE task_schedule SET status='failed', ended_ts=?, last_error=?"
+                " WHERE id=? AND status='running'",
+                (ts, reason, r["id"]),
+            )
+        _audit(state, action="task.recover", result="failed", object_id=r["id"],
+               actor=actor, detail=f"{reason}；任务可重跑")
+        out.append({"id": r["id"], "task_type": r["task_type"],
+                    "started_ts": r["started_ts"], "reason": reason})
+    return out
+
+
+def recover_crashed(state, *, stale_minutes: int = CRASH_STALE_MINUTES,
+                    now: datetime | None = None,
+                    actor: str = "scheduler") -> list[dict]:
+    """崩溃恢复扫描（spec-04 §2.3）：running 且心跳/启动时刻超过阈值 → failed 可重跑。
+
+    心跳口径：优先 heartbeat_ts，缺失回退 started_ts。超时说明进程曾中断、无心跳续报，
+    任务按失败收敛（重跑幂等由 §2.1 幂等键 + 各模块 settle_key 兜底）。
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    cutoff = (now_utc - timedelta(minutes=max(1, int(stale_minutes)))
+              ).isoformat(timespec="seconds")
+    rows = state_conn(state).execute(
+        "SELECT * FROM task_schedule WHERE status='running'"
+        " AND COALESCE(NULLIF(heartbeat_ts,''), started_ts) <= ?",
+        (cutoff,),
+    ).fetchall()
+    reason = f"崩溃恢复：无心跳超过 {stale_minutes} 分钟（{cutoff}）"
+    return _recover(state, rows, reason=reason, actor=actor)
+
+
+def recover_on_startup(state, *, actor: str = "startup") -> list[dict]:
+    """进程启动崩溃恢复（spec-04 §2.6 第 3/4 步前的收敛）：单实例锁下所有 running
+    均为上一进程遗留，直接判 failed 可重跑（无需等心跳超时）。"""
+    rows = state_conn(state).execute(
+        "SELECT * FROM task_schedule WHERE status='running'").fetchall()
+    return _recover(state, rows, reason="崩溃恢复：进程重启，running 遗留无心跳",
+                    actor=actor)
 
 
 def _run_retro_extraction(state, task: dict) -> str:

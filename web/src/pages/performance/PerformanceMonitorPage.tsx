@@ -165,7 +165,8 @@ export default function PerformanceMonitorPage() {
       const r = await runSchedulerTick();
       const ran = r.deferrable;
       message.success(
-        `tick 完成：清扫过期审批 ${r.expired_approvals} 项，` +
+        `tick 完成：崩溃恢复 ${r.recovered_tasks} 项，` +
+          `清扫过期审批 ${r.expired_approvals} 项，` +
           `interrupt 超时 ${r.interrupt_timed_out} 项，` +
           `可延迟任务 认领 ${ran.claimed} / 完成 ${ran.done} / 失败 ${ran.failed} / 跳过 ${ran.skipped}` +
           (ran.deferred ? ` / 降级延后 ${ran.deferred}` : ""),

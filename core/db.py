@@ -1170,6 +1170,15 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
         INSERT OR IGNORE INTO manager_state (id, updated_ts) VALUES ('manager', '');
         """,
     ),
+    (
+        35,
+        """
+        -- spec-04 §2.3 崩溃恢复：running 任务心跳；无心跳超时 → failed 可重跑。
+        ALTER TABLE task_schedule ADD COLUMN heartbeat_ts TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_task_schedule_heartbeat
+            ON task_schedule(status, heartbeat_ts);
+        """,
+    ),
 ]
 
 

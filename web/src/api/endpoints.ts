@@ -1604,6 +1604,7 @@ export interface SchedulerTick {
   ts: string;
   expired_approvals: number;
   interrupt_timed_out: number;
+  recovered_tasks: number;
   idle: boolean;
   manager_mode: string;
   window: { idle: boolean; trading_hours: boolean; running: number; reason: string };
