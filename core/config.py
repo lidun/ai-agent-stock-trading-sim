@@ -67,6 +67,10 @@ class Settings:
     scheduler_tick_s: int = 60            # tick 间隔
     scheduler_deferrable_limit: int = 10  # 单次 tick 可延迟任务上限
 
+    # spec-02 §3.2 检索协议
+    recent_fallback_days: int = 5         # 无卡片原文兜底检索窗口（交易日近似=自然日）
+    card_backlog_hours: int = 24          # 无卡片滞留超时 → 触发即时补卡
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -113,6 +117,8 @@ def load_settings() -> Settings:
         scheduler_auto_tick=_as_bool("CORE_SCHEDULER_AUTO_TICK", False),
         scheduler_tick_s=_as_int("CORE_SCHEDULER_TICK_S", 60),
         scheduler_deferrable_limit=_as_int("CORE_SCHEDULER_DEFERRABLE_LIMIT", 10),
+        recent_fallback_days=_as_int("CORE_RECENT_FALLBACK_DAYS", 5),
+        card_backlog_hours=_as_int("CORE_CARD_BACKLOG_HOURS", 24),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )
