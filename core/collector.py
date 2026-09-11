@@ -20,7 +20,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from decimal import Decimal
 from time import monotonic
 
-from core import l0store, source_chain
+from core import l0store, source_chain, source_health
 from core.db import state_conn
 
 log = logging.getLogger(__name__)
@@ -201,8 +201,10 @@ class MarketCollector:
             return {"status": "no_source", "date": trade_date, "session": sess,
                     "configured": self.role_configured}
         try:
+            t0 = monotonic()
             snap = self._provider(source).realtime_batch(symbols)
         except Exception as exc:  # noqa: BLE001 源级失败 → 退避重试（当日不切源）
+            self._record_health(source, False, 0.0, trade_date)
             return self._on_source_failure(trade_date, sess, source, exc)
         rows = [self._sample_row(s, snap.get(s), now, trade_date, source, sess)
                 for s in symbols]
@@ -213,6 +215,7 @@ class MarketCollector:
         self._fails = 0
         self._backoff_until = 0.0
         self.router.record_ok(source)
+        self._record_health(source, True, (monotonic() - t0) * 1000.0, trade_date)
         self._maybe_finalize(now)
         outcome = {"status": "collected", "date": trade_date, "session": sess,
                    "source": source, "samples": len(rows),
@@ -263,6 +266,21 @@ class MarketCollector:
     def _record_source(self, trade_date: str, source: str, snap: dict) -> None:
         for sym in snap:
             l0store.set_source_binding(self.state, sym, trade_date, source)
+
+    def _record_health(self, source: str, ok: bool, latency_ms: float,
+                       trade_date: str) -> None:
+        """记录源健康度并评估切换（§9）；失败不影响采集主链路。"""
+        try:
+            now = bjt_now()
+            source_health.record_call(
+                self.state, source=source, ok=ok, latency_ms=latency_ms,
+                source_family=source_chain.family_of(source), kind="collect",
+                trade_date=trade_date, now=now)
+            source_health.evaluate_switch(
+                self.state, source=source, kind="collect",
+                trade_date=trade_date, now=now)
+        except Exception:  # noqa: BLE001
+            log.exception("源健康度记录失败（不影响采集）")
 
     def _on_source_failure(self, trade_date, sess, source, exc) -> dict:
         self._fails += 1

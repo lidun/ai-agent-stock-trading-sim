@@ -89,6 +89,15 @@ class Settings:
     market_note_retention_days: int = 180  # 远期原文保留期（前置=摘要+抽检通过）
     memory_inspection_sample_ratio: float = 0.1  # 管理 Agent 抽检抽样比例
 
+    # spec-03 §9 数据源健康度与故障切换
+    source_health_c_minutes: int = 10  # C 级持续 N 分钟后触发降权/切换
+    source_health_recover_cooldown_min: int = 30  # 回权冷却期（分钟）
+    source_health_recover_successes: int = 2  # 连续探活成功 M 次回权
+    source_health_latency_sample_max: int = 200  # 延迟样本保留上限
+    source_health_a_success_pct: int = 98  # A 级成功率下限（%）
+    source_health_b_success_pct: int = 90  # B 级成功率下限（%）
+    source_health_a_p95_ms: int = 3000  # A 级 P95 延迟上限（毫秒）
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -143,6 +152,18 @@ def load_settings() -> Settings:
         market_note_retention_days=_as_int("CORE_MARKET_NOTE_RETENTION_DAYS", 180),
         memory_inspection_sample_ratio=_as_float(
             "CORE_MEMORY_INSPECTION_SAMPLE_RATIO", 0.1),
+        source_health_c_minutes=_as_int("CORE_SOURCE_HEALTH_C_MINUTES", 10),
+        source_health_recover_cooldown_min=_as_int(
+            "CORE_SOURCE_HEALTH_RECOVER_COOLDOWN_MIN", 30),
+        source_health_recover_successes=_as_int(
+            "CORE_SOURCE_HEALTH_RECOVER_SUCCESSES", 2),
+        source_health_latency_sample_max=_as_int(
+            "CORE_SOURCE_HEALTH_LATENCY_SAMPLE_MAX", 200),
+        source_health_a_success_pct=_as_int(
+            "CORE_SOURCE_HEALTH_A_SUCCESS_PCT", 98),
+        source_health_b_success_pct=_as_int(
+            "CORE_SOURCE_HEALTH_B_SUCCESS_PCT", 90),
+        source_health_a_p95_ms=_as_int("CORE_SOURCE_HEALTH_A_P95_MS", 3000),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )

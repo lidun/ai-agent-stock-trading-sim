@@ -1262,6 +1262,34 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON memory_inspections(agent_id, period, period_key, passed);
         """,
     ),
+    (
+        40,
+        """
+        -- spec-03 §9 数据源健康度：每源当日指标 + A/B/C 分 + 切换/回权状态。
+        CREATE TABLE IF NOT EXISTS source_health (
+            source              TEXT NOT NULL,
+            trade_date          TEXT NOT NULL,
+            source_family       TEXT NOT NULL DEFAULT '',
+            kind                TEXT NOT NULL DEFAULT 'pull'
+                CHECK (kind IN ('pull', 'collect')),
+            calls               INTEGER NOT NULL DEFAULT 0,
+            success             INTEGER NOT NULL DEFAULT 0,
+            fail                INTEGER NOT NULL DEFAULT 0,
+            degraded_count      INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            latency_samples     TEXT NOT NULL DEFAULT '[]',
+            score               TEXT NOT NULL DEFAULT ''
+                CHECK (score IN ('', 'A', 'B', 'C')),
+            c_since_ts          TEXT NOT NULL DEFAULT '',
+            cooled_until        TEXT NOT NULL DEFAULT '',
+            recover_successes   INTEGER NOT NULL DEFAULT 0,
+            switched            INTEGER NOT NULL DEFAULT 0,
+            note                TEXT NOT NULL DEFAULT '',
+            updated_ts          TEXT NOT NULL,
+            PRIMARY KEY (source, trade_date)
+        );
+        """,
+    ),
 ]
 
 

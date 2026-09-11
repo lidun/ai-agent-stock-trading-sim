@@ -15,7 +15,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request
 
-from core import collector, l0store, market_data
+from core import collector, l0store, market_data, source_health
 from core.auth import require_session
 
 router = APIRouter(prefix="/api/market", tags=["market"])
@@ -135,6 +135,12 @@ def replay_get(request: Request, session: SessionDep,
             "official_close_source": series["official_close_source"],
             "source": series["source"], "quality": series["quality"],
             "notes": series["notes"]}
+
+
+@router.get("/source-health")
+def source_health_get(request: Request, session: SessionDep, trade_date: str = ""):
+    d = _parse_date(trade_date)
+    return {"trade_date": d, "rows": source_health.snapshot(request.app.state, d)}
 
 
 @router.post("/pull-minute")

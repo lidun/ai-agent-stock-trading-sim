@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from core import collector, l0store
+from core import collector, l0store, source_health
 from core.collector import MarketCollector
 
 
@@ -77,6 +77,17 @@ def test_cycle_collects_and_binds(authed_client):
     watch = l0store.watchlist_for(st, "2026-09-09")
     assert [w["symbol"] for w in watch] == ["600000"]
     assert watch[0]["reason"] == "observation"
+
+
+def test_cycle_records_source_health(authed_client):
+    st = authed_client.app.state
+    l0store.observation_add(st, "600001")
+    MarketCollector(st, providers={"tencent": Snap()}).cycle(_dt(10, 0))
+    h = source_health.get_health(st, "tencent", "2026-09-09")
+    assert h["calls"] == 1 and h["success"] == 1 and h["kind"] == "collect"
+    MarketCollector(st, providers={"tencent": Snap(boom=True)}).cycle(_dt(10, 0, 3))
+    h2 = source_health.get_health(st, "tencent", "2026-09-09")
+    assert h2["fail"] == 1 and h2["consecutive_failures"] == 1
 
 
 def test_cycle_empty_watchlist_no_network(authed_client):
