@@ -181,8 +181,16 @@ def _run_retro_extraction(state, task: dict) -> str:
     return f"报告 {report_id} 归因={rpt['attribution_status']}"
 
 
+def _run_kb_stats_refresh(state, task: dict) -> str:
+    """日内结算后 kb_stats 刷新的兜底（§2.5⑦）：确定性重算，零 token。"""
+    from core import kb  # noqa: PLC0415
+    r = kb.recompute_stats(state)
+    return f"重算 {r['entries']} 条目 / {r['buckets']} 桶"
+
+
 _HANDLERS: dict[str, Callable[[object, dict], str]] = {
     "经验提取": _run_retro_extraction,
+    "kb_stats刷新": _run_kb_stats_refresh,
 }
 
 

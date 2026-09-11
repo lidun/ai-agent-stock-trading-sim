@@ -84,6 +84,32 @@ def test_run_deferrable_skips_unknown_handler(authed_client):
     assert tasks.get_task(st, t["id"])["status"] == "skipped"
 
 
+def test_kb_stats_refresh_handler(authed_client):
+    st = authed_client.app.state
+    t = tasks.enqueue(st, task_type="kb_stats刷新", agent_id=DEMO, dedup_key="k1")
+    out = tasks.run_deferrable(st, task_type="kb_stats刷新")
+    assert out["claimed"] == 1 and out["done"] == 1
+    assert tasks.get_task(st, t["id"])["status"] == "done"
+
+
+def test_recompute_failure_enqueues_fallback(authed_client, monkeypatch):
+    st = authed_client.app.state
+    from core import kb
+    from core.settle_scheduler import EodSettleTrigger
+
+    def boom(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(kb, "recompute_stats", boom)
+    trig = EodSettleTrigger(st, feed=None)
+    r = trig._recompute_kb("2026-09-04")
+    assert r.get("error") is True
+    rows = tasks.list_tasks(st, task_type="kb_stats刷新")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "pending" and rows[0]["is_deferrable"] is True
+    assert rows[0]["trade_date"] == "2026-09-04"
+
+
 def test_tasks_http_roundtrip(authed_client):
     h = csrf_headers(authed_client)
     r = authed_client.post("/api/tasks", json={

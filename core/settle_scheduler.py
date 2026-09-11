@@ -218,10 +218,11 @@ class EodSettleTrigger:
                     f"结清 {closed} 条，行情缺口 {gaps} 票")
         return {"signal_accounts": len(accounts), "closed": closed, "updated": updated}
 
-    def _recompute_kb(self) -> dict:
+    def _recompute_kb(self, trade_date: str = "") -> dict:
         """日结算后确定性重算知识库统计（spec-05 §3.3，零 token，紧随结算回调）。
 
-        故障不阻断结算主流程（统计缺失由次日重算补齐）。
+        故障不阻断结算主流程：失败时入「kb_stats刷新」可延迟任务兜底（spec-04 §2.5⑦），
+        由空闲窗口/手动补跑重算（幂等，按 trade_date 去重）。
         """
         from core import kb  # noqa: PLC0415
         try:
@@ -231,6 +232,14 @@ class EodSettleTrigger:
             return r
         except Exception:  # noqa: BLE001 - 重算故障不阻断结算主流程
             log.exception("kb_stats 重算失败（不影响结算）")
+            try:
+                from core import tasks  # noqa: PLC0415
+                tasks.enqueue(
+                    self.state, task_type="kb_stats刷新", trade_date=trade_date,
+                    dedup_key=trade_date or "manual", is_deferrable=True,
+                    priority=6, resource_class="light", actor="settle_scheduler")
+            except Exception:  # noqa: BLE001 - 兜底入队失败也不阻断
+                log.exception("kb_stats 刷新兜底任务入队失败")
             return {"entries": 0, "buckets": 0, "error": True}
 
     def _advance_windows(self, trade_date: str) -> list[dict]:
@@ -295,7 +304,7 @@ class EodSettleTrigger:
         exits = self._advance_exits(dstr) if accounts else {}
         signals = self._advance_signals(dstr) if sig_accounts else {}
         self._done_dates.add(dstr)
-        kb_stats = self._recompute_kb()
+        kb_stats = self._recompute_kb(dstr)
         return {"date": dstr, "status": "no_pending", "exits": exits, "signals": signals,
                 "kb_stats": kb_stats, "windows": self._advance_windows(dstr)}
 
@@ -322,7 +331,7 @@ class EodSettleTrigger:
             self._done_dates.add(dstr)
             self._audit("trade.eod_settle_auto", "ok",
                         f"{dstr} 结算完成，账户 {len(accounts_r)} 个")
-            kb_stats = self._recompute_kb()
+            kb_stats = self._recompute_kb(dstr)
             return {"date": dstr, "status": "settled", "accounts": accounts_r,
                     "exits": exits, "signals": signals, "kb_stats": kb_stats,
                     "windows": self._advance_windows(dstr)}
@@ -380,7 +389,7 @@ class EodSettleTrigger:
                 self._fill_catchup_absent(d, acct_errs)
             self._push_deliveries(d)
             self._done_dates.add(d)
-        self._recompute_kb()
+        self._recompute_kb(trading[-1] if trading else "")
         self._audit("trade.eod_catchup_auto", "ok" if not errs else "partial",
                     f"快进回放 {len(trading)} 个会话日（{trading[0]}..{trading[-1]}），"
                     f"缺口会话 {len(errs)} 个")
