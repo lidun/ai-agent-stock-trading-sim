@@ -150,6 +150,21 @@ def kb_retro_report_detail(report_id: str, request: Request, session: SessionDep
     return {"report": rpt}
 
 
+@router.post("/kb/retro-reports/{report_id}/attribution")
+def kb_retro_report_attribution(report_id: str, request: Request,
+                                session: SessionDep,
+                                payload: dict | None = Body(default=None)):
+    from core import retrospective  # noqa: PLC0415
+    actor = session["session"]["username"]
+    body = payload or {}
+    try:
+        return {"report": retrospective.generate_attribution(
+            request.app.state, report_id, actor=actor,
+            timeout_s=float(body.get("timeout_s", 90.0)))}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/kb/retro-reports/{report_id}/confirm")
 def kb_retro_report_confirm(report_id: str, request: Request, session: SessionDep,
                             payload: dict | None = Body(default=None)):

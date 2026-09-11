@@ -624,10 +624,15 @@ def finish_trial(state, *, agent_id: str, decision: str,
             f"updated_ts={ts} WHERE agent_id=? AND status='in_progress'",
             (agent_id,),
         )
-    return {
+    result = {
         "archive_id": archive_id,
         "agent": {"id": agent_id, "name": agent["name"], "role": "strategy",
                   "status": next_status},
         "trial_account_id": trial["id"],
         "snapshot": snapshot,
     }
+    if next_status == "archived":
+        from core import retrospective  # noqa: PLC0415
+        result["retro_extraction"] = retrospective.extract_on_archive(
+            state, agent_id, actor="manager")
+    return result

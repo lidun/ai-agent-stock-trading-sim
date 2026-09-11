@@ -1,7 +1,7 @@
 """归档经验提取测试（spec-05 §5：终局统计 + LLM 归因降级 + 评审回填知识库）。"""
 from __future__ import annotations
 
-from core import kb, retrospective, signalstore
+from core import accountstore, kb, retrospective, signalstore
 from core.db import state_conn, write_txn
 from core.tests.conftest import csrf_headers
 
@@ -15,8 +15,9 @@ def _settle(state, sid: str, fwd, end: str = "2026-09-03") -> None:
             (fwd, end, sid))
 
 
-def _sig(state, concept, fwd=None, *, bucket="cn_a_main", sig_type="buy"):
-    sid = signalstore.register(state, DEMO, sig_type, "600000", "2026-08-20",
+def _sig(state, concept, fwd=None, *, bucket="cn_a_main", sig_type="buy",
+         account=DEMO):
+    sid = signalstore.register(state, account, sig_type, "600000", "2026-08-20",
                                concept_tag=concept, env_bucket=bucket,
                                ref_price=10.0)
     if fwd is not None:
@@ -31,18 +32,19 @@ def test_final_stats_buckets_and_verdicts(authed_client):
     _sig(st, "有效概念", -1.0)
     _sig(st, "无效概念", -3.0)
     _sig(st, "在途概念")                                   # 未结清不计
-    _sig(st, "试运行概念", 9.0)                            # trial 排除
+    _sig(st, "试运行概念", 9.0)
     with write_txn(state_conn(st)) as c:
         c.execute("UPDATE signal_registry SET trial_flag=1 WHERE concept_tag='试运行概念'")
 
     out = retrospective.final_stats(st, DEMO)
     buckets = {b["concept_tag"]: b for b in out["buckets"]}
-    assert out["signal_total"] == 5 and out["settled_n"] == 4  # trial 已在查询层排除
+    # §5「全部信号」：试运行退休 Agent 的历史即其样本，trial 信号计入终局统计
+    assert out["signal_total"] == 6 and out["settled_n"] == 5
     assert buckets["有效概念"]["sample_n"] == 3
     assert buckets["有效概念"]["verdict"] == "effective"
     assert buckets["无效概念"]["verdict"] == "ineffective"
     assert buckets["在途概念"]["sample_n"] == 0
-    assert "试运行概念" not in buckets
+    assert buckets["试运行概念"]["sample_n"] == 1
 
 
 def test_final_stats_merges_tag_aliases(authed_client):
@@ -137,3 +139,49 @@ def test_retro_http_roundtrip(authed_client):
 
     missing = authed_client.get("/api/kb/retro-reports/ghost")
     assert missing.status_code == 404
+
+
+def test_build_report_defers_then_attribution_fills(authed_client):
+    st = authed_client.app.state
+    _sig(st, "概念A", 1.0)
+    rpt = retrospective.build_report(st, DEMO, use_llm=False, actor="admin")
+    assert rpt["attribution_status"] == "deferred" and rpt["attribution"] == ""
+    after = retrospective.generate_attribution(st, rpt["id"], actor="admin")
+    # 测试环境未配置模型服务 → 确定性降级
+    assert after["attribution_status"] == "not_configured"
+    row = state_conn(st).execute(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE action='kb.retro.attribution'"
+    ).fetchone()
+    assert row["n"] == 1
+
+
+def test_extract_on_archive_idempotent(authed_client):
+    st = authed_client.app.state
+    accountstore.create_trial_agent(st, agent_id="agent-retro-x", name="退休候选")
+    _sig(st, "尾盘缩量走弱", -2.0, account="agent-retro-x.trial")
+
+    first = retrospective.extract_on_archive(st, "agent-retro-x", actor="admin")
+    assert first["skipped"] is False
+    rpt = retrospective.get_report(st, first["report_id"])
+    assert rpt["attribution_status"] == "deferred"
+    assert rpt["stats"]["settled_n"] == 1
+
+    again = retrospective.extract_on_archive(st, "agent-retro-x", actor="admin")
+    assert again["skipped"] is True and again["report_id"] == first["report_id"]
+
+
+def test_finish_trial_reject_triggers_extraction(authed_client):
+    st = authed_client.app.state
+    accountstore.create_trial_agent(st, agent_id="agent-retro-y", name="被否决")
+    _sig(st, "概念Y", 3.0, account="agent-retro-y.trial")
+
+    res = accountstore.finish_trial(st, agent_id="agent-retro-y", decision="reject",
+                                    verdict="不合格")
+    assert res["agent"]["status"] == "archived"
+    assert res["retro_extraction"]["skipped"] is False
+    rpt = retrospective.get_report(st, res["retro_extraction"]["report_id"])
+    assert rpt["stats"]["settled_n"] == 1 and rpt["attribution_status"] == "deferred"
+
+    # 幂等：重复归档不重复生成（对该 Agent 已有报告）
+    assert retrospective.extract_on_archive(st, "agent-retro-y")["skipped"] is True
+

@@ -1,8 +1,10 @@
 """归档经验提取（spec-05 §5：Agent 归档/退休终局归因，防样本沉底与系统遗忘）。
 
 流程：
-1. 终局统计（确定性，零 token）：该 Agent 全部已结清信号按 (concept_tag × env_bucket)
+1. 终局统计（确定性，零 token）：该 Agent 全部信号按 (concept_tag × env_bucket)
    分桶，concept_tag 按 kb_tag_aliases 归并到规范名（§3.11），统计口径同 kb_stats（§3.3）；
+   含试运行期信号（§5「全部信号」——试运行退休 Agent 的历史即其样本），未结清不计。
+   跨 Agent 知识库证据统计仍按 §3.3 隔离 trial（本模块不回写）。
 2. LLM 终局归因：结合终局统计产出「什么有效/什么无效/为什么」（未配置/失败确定性降级）；
 3. 管理 Agent 评审：用户/管理 Agent 在报告上确认（review_ref 留痕）；
 4. 回填知识库：证实有效 → 归并到现有条目（写别名）或新建 observing；确认无效 → 条目失效；
@@ -25,7 +27,7 @@ RETRO_STATUS = ("pending_review", "confirmed")
 
 _PROMPT = """你是量化团队管理 Agent，正在为即将归档/退休的策略子 Agent「{agent_name}」（{agent_id}）撰写终局归因报告。
 
-只允许使用下方【终局统计】：该 Agent 全部已结清信号按（概念 × 环境桶）归并，含样本/胜率/期望值（含费）；trial 样本已排除；concept_tag 已按月度归并映射到规范名。
+只允许使用下方【终局统计】：该 Agent 全部已结清信号按（概念 × 环境桶）归并，含样本/胜率/期望值（含费）；trial 样本已含（§5「全部信号」）；concept_tag 已按月度归并映射到规范名。
 
 请输出 Markdown（不加代码围栏，≤800 字），覆盖：
 - 哪些概念在该 Agent 被证实有效（期望值为正、样本充足），哪些无效或证据不足；
@@ -58,7 +60,7 @@ def final_stats(state, agent_id: str) -> dict:
         "SELECT sr.concept_tag, sr.env_bucket, sr.fwd_return_pct, sr.quality,"
         " sr.exception FROM signal_registry sr"
         " JOIN accounts a ON a.id = sr.account_id"
-        " WHERE a.agent_id=? AND sr.trial_flag=0"
+        " WHERE a.agent_id=?"
         " AND sr.sig_type IN ('candidate','buy','sell')", (agent_id,),
     ).fetchall()
     grouped: dict[tuple, dict] = {}
@@ -105,23 +107,18 @@ def _audit(state, *, action: str, result: str, object_id: str, detail: str,
         )
 
 
-def build_report(state, agent_id: str, *, timeout_s: float = 90.0,
-                 actor: str = "manager") -> dict:
-    """生成归档经验提取报告（终局统计 + LLM 终局归因，落 pending_review）。"""
-    ag = get_agent(state, agent_id)
-    if ag is None:
-        raise LookupError(f"Agent 不存在：{agent_id}")
-    stats = final_stats(state, agent_id)
-    report_id = "rr" + secrets.token_hex(10)
+def _run_attribution(state, report_id: str, *, agent_id: str, agent_name: str,
+                     stats: dict, timeout_s: float, actor: str) -> str:
+    """执行 LLM 终局归因并回写报告；返回归因状态（未配置/失败确定性降级）。"""
     started = _tm.monotonic()
-    task_id = f"retro.extraction:{report_id}"
+    task_id = f"retro.attribution:{report_id}"
     attribution = ""
     attr_status = "not_configured"
     try:
         out = llm.chat(state, [
             {"role": "system", "content": "你是严谨的量化团队管理 Agent；只依据给定终局统计做归因，不虚构数据。"},
             {"role": "user", "content": _PROMPT.format(
-                agent_name=ag.get("name", agent_id), agent_id=agent_id,
+                agent_name=agent_name, agent_id=agent_id,
                 stats=json.dumps(stats, ensure_ascii=False))},
         ], timeout_s=timeout_s)
         attribution = (out.get("content") or "").strip()
@@ -140,6 +137,30 @@ def build_report(state, agent_id: str, *, timeout_s: float = 90.0,
             state, agent_id=agent_id, task_id=task_id,
             task_type="retro_extraction", provider="", model="", usage=None,
             ok=False, started_mono=started, detail=str(exc)[:400])
+    with write_txn(state_conn(state)) as c:
+        c.execute(
+            "UPDATE retro_reports SET attribution=?, attribution_status=?,"
+            " updated_ts=? WHERE id=?",
+            (attribution, attr_status, _now_iso(), report_id))
+    _audit(state, action="kb.retro.attribution", result=attr_status,
+           object_id=report_id, actor=actor,
+           detail=f"agent={agent_id} 归因={attr_status}")
+    return attr_status
+
+
+def build_report(state, agent_id: str, *, use_llm: bool = True,
+                 timeout_s: float = 90.0, actor: str = "manager") -> dict:
+    """生成归档经验提取报告（终局统计确定性落库；LLM 终局归因可延迟）。
+
+    生命周期触发用 use_llm=False 快速落确定性统计（attribution_status=deferred），
+    避免归档请求阻塞在模型调用；归因随后经 generate_attribution 补齐（spec-04 §2.1
+    「可延迟组」）。前台手动提取默认 use_llm=True 一次完成。
+    """
+    ag = get_agent(state, agent_id)
+    if ag is None:
+        raise LookupError(f"Agent 不存在：{agent_id}")
+    stats = final_stats(state, agent_id)
+    report_id = "rr" + secrets.token_hex(10)
     ts = _now_iso()
     with write_txn(state_conn(state)) as c:
         c.execute(
@@ -147,13 +168,48 @@ def build_report(state, agent_id: str, *, timeout_s: float = 90.0,
             " attribution_status, review_ref, created_ts, updated_ts)"
             " VALUES (?,?,?,?,?,?,?,?,?)",
             (report_id, agent_id, "pending_review",
-             json.dumps(stats, ensure_ascii=False), attribution, attr_status,
-             "{}", ts, ts))
-    _audit(state, action="kb.retro.extract", result=attr_status,
+             json.dumps(stats, ensure_ascii=False), "", "deferred", "{}", ts, ts))
+    _audit(state, action="kb.retro.extract", result="created",
            object_id=report_id, actor=actor,
            detail=f"agent={agent_id} 有效桶={stats['effective']} 无效桶="
-                  f"{stats['ineffective']} 归因={attr_status}")
+                  f"{stats['ineffective']}")
+    if use_llm:
+        _run_attribution(state, report_id, agent_id=agent_id,
+                         agent_name=ag.get("name", agent_id), stats=stats,
+                         timeout_s=timeout_s, actor=actor)
     return get_report(state, report_id)
+
+
+def generate_attribution(state, report_id: str, *, timeout_s: float = 90.0,
+                         actor: str = "manager") -> dict:
+    """补齐/重跑报告的 LLM 终局归因（用于生命周期触发的延迟报告）。"""
+    rpt = get_report(state, report_id)
+    if rpt is None:
+        raise LookupError(f"报告不存在：{report_id}")
+    ag = get_agent(state, rpt["agent_id"])
+    _run_attribution(state, report_id, agent_id=rpt["agent_id"],
+                     agent_name=ag.get("name", rpt["agent_id"]) if ag else rpt["agent_id"],
+                     stats=rpt["stats"], timeout_s=timeout_s, actor=actor)
+    return get_report(state, report_id)
+
+
+def extract_on_archive(state, agent_id: str, *, actor: str = "manager") -> dict:
+    """生命周期钩子：Agent 归档/退休时即时生成经验提取报告（确定性统计，零 token）。
+
+    幂等：该 Agent 已有报告则跳过（不重复生成）；best-effort：任何异常不阻断归档流程。
+    LLM 归因延迟至管理评审阶段（generate_attribution）。
+    """
+    existing = state_conn(state).execute(
+        "SELECT id FROM retro_reports WHERE agent_id=?"
+        " ORDER BY created_ts DESC LIMIT 1", (agent_id,)).fetchone()
+    if existing is not None:
+        return {"skipped": True, "report_id": existing["id"],
+                "reason": "已存在经验提取报告"}
+    try:
+        rpt = build_report(state, agent_id, use_llm=False, actor=actor)
+        return {"skipped": False, "report_id": rpt["id"]}
+    except Exception as exc:  # noqa: BLE001 —— 归档主流程不可被副作用阻断
+        return {"skipped": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def _row(r) -> dict:

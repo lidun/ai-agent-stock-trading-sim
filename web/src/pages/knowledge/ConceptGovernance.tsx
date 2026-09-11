@@ -22,6 +22,7 @@ import {
   dispatchKbReferenceCards,
   extractRetroReport,
   fetchKbEvidenceEta,
+  generateRetroAttribution,
   listAgents,
   listKb,
   listKbCandidates,
@@ -207,6 +208,25 @@ export default function ConceptGovernance({ onChanged }: Props) {
       void load();
     } catch (e) {
       message.error((e as Error).message ?? "确认失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doGenAttribution = async (rpt: RetroReport) => {
+    setBusy(true);
+    try {
+      const r = await generateRetroAttribution(rpt.id);
+      setDetail(r.report);
+      const st = r.report.attribution_status;
+      if (st === "generated") {
+        message.success("LLM 终局归因已生成");
+      } else {
+        message.warning(`归因未生成（${st}）`);
+      }
+      void load();
+    } catch (e) {
+      message.error((e as Error).message ?? "归因生成失败");
     } finally {
       setBusy(false);
     }
@@ -477,7 +497,7 @@ export default function ConceptGovernance({ onChanged }: Props) {
                   type="info"
                   showIcon
                   style={{ marginBottom: 8 }}
-                  message="Agent 归档/退休时执行终局统计（确定性）→ LLM 归因 → 管理评审确认后回填知识库；trial 样本排除，concept_tag 按归并映射归口。"
+                  message="Agent 归档/退休时即时生成终局统计报告（零 token），LLM 归因延迟到评审阶段补齐；concept_tag 按归并映射归口。"
                 />
                 <Space style={{ marginBottom: 8 }}>
                   <Select
@@ -541,6 +561,11 @@ export default function ConceptGovernance({ onChanged }: Props) {
         footer={
           <Space>
             <Button onClick={() => setDetail(null)}>关闭</Button>
+            {detail && detail.attribution_status !== "generated" && (
+              <Button loading={busy} onClick={() => detail && void doGenAttribution(detail)}>
+                生成归属报告
+              </Button>
+            )}
             {detail?.status === "pending_review" && (
               <Button type="primary" loading={busy} onClick={() => detail && void doConfirmRetro(detail)}>
                 评审确认

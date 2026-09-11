@@ -1039,6 +1039,12 @@ export function getRetroReport(id: string): Promise<{ report: RetroReport }> {
   return apiGet(`/api/kb/retro-reports/${encodeURIComponent(id)}`);
 }
 
+export function generateRetroAttribution(
+  id: string,
+): Promise<{ report: RetroReport }> {
+  return apiPost(`/api/kb/retro-reports/${encodeURIComponent(id)}/attribution`, {});
+}
+
 export function confirmRetroReport(
   id: string,
   body: {
