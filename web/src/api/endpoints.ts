@@ -972,6 +972,89 @@ export function dispatchKbReferenceCards(body?: {
   return apiPost("/api/kb/reference-cards", body ?? {});
 }
 
+export interface RetroBucket {
+  concept_tag: string;
+  raw_tags: string[];
+  env_bucket: string;
+  verdict: "effective" | "ineffective" | "neutral";
+  sample_n: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  expectancy: number | null;
+  stale_n: number;
+}
+
+export interface RetroStats {
+  agent_id: string;
+  signal_total: number;
+  settled_n: number;
+  effective: number;
+  ineffective: number;
+  buckets: RetroBucket[];
+}
+
+export interface RetroApplied {
+  concept_tag: string;
+  action: string;
+  kb_id?: string;
+  created?: boolean;
+  error?: string;
+}
+
+export interface RetroReport {
+  id: string;
+  agent_id: string;
+  status: "pending_review" | "confirmed";
+  stats: RetroStats;
+  attribution: string;
+  attribution_status: string;
+  review_ref: {
+    decided_by?: string;
+    note?: string;
+    ts?: string;
+    applied?: RetroApplied[];
+  };
+  created_ts: string;
+  updated_ts: string;
+}
+
+export function listRetroReports(
+  params?: { agent_id?: string; limit?: number },
+): Promise<{ reports: RetroReport[] }> {
+  const q = new URLSearchParams();
+  if (params?.agent_id) q.set("agent_id", params.agent_id);
+  if (params?.limit != null) q.set("limit", String(params.limit));
+  const s = q.toString();
+  return apiGet(`/api/kb/retro-reports${s ? `?${s}` : ""}`);
+}
+
+export function extractRetroReport(body: {
+  agent_id: string;
+}): Promise<{ report: RetroReport }> {
+  return apiPost("/api/kb/retro-reports", body);
+}
+
+export function getRetroReport(id: string): Promise<{ report: RetroReport }> {
+  return apiGet(`/api/kb/retro-reports/${encodeURIComponent(id)}`);
+}
+
+export function confirmRetroReport(
+  id: string,
+  body: {
+    note?: string;
+    decisions?: Array<{
+      concept_tag: string;
+      action: "merge" | "create" | "invalidate";
+      kb_id?: string;
+      type?: KbType;
+      note?: string;
+    }>;
+  },
+): Promise<{ report: RetroReport }> {
+  return apiPost(`/api/kb/retro-reports/${encodeURIComponent(id)}/confirm`, body);
+}
+
 // ---------- 策略分析（spec-06 §6.4 P2：资金曲线/指标卡/策略演进） ----------
 
 export type CurveRange = "all" | "1m" | "3m";

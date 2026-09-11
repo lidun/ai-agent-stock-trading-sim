@@ -119,6 +119,53 @@ def kb_tag_merge(request: Request, session: SessionDep,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/kb/retro-reports")
+def kb_retro_reports(request: Request, session: SessionDep, agent_id: str = "",
+                     limit: int = 100):
+    from core import retrospective  # noqa: PLC0415
+    return {"reports": retrospective.list_reports(request.app.state,
+                                                  agent_id=agent_id, limit=limit)}
+
+
+@router.post("/kb/retro-reports")
+def kb_retro_extract(request: Request, session: SessionDep,
+                     payload: dict | None = Body(default=None)):
+    from core import retrospective  # noqa: PLC0415
+    actor = session["session"]["username"]
+    body = payload or {}
+    _ensure_agent(request.app.state, body.get("agent_id", ""))
+    try:
+        return {"report": retrospective.build_report(
+            request.app.state, body.get("agent_id", ""), actor=actor)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/kb/retro-reports/{report_id}")
+def kb_retro_report_detail(report_id: str, request: Request, session: SessionDep):
+    from core import retrospective  # noqa: PLC0415
+    rpt = retrospective.get_report(request.app.state, report_id)
+    if rpt is None:
+        raise HTTPException(status_code=404, detail="报告不存在")
+    return {"report": rpt}
+
+
+@router.post("/kb/retro-reports/{report_id}/confirm")
+def kb_retro_report_confirm(report_id: str, request: Request, session: SessionDep,
+                            payload: dict | None = Body(default=None)):
+    from core import retrospective  # noqa: PLC0415
+    actor = session["session"]["username"]
+    body = payload or {}
+    try:
+        return {"report": retrospective.confirm_report(
+            request.app.state, report_id, actor=actor,
+            note=body.get("note", ""), decisions=body.get("decisions"))}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/kb/{kb_id}")
 def kb_detail(kb_id: str, request: Request, session: SessionDep,
               include_deleted: bool = True):

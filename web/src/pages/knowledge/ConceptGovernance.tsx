@@ -18,14 +18,19 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
+  confirmRetroReport,
   dispatchKbReferenceCards,
+  extractRetroReport,
   fetchKbEvidenceEta,
+  listAgents,
   listKb,
   listKbCandidates,
   listKbFreeTags,
   listKbTagAliases,
+  listRetroReports,
   mergeKbTag,
   transitionKb,
+  type AgentInfo,
   type KbCandidate,
   type KbEvidenceBucket,
   type KbEntry,
@@ -33,6 +38,7 @@ import {
   type KbTagAlias,
   type KbTagProposal,
   type KbStatus,
+  type RetroReport,
 } from "../../api/endpoints";
 
 const STATUS_META: Record<KbStatus, { color: string; text: string }> = {
@@ -72,6 +78,10 @@ export default function ConceptGovernance({ onChanged }: Props) {
   const [busy, setBusy] = useState(false);
   const [cardOpen, setCardOpen] = useState(false);
   const [cards, setCards] = useState<KbReferenceCard[]>([]);
+  const [reports, setReports] = useState<RetroReport[]>([]);
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [retroAgent, setRetroAgent] = useState("");
+  const [detail, setDetail] = useState<RetroReport | null>(null);
 
   const positiveEntries = useMemo(
     () => entries.filter((e) => e.type === "positive" && !e.deleted_ts),
@@ -86,17 +96,22 @@ export default function ConceptGovernance({ onChanged }: Props) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [c, ev, tags, list] = await Promise.all([
+      const [c, ev, tags, list, retro, ag] = await Promise.all([
         listKbCandidates(),
         fetchKbEvidenceEta({ window_days: etaWindow }),
         listKbFreeTags({ min_signals: 1, limit: 50 }),
         listKb({ includeDeleted: false }),
+        listRetroReports({ limit: 50 }),
+        listAgents(),
       ]);
       setCandidates(c.candidates);
       setInsufficient(c.insufficient_buckets);
       setEta(ev.buckets);
       setProposals(tags.proposals);
       setEntries(list.entries);
+      setReports(retro.reports);
+      setAgents(ag.agents);
+      setRetroAgent((prev) => prev || ag.agents.find((a) => a.role === "strategy")?.id || "");
       const al = await listKbTagAliases();
       setAliases(al.aliases);
     } catch (e) {
@@ -160,6 +175,38 @@ export default function ConceptGovernance({ onChanged }: Props) {
       void load();
     } catch (e) {
       message.error((e as Error).message ?? "参考卡下发失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doExtract = async () => {
+    if (!retroAgent) {
+      message.warning("请选择要提取经验的 Agent");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await extractRetroReport({ agent_id: retroAgent });
+      setDetail(r.report);
+      message.success("终局归因报告已生成（待管理评审）");
+      void load();
+    } catch (e) {
+      message.error((e as Error).message ?? "经验提取失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doConfirmRetro = async (rpt: RetroReport) => {
+    setBusy(true);
+    try {
+      const r = await confirmRetroReport(rpt.id, { note: "前端评审确认" });
+      setDetail(r.report);
+      message.success("报告已确认，评审留痕");
+      void load();
+    } catch (e) {
+      message.error((e as Error).message ?? "确认失败");
     } finally {
       setBusy(false);
     }
@@ -287,6 +334,33 @@ export default function ConceptGovernance({ onChanged }: Props) {
     },
   ];
 
+  const retroCols: ColumnsType<RetroReport> = [
+    { title: "报告", dataIndex: "id", width: 160, render: (s: string) => <Typography.Text code>{s}</Typography.Text> },
+    { title: "Agent", dataIndex: "agent_id", width: 150 },
+    {
+      title: "状态", dataIndex: "status", width: 100,
+      render: (s: RetroReport["status"]) =>
+        s === "confirmed" ? <Tag color="green">已确认</Tag> : <Tag color="orange">待评审</Tag>,
+    },
+    {
+      title: "归因", dataIndex: "attribution_status", width: 130,
+      render: (s: string) =>
+        s === "generated" ? <Tag color="blue">LLM</Tag> : <Tag color="default">{s || "—"}</Tag>,
+    },
+    {
+      title: "有效/无效桶", key: "v", width: 120,
+      render: (_, r) => <span>{r.stats.effective} / {r.stats.ineffective}</span>,
+    },
+    { title: "已结清样本", key: "n", width: 110, render: (_, r) => r.stats.settled_n },
+    { title: "生成时间", dataIndex: "created_ts", width: 180 },
+    {
+      title: "操作", key: "op", width: 100,
+      render: (_, r) => (
+        <Button size="small" onClick={() => setDetail(r)}>查看</Button>
+      ),
+    },
+  ];
+
   return (
     <Card
       size="small"
@@ -394,6 +468,41 @@ export default function ConceptGovernance({ onChanged }: Props) {
               </>
             ),
           },
+          {
+            key: "retro",
+            label: `归档经验提取（${reports.length}）`,
+            children: (
+              <>
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 8 }}
+                  message="Agent 归档/退休时执行终局统计（确定性）→ LLM 归因 → 管理评审确认后回填知识库；trial 样本排除，concept_tag 按归并映射归口。"
+                />
+                <Space style={{ marginBottom: 8 }}>
+                  <Select
+                    size="small"
+                    style={{ width: 220 }}
+                    value={retroAgent || undefined}
+                    onChange={setRetroAgent}
+                    placeholder="选择 Agent"
+                    options={agents.map((a) => ({
+                      value: a.id,
+                      label: `${a.name}（${a.id}）`,
+                    }))}
+                  />
+                  <Button size="small" type="primary" loading={busy} onClick={() => void doExtract()}>
+                    生成终局归因报告
+                  </Button>
+                </Space>
+                {reports.length === 0 ? (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无归档经验提取报告" />
+                ) : (
+                  <Table rowKey={(r) => r.id} size="small" pagination={false} columns={retroCols} dataSource={reports} scroll={{ x: 1000 }} />
+                )}
+              </>
+            ),
+          },
         ]}
       />
 
@@ -420,6 +529,91 @@ export default function ConceptGovernance({ onChanged }: Props) {
                 </Descriptions>
               </Card>
             ))}
+          </Space>
+        )}
+      </Modal>
+
+      <Modal
+        open={detail != null}
+        onCancel={() => setDetail(null)}
+        width={820}
+        title={detail ? `归档经验提取报告 · ${detail.id}` : ""}
+        footer={
+          <Space>
+            <Button onClick={() => setDetail(null)}>关闭</Button>
+            {detail?.status === "pending_review" && (
+              <Button type="primary" loading={busy} onClick={() => detail && void doConfirmRetro(detail)}>
+                评审确认
+              </Button>
+            )}
+          </Space>
+        }
+      >
+        {detail && (
+          <Space direction="vertical" style={{ width: "100%" }} size={12}>
+            <Descriptions size="small" column={3}>
+              <Descriptions.Item label="Agent">{detail.agent_id}</Descriptions.Item>
+              <Descriptions.Item label="状态">
+                {detail.status === "confirmed" ? <Tag color="green">已确认</Tag> : <Tag color="orange">待评审</Tag>}
+              </Descriptions.Item>
+              <Descriptions.Item label="归因来源">{detail.attribution_status || "—"}</Descriptions.Item>
+              <Descriptions.Item label="已结清样本">{detail.stats.settled_n}</Descriptions.Item>
+              <Descriptions.Item label="有效桶">{detail.stats.effective}</Descriptions.Item>
+              <Descriptions.Item label="无效桶">{detail.stats.ineffective}</Descriptions.Item>
+            </Descriptions>
+            <div>
+              <Typography.Title level={5}>终局统计（概念 × 环境桶）</Typography.Title>
+              {detail.stats.buckets.length === 0 ? (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>暂无已结清信号样本。</Typography.Text>
+              ) : (
+                <Table
+                  rowKey={(b) => `${b.concept_tag}-${b.env_bucket}`}
+                  size="small"
+                  pagination={false}
+                  dataSource={detail.stats.buckets}
+                  columns={[
+                    { title: "概念", dataIndex: "concept_tag", width: 160 },
+                    { title: "环境桶", dataIndex: "env_bucket", width: 110 },
+                    {
+                      title: "结论", dataIndex: "verdict", width: 90,
+                      render: (v: string) =>
+                        v === "effective" ? <Tag color="green">有效</Tag>
+                          : v === "ineffective" ? <Tag color="red">无效</Tag>
+                            : <Tag>中性</Tag>,
+                    },
+                    { title: "n", dataIndex: "sample_n", width: 60 },
+                    { title: "胜率", key: "wr", width: 80, render: (_, b) => pct(b.win_rate) },
+                    { title: "E", key: "e", width: 80, render: (_, b) => num(b.expectancy) },
+                  ]}
+                />
+              )}
+            </div>
+            <div>
+              <Typography.Title level={5}>LLM 终局归因</Typography.Title>
+              {detail.attribution ? (
+                <Typography.Paragraph style={{ whiteSpace: "pre-wrap", fontSize: 13, marginBottom: 0 }}>
+                  {detail.attribution}
+                </Typography.Paragraph>
+              ) : (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {detail.attribution_status === "not_configured"
+                    ? "模型服务未配置，仅保留确定性终局统计；配置后可重新生成。"
+                    : `未生成归因（${detail.attribution_status || "—"}）。`}
+                </Typography.Text>
+              )}
+            </div>
+            {detail.review_ref.ts && (
+              <div>
+                <Typography.Title level={5}>评审留痕</Typography.Title>
+                <Typography.Text style={{ fontSize: 12 }}>
+                  {detail.review_ref.decided_by} · {detail.review_ref.ts}
+                  {detail.review_ref.note ? ` · ${detail.review_ref.note}` : ""}
+                  {detail.review_ref.applied?.length
+                    ? ` · 回填 ${detail.review_ref.applied.length} 项`
+                    : ""}
+                </Typography.Text>
+              </div>
+            )}
           </Space>
         )}
       </Modal>

@@ -1079,6 +1079,29 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON kb_tag_aliases(canonical_kb_id);
         """,
     ),
+    (
+        31,
+        """
+        -- spec-05 §5 归档经验提取：Agent 归档/退休时的终局归因报告（终局统计确定性 +
+        -- LLM 终局归因 + 管理 Agent 评审 + 回填知识库）。stats=按 (concept_tag×env_bucket)
+        -- 归并统计 JSON；attribution=LLM 归因文本（status 标注生成态，未配置/失败降级）；
+        -- review_ref=管理评审与回填决策留痕 JSON。
+        CREATE TABLE IF NOT EXISTS retro_reports (
+            id                 TEXT PRIMARY KEY,
+            agent_id           TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'pending_review'
+                               CHECK (status IN ('pending_review', 'confirmed')),
+            stats              TEXT NOT NULL DEFAULT '{}',
+            attribution        TEXT NOT NULL DEFAULT '',
+            attribution_status TEXT NOT NULL DEFAULT '',
+            review_ref         TEXT NOT NULL DEFAULT '{}',
+            created_ts         TEXT NOT NULL,
+            updated_ts         TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_retro_reports_agent
+            ON retro_reports(agent_id, created_ts DESC);
+        """,
+    ),
 ]
 
 
