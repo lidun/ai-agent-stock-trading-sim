@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
+  App as AntApp,
   Button,
   Card,
   Empty,
   Flex,
+  Progress,
   Skeleton,
   Space,
   Statistic,
@@ -13,12 +15,15 @@ import {
   Typography,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { ReloadOutlined } from "@ant-design/icons";
+import { ReloadOutlined, PlayCircleOutlined } from "@ant-design/icons";
 import {
   fetchPerformanceSnapshot,
+  fetchSchedulerStatus,
   fetchUsageDaily,
   fetchUsageGroup,
+  runSchedulerTick,
   type PerformanceSnapshot,
+  type SchedulerStatus,
   type UsageDailyRow,
   type UsageGroupRow,
 } from "../../api/endpoints";
@@ -117,8 +122,11 @@ const staleColumns: ColumnsType<PerformanceSnapshot["tasks"]["stale_active"][num
 ];
 
 export default function PerformanceMonitorPage() {
+  const { message } = AntApp.useApp();
   const [data, setData] = useState<PerformanceSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
+  const [scheduler, setScheduler] = useState<SchedulerStatus | null>(null);
+  const [ticking, setTicking] = useState(false);
   const [usage, setUsage] = useState<{
     daily: UsageDailyRow[];
     group: UsageGroupRow[];
@@ -135,6 +143,12 @@ export default function PerformanceMonitorPage() {
       setLoading(false);
     }
     try {
+      setScheduler(await fetchSchedulerStatus());
+    } catch (e) {
+      console.error("scheduler status failed", e);
+      setScheduler(null);
+    }
+    try {
       const [daily, group] = await Promise.all([
         fetchUsageDaily(14),
         fetchUsageGroup(14),
@@ -144,6 +158,24 @@ export default function PerformanceMonitorPage() {
       console.error("usage summary failed", e);
     }
   }, []);
+
+  const onTick = useCallback(async () => {
+    setTicking(true);
+    try {
+      const r = await runSchedulerTick();
+      const ran = r.deferrable;
+      message.success(
+        `tick 完成：清扫过期审批 ${r.expired_approvals} 项，` +
+          `可延迟任务 认领 ${ran.claimed} / 完成 ${ran.done} / 失败 ${ran.failed} / 跳过 ${ran.skipped}`,
+      );
+      await reload();
+    } catch (e) {
+      console.error("scheduler tick failed", e);
+      message.error("tick 失败——后端拒绝或不可达");
+    } finally {
+      setTicking(false);
+    }
+  }, [message, reload]);
 
   useEffect(() => {
     void reload();
@@ -159,6 +191,9 @@ export default function PerformanceMonitorPage() {
   const uTotalCalls = uDaily.reduce((n, r) => n + r.llm_calls, 0);
   const uTokensIn = uDaily.reduce((n, r) => n + r.tokens_in, 0);
   const uTokensOut = uDaily.reduce((n, r) => n + r.tokens_out, 0);
+  const cap = scheduler?.capacity;
+  const capPct = (ratio: number) => Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+  const slackOk = scheduler?.idle ?? false;
 
   return (
     <div style={{ padding: 16, minHeight: "100%" }}>
@@ -275,6 +310,90 @@ export default function PerformanceMonitorPage() {
           </Typography.Text>
         </Flex>
       )}
+
+      <Card
+        size="small"
+        title="调度器 · 空闲窗口与资源闸门（spec-04 §2.5/§7.2）"
+        style={{ marginTop: 12 }}
+        extra={
+          <Space size={4}>
+            <Tag color={slackOk ? "green" : "default"}>
+              {slackOk ? "空闲可跑" : "非空闲"}
+            </Tag>
+            <Button
+              size="small"
+              type="primary"
+              icon={<PlayCircleOutlined />}
+              loading={ticking}
+              onClick={() => void onTick()}
+            >
+              立即 tick
+            </Button>
+          </Space>
+        }
+      >
+        {!scheduler ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="调度器状态不可用"
+            style={{ padding: "12px 0" }}
+          />
+        ) : (
+          <Flex vertical gap={12}>
+            <Flex gap={12} wrap>
+              <Card size="small" style={{ flex: "1 1 160px" }}>
+                <Statistic title="待办任务" value={scheduler.pending_tasks}
+                  suffix={<Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    其中可延迟 {scheduler.pending_deferrable}
+                  </Typography.Text>} />
+              </Card>
+              <Card size="small" style={{ flex: "1 1 160px" }}>
+                <Statistic title="运行中任务" value={scheduler.running_tasks} />
+              </Card>
+              <Card size="small" style={{ flex: "1 1 160px" }}>
+                <Statistic title="待决审批" value={scheduler.pending_approvals} />
+              </Card>
+              <Card size="small" style={{ flex: "1.4 1 240px" }}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  空闲判定
+                </Typography.Text>
+                <div style={{ marginTop: 4 }}>
+                  <Typography.Text>{scheduler.idle_reason}</Typography.Text>
+                </div>
+              </Card>
+            </Flex>
+            <Flex gap={18} wrap align="center">
+              <div style={{ flex: "1 1 220px", minWidth: 200 }}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  CPU 余量 {cap?.known ? `${capPct(cap.cpu_avail_ratio)}%（load1 ${cap.load1.toFixed(2)} / ${cap.cpu_count} 核）` : "采样不可用"}
+                </Typography.Text>
+                <Progress
+                  percent={cap?.known ? capPct(cap.cpu_avail_ratio) : 0}
+                  status={cap?.known && cap.cpu_avail_ratio < 0.30 ? "exception" : "normal"}
+                  size="small"
+                />
+              </div>
+              <div style={{ flex: "1 1 220px", minWidth: 200 }}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  内存余量 {cap?.known ? `${capPct(cap.mem_avail_ratio)}%` : "采样不可用"}
+                </Typography.Text>
+                <Progress
+                  percent={cap?.known ? capPct(cap.mem_avail_ratio) : 0}
+                  status={cap?.known && cap.mem_avail_ratio < 0.30 ? "exception" : "normal"}
+                  size="small"
+                />
+              </div>
+              <Tag color="blue">新任务准入阈值 30%</Tag>
+              <Tag color="blue">任务内 LLM 调用阈值 10%</Tag>
+            </Flex>
+            <Alert
+              type="info"
+              showIcon
+              message="tick 仅在空闲窗口执行可延迟任务（经验提取 / kb_stats 刷新）；手动触发用于本地验证，生产由空闲巡检驱动。"
+            />
+          </Flex>
+        )}
+      </Card>
 
       <Card
         size="small"

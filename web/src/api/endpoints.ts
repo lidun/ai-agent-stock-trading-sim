@@ -1574,3 +1574,45 @@ export function fetchUsageGroup(days = 14): Promise<{ rows: UsageGroupRow[] }> {
 export function fetchUsageLedger(limit = 30): Promise<{ rows: UsageLedgerRow[] }> {
   return apiGet<{ rows: UsageLedgerRow[] }>(`/api/usage/ledger?limit=${limit}`);
 }
+
+// ---------- 调度器 / 资源闸门（spec-04 §2.5/§7.2） ----------
+
+export interface SchedulerCapacity {
+  ts: string;
+  cpu_count: number;
+  load1: number;
+  cpu_avail_ratio: number;
+  mem_total_kb: number;
+  mem_avail_kb: number;
+  mem_avail_ratio: number;
+  known: boolean;
+}
+
+export interface SchedulerStatus {
+  pending_tasks: number;
+  pending_deferrable: number;
+  pending_approvals: number;
+  running_tasks: number;
+  idle: boolean;
+  idle_reason: string;
+  capacity: SchedulerCapacity;
+}
+
+export interface SchedulerTick {
+  ts: string;
+  expired_approvals: number;
+  idle: boolean;
+  window: { idle: boolean; trading_hours: boolean; running: number; reason: string };
+  capacity: SchedulerCapacity;
+  deferrable: { claimed: number; done: number; failed: number; skipped: number };
+}
+
+export function fetchSchedulerStatus(): Promise<SchedulerStatus> {
+  return apiGet<SchedulerStatus>("/api/scheduler/status");
+}
+
+export function runSchedulerTick(deferrableLimit = 10): Promise<SchedulerTick> {
+  return apiPost<SchedulerTick>("/api/scheduler/tick", {
+    deferrable_limit: deferrableLimit,
+  });
+}
