@@ -1242,6 +1242,26 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON context_templates(agent_id, active);
         """,
     ),
+    (
+        39,
+        """
+        -- spec-02 §4.3/§12 管理 Agent 抽检凭证：滚动删除前置条件（摘要已生成+抽检通过）。
+        CREATE TABLE IF NOT EXISTS memory_inspections (
+            id            TEXT PRIMARY KEY,
+            agent_id      TEXT NOT NULL REFERENCES agents(id),
+            period        TEXT NOT NULL CHECK (period IN ('day', 'week', 'month')),
+            period_key    TEXT NOT NULL,
+            checked       INTEGER NOT NULL DEFAULT 0,
+            flagged       INTEGER NOT NULL DEFAULT 0,
+            missing_cards INTEGER NOT NULL DEFAULT 0,
+            passed        INTEGER NOT NULL DEFAULT 0,
+            note          TEXT NOT NULL DEFAULT '',
+            created_ts    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_inspections_pass
+            ON memory_inspections(agent_id, period, period_key, passed);
+        """,
+    ),
 ]
 
 

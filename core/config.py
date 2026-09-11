@@ -23,6 +23,13 @@ def _as_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _as_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class Settings:
     host: str = "127.0.0.1"
@@ -78,6 +85,10 @@ class Settings:
     backup_retention: int = 7
     backups_subdir: str = "backups"
 
+    # spec-02 §4.3 市场观察滚动删除
+    market_note_retention_days: int = 180  # 远期原文保留期（前置=摘要+抽检通过）
+    memory_inspection_sample_ratio: float = 0.1  # 管理 Agent 抽检抽样比例
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -129,6 +140,9 @@ def load_settings() -> Settings:
         context_budget_tokens=_as_int("CORE_CONTEXT_BUDGET_TOKENS", 8000),
         backup_retention=_as_int("CORE_BACKUP_RETENTION", 7),
         backups_subdir=os.getenv("CORE_BACKUPS_SUBDIR", "backups"),
+        market_note_retention_days=_as_int("CORE_MARKET_NOTE_RETENTION_DAYS", 180),
+        memory_inspection_sample_ratio=_as_float(
+            "CORE_MEMORY_INSPECTION_SAMPLE_RATIO", 0.1),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )
