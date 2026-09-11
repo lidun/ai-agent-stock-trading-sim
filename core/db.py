@@ -1221,6 +1221,27 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON memory_cards(agent_id, updated_ts);
         """,
     ),
+    (
+        38,
+        """
+        -- spec-02 §7.0 上下文装配模板与意图路由表存储。
+        -- 演进=新 template_version 插入 + active 切换（旧版本标 superseded_ts 保留，全审计）。
+        CREATE TABLE IF NOT EXISTS context_templates (
+            id               TEXT PRIMARY KEY,
+            agent_id         TEXT NOT NULL REFERENCES agents(id),
+            template_version INTEGER NOT NULL,
+            route_table      TEXT NOT NULL DEFAULT '{}',
+            block_order      TEXT NOT NULL DEFAULT '[]',
+            active           INTEGER NOT NULL DEFAULT 1,
+            created_by       TEXT NOT NULL DEFAULT 'manager',
+            created_ts       TEXT NOT NULL,
+            superseded_ts    TEXT NOT NULL DEFAULT '',
+            UNIQUE (agent_id, template_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_templates_agent
+            ON context_templates(agent_id, active);
+        """,
+    ),
 ]
 
 

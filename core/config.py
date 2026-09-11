@@ -71,6 +71,9 @@ class Settings:
     recent_fallback_days: int = 5         # 无卡片原文兜底检索窗口（交易日近似=自然日）
     card_backlog_hours: int = 24          # 无卡片滞留超时 → 触发即时补卡
 
+    # spec-02 §7.3 装配预算（估算 token 上限，超出仅提示并标高耗）
+    context_budget_tokens: int = 8000
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -119,6 +122,7 @@ def load_settings() -> Settings:
         scheduler_deferrable_limit=_as_int("CORE_SCHEDULER_DEFERRABLE_LIMIT", 10),
         recent_fallback_days=_as_int("CORE_RECENT_FALLBACK_DAYS", 5),
         card_backlog_hours=_as_int("CORE_CARD_BACKLOG_HOURS", 24),
+        context_budget_tokens=_as_int("CORE_CONTEXT_BUDGET_TOKENS", 8000),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )
