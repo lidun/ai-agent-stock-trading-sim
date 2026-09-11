@@ -73,6 +73,15 @@ def test_tick_skips_when_not_idle(authed_client):
     assert tasks.get_task(st, t["id"])["status"] == "pending"
 
 
+def test_engine_run_once(authed_client):
+    st = authed_client.app.state
+    t = tasks.enqueue(st, task_type="kb_stats刷新", agent_id=DEMO, dedup_key="eng1")
+    eng = scheduler.SchedulerEngine(st, deferrable_limit=5)
+    out = eng.run_once(now=OFF_HOURS, capacity=_cap(0.9, 0.9))
+    assert eng.ticks == 1 and eng.last_result is out
+    assert tasks.get_task(st, t["id"])["status"] == "done"
+
+
 def test_scheduler_http_roundtrip(authed_client):
     r = authed_client.get("/api/scheduler/status")
     assert r.status_code == 200, r.text

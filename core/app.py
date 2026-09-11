@@ -187,6 +187,31 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
                 except asyncio.CancelledError:
                     pass
 
+    if settings.scheduler_auto_tick:
+        # spec-04 §2.2/§2.5 常驻空闲巡检：非交易时段且资源余量足时执行可延迟任务
+        from core.scheduler import SchedulerEngine
+
+        app.state.scheduler_engine = SchedulerEngine(
+            app.state, deferrable_limit=settings.scheduler_deferrable_limit)
+
+        @app.on_event("startup")
+        async def _start_scheduler():
+            app.state.scheduler_task = asyncio.create_task(
+                app.state.scheduler_engine.run_forever(settings.scheduler_tick_s)
+            )
+            log.info("调度器常驻巡检已启用：tick %ss，可延迟上限 %s",
+                     settings.scheduler_tick_s, settings.scheduler_deferrable_limit)
+
+        @app.on_event("shutdown")
+        async def _stop_scheduler():
+            task = getattr(app.state, "scheduler_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
     @app.get("/")
     def root():
         return {"service": "ai-agent-trading-core", "version": __version__,

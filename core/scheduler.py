@@ -10,10 +10,14 @@ tick 由外部（常驻循环/手动路由）调用，保持幂等：可重复�
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 from core import approval, resource_gate, tasks
 from core.db import state_conn, write_txn
+
+log = logging.getLogger(__name__)
 
 _BJ = timezone(timedelta(hours=8))
 _AM = (9 * 60 + 30, 11 * 60 + 30)
@@ -106,3 +110,43 @@ def status(state, *, now: datetime | None = None,
         "idle": window["idle"], "idle_reason": window["reason"],
         "capacity": window["capacity"],
     }
+
+
+class SchedulerEngine:
+    """常驻 tick 驱动（spec-04 §2.2）：core 进程内空闲巡检 + 过期清扫唯一触发点。
+
+    与 EodSettleTrigger 同构：run_forever 异步循环，操作全幂等；每个 tick 通过
+    asyncio.to_thread 执行（sqlite/LLM 调用为阻塞操作，避免卡事件循环）。
+    测试默认不启用（CORE_SCHEDULER_AUTO_TICK），run_once 供同步单步验证。
+    """
+
+    def __init__(self, state, *, deferrable_limit: int = 10, actor: str = "scheduler"):
+        self.state = state
+        self.deferrable_limit = deferrable_limit
+        self.actor = actor
+        self.ticks = 0
+        self.last_result: dict | None = None
+
+    def run_once(self, *, now: datetime | None = None,
+                 capacity: dict | None = None) -> dict:
+        r = tick(self.state, now=now, capacity=capacity,
+                 deferrable_limit=self.deferrable_limit, actor=self.actor)
+        self.ticks += 1
+        self.last_result = r
+        return r
+
+    async def run_forever(self, tick_s: int) -> None:
+        while True:
+            try:
+                r = await asyncio.to_thread(self.run_once)
+                ran = r["deferrable"]
+                if r["expired_approvals"] or ran["claimed"]:
+                    log.info("调度 tick：过期审批 %s，空闲=%s，可延迟执行 %s/%s"
+                             "（完成 %s / 失败 %s / 跳过 %s）",
+                             r["expired_approvals"], r["idle"], ran["done"],
+                             ran["claimed"], ran["done"], ran["failed"], ran["skipped"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 单次失败不终止常驻循环
+                log.exception("调度 tick 异常（下个 tick 重试）")
+            await asyncio.sleep(tick_s)

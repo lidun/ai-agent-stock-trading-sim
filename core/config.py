@@ -62,6 +62,11 @@ class Settings:
     market_data_enabled: bool = False     # 数据服务常驻开关（交易时段内 3s 采集循环）
     market_sources: str = "tencent"       # 运行期已配置/可用的源（逗号分隔，按 spec §2.2 默认链优先级取用）
 
+    # 调度器常驻空闲巡检（spec-04 §2.2/§2.5，部署启用；测试默认关）
+    scheduler_auto_tick: bool = False     # 常驻 tick 开关
+    scheduler_tick_s: int = 60            # tick 间隔
+    scheduler_deferrable_limit: int = 10  # 单次 tick 可延迟任务上限
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -105,6 +110,9 @@ def load_settings() -> Settings:
         eod_settle_retry_until=os.getenv("CORE_EOD_SETTLE_RETRY_UNTIL", "16:35"),
         market_data_enabled=_as_bool("CORE_MARKET_DATA_ENABLED", False),
         market_sources=os.getenv("CORE_MARKET_SOURCES", "tencent").strip(),
+        scheduler_auto_tick=_as_bool("CORE_SCHEDULER_AUTO_TICK", False),
+        scheduler_tick_s=_as_int("CORE_SCHEDULER_TICK_S", 60),
+        scheduler_deferrable_limit=_as_int("CORE_SCHEDULER_DEFERRABLE_LIMIT", 10),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )
