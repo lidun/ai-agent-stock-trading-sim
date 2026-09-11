@@ -358,11 +358,41 @@ def _run_health_check(state, task: dict) -> str:
     return f"db/llm 自检 ok={r['ok']}，模式={r['mode']}（{r['detail']}）"
 
 
+def _run_remedy_startup(state, task: dict) -> str:
+    from core import reconcile  # noqa: PLC0415
+    return reconcile._run_remedy_startup(state, task)
+
+
 _HANDLERS: dict[str, Callable[[object, dict], str]] = {
     "经验提取": _run_retro_extraction,
     "kb_stats刷新": _run_kb_stats_refresh,
     "健康检查": _run_health_check,
+    "补救启动": _run_remedy_startup,
 }
+
+
+def _dispatch(state, claimed: list[dict], *, actor: str) -> dict:
+    """执行已认领任务并收尾；无处理器/异常不中断整批。"""
+    items: list[dict] = []
+    for task in claimed:
+        handler = _HANDLERS.get(task["task_type"])
+        if handler is None:
+            finish(state, task["id"], ok=False, status="skipped",
+                   detail=f"无处理器：{task['task_type']}", actor=actor)
+            items.append({"id": task["id"], "task_type": task["task_type"],
+                          "status": "skipped", "detail": "无处理器"})
+            continue
+        try:
+            detail = handler(state, task) or "ok"
+            finish(state, task["id"], ok=True, detail=detail, actor=actor)
+            items.append({"id": task["id"], "task_type": task["task_type"],
+                          "status": "done", "detail": detail})
+        except Exception as exc:  # noqa: BLE001 —— 单任务失败不影响整批
+            msg = f"{type(exc).__name__}: {exc}"[:400]
+            finish(state, task["id"], ok=False, detail=msg, actor=actor)
+            items.append({"id": task["id"], "task_type": task["task_type"],
+                          "status": "failed", "detail": msg})
+    return {"items": items}
 
 
 def run_deferrable(state, *, task_type: str = "", limit: int = 10,
@@ -391,26 +421,21 @@ def run_deferrable(state, *, task_type: str = "", limit: int = 10,
             else:
                 kept.append(task)
         claimed = kept
-    for task in claimed:
-        handler = _HANDLERS.get(task["task_type"])
-        if handler is None:
-            finish(state, task["id"], ok=False, status="skipped",
-                   detail=f"无可延迟处理器：{task['task_type']}", actor=actor)
-            items.append({"id": task["id"], "task_type": task["task_type"],
-                          "status": "skipped", "detail": "无处理器"})
-            continue
-        try:
-            detail = handler(state, task) or "ok"
-            finish(state, task["id"], ok=True, detail=detail, actor=actor)
-            items.append({"id": task["id"], "task_type": task["task_type"],
-                          "status": "done", "detail": detail})
-        except Exception as exc:  # noqa: BLE001 —— 单任务失败不影响整批
-            msg = f"{type(exc).__name__}: {exc}"[:400]
-            finish(state, task["id"], ok=False, detail=msg, actor=actor)
-            items.append({"id": task["id"], "task_type": task["task_type"],
-                          "status": "failed", "detail": msg})
+    items += _dispatch(state, claimed, actor=actor)["items"]
     done = sum(1 for i in items if i["status"] == "done")
     return {"claimed": len(claimed) + deferred, "done": done,
             "failed": sum(1 for i in items if i["status"] == "failed"),
             "skipped": sum(1 for i in items if i["status"] == "skipped"),
             "deferred": deferred, "items": items}
+
+
+def run_pending(state, *, task_type: str, limit: int = 10,
+                actor: str = "scheduler") -> dict:
+    """认领并执行到期 pending 任务（含非可延迟，供时效任务即时执行，如补救启动）。"""
+    claimed = claim_due(state, task_type=task_type, limit=limit)
+    items = _dispatch(state, claimed, actor=actor)["items"]
+    return {"claimed": len(claimed),
+            "done": sum(1 for i in items if i["status"] == "done"),
+            "failed": sum(1 for i in items if i["status"] == "failed"),
+            "skipped": sum(1 for i in items if i["status"] == "skipped"),
+            "items": items}

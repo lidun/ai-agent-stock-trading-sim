@@ -103,6 +103,18 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
                          len(recovered))
         except Exception:  # noqa: BLE001 - 恢复失败不阻断启动
             log.exception("崩溃恢复扫描失败")
+        try:  # §2.6 第 5 步：时效决策任务现实时间判定（过期 skipped/缺勤日报）
+            from core import reconcile
+            from core.settle_scheduler import bjt_now
+            bj = bjt_now()
+            r = reconcile.expire_decision_tasks(
+                app.state, today=bj.date().isoformat(), now_bj=bj,
+                actor="startup")
+            if r["skipped"]:
+                log.info("启动时效判定：过期决策任务 %d 个转 skipped，缺勤日报 %d 份",
+                         len(r["skipped"]), len(r["absent_reports"]))
+        except Exception:  # noqa: BLE001 - 判定失败不阻断启动
+            log.exception("启动时效任务判定失败")
 
     # 中间件注册（后注册先执行：CSRF 校验在安全头外层之前）
     app.add_middleware(SecurityHeadersMiddleware)

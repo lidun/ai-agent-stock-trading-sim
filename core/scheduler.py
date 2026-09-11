@@ -74,6 +74,21 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
     recovered = tasks.recover_crashed(state, now=now_utc, actor=actor)
     expired = approval.expire_overdue(state, now_utc)
     timed_out = tasks.scan_interrupt_timeouts(state, now=now_utc, actor=actor)
+    # §2.4 时效分级：过期决策任务 skipped / 缺勤日报；盘中无单账户补救启动
+    bj = now_utc.astimezone(_BJ)
+    expired_decisions: dict = {"skipped": [], "absent_reports": []}
+    remedy: list[dict] = []
+    try:
+        from core import reconcile  # noqa: PLC0415
+        expired_decisions = reconcile.expire_decision_tasks(
+            state, today=bj.date().isoformat(), now_bj=bj.replace(tzinfo=None),
+            actor=actor)
+        remedy = reconcile.remedy_startup(
+            state, now_bj=now_utc, trading=_is_trading_hours(now_utc), actor=actor)
+        if remedy:
+            tasks.run_pending(state, task_type="补救启动", actor=actor)
+    except Exception:  # noqa: BLE001 - 时效判定失败不阻断 tick
+        log.exception("时效任务现实时间判定失败（下个 tick 重试）")
     window = idle_window(state, now=now_utc, capacity=capacity)
     ran = {"claimed": 0, "done": 0, "failed": 0, "skipped": 0, "items": []}
     if window["idle"]:
@@ -89,7 +104,10 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
         "ts": now_utc.astimezone(_BJ).isoformat(timespec="seconds"),
         "expired_approvals": expired, "interrupt_timed_out": len(timed_out),
         "interrupts": timed_out, "recovered_tasks": len(recovered),
-        "recovered": recovered, "idle": window["idle"],
+        "recovered": recovered,
+        "expired_decisions": expired_decisions["skipped"],
+        "absent_reports": expired_decisions["absent_reports"],
+        "remedy_startups": remedy, "idle": window["idle"],
         "window": {k: v for k, v in window.items() if k != "capacity"},
         "capacity": window["capacity"], "deferrable": ran,
         "manager_mode": (mgr or {}).get("mode", ""),
@@ -101,6 +119,8 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
             (_now_iso(), actor, "scheduler.tick", "task_schedule", "", "ok",
              f"崩溃恢复 {len(recovered)}，过期审批 {expired}，"
              f"interrupt 超时 {len(timed_out)}，"
+             f"过期决策 {len(expired_decisions['skipped'])}，"
+             f"补救启动 {len(remedy)}，"
              f"空闲={window['idle']}，可延迟执行 {ran['done']}/{ran['claimed']}", ""),
         )
     return result
