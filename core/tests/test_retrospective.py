@@ -161,13 +161,14 @@ def test_extract_on_archive_idempotent(authed_client):
     _sig(st, "尾盘缩量走弱", -2.0, account="agent-retro-x.trial")
 
     first = retrospective.extract_on_archive(st, "agent-retro-x", actor="admin")
-    assert first["skipped"] is False
+    assert first["skipped"] is False and first["task_created"] is True
     rpt = retrospective.get_report(st, first["report_id"])
     assert rpt["attribution_status"] == "deferred"
     assert rpt["stats"]["settled_n"] == 1
 
     again = retrospective.extract_on_archive(st, "agent-retro-x", actor="admin")
     assert again["skipped"] is True and again["report_id"] == first["report_id"]
+    assert again["task_created"] is False and again["task_id"] == first["task_id"]
 
 
 def test_finish_trial_reject_triggers_extraction(authed_client):
@@ -179,9 +180,16 @@ def test_finish_trial_reject_triggers_extraction(authed_client):
                                     verdict="不合格")
     assert res["agent"]["status"] == "archived"
     assert res["retro_extraction"]["skipped"] is False
+    assert res["retro_extraction"]["task_created"] is True
     rpt = retrospective.get_report(st, res["retro_extraction"]["report_id"])
     assert rpt["stats"]["settled_n"] == 1 and rpt["attribution_status"] == "deferred"
 
-    # 幂等：重复归档不重复生成（对该 Agent 已有报告）
+    # 可延迟任务已入队且认领后归因补齐（测试环境未配置模型 → not_configured）
+    from core import tasks
+    task = tasks.get_task(st, res["retro_extraction"]["task_id"])
+    assert task["task_type"] == "经验提取" and task["status"] == "pending"
+    assert task["is_deferrable"] is True
+
+    # 幂等：重复归档不重复生成（对该 Agent 已有报告/任务）
     assert retrospective.extract_on_archive(st, "agent-retro-y")["skipped"] is True
 

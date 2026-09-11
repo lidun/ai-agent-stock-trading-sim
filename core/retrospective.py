@@ -194,22 +194,31 @@ def generate_attribution(state, report_id: str, *, timeout_s: float = 90.0,
 
 
 def extract_on_archive(state, agent_id: str, *, actor: str = "manager") -> dict:
-    """生命周期钩子：Agent 归档/退休时即时生成经验提取报告（确定性统计，零 token）。
+    """生命周期钩子：Agent 归档/退休时生成经验提取报告并入可延迟任务组。
 
-    幂等：该 Agent 已有报告则跳过（不重复生成）；best-effort：任何异常不阻断归档流程。
-    LLM 归因延迟至管理评审阶段（generate_attribution）。
+    即时生成**确定性统计**报告（零 token）；LLM 终局归因作为 spec-04 §2.1「经验提取」
+    可延迟任务入队（§2.5 ⑧），由空闲窗口/手动运行补齐，避免归档请求阻塞模型调用。
+    幂等：报告按 Agent、任务按报告 id 去重；best-effort：异常不阻断归档主流程。
     """
     existing = state_conn(state).execute(
         "SELECT id FROM retro_reports WHERE agent_id=?"
         " ORDER BY created_ts DESC LIMIT 1", (agent_id,)).fetchone()
     if existing is not None:
-        return {"skipped": True, "report_id": existing["id"],
-                "reason": "已存在经验提取报告"}
-    try:
-        rpt = build_report(state, agent_id, use_llm=False, actor=actor)
-        return {"skipped": False, "report_id": rpt["id"]}
-    except Exception as exc:  # noqa: BLE001 —— 归档主流程不可被副作用阻断
-        return {"skipped": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+        report_id, skipped = existing["id"], True
+    else:
+        try:
+            report_id = build_report(state, agent_id, use_llm=False,
+                                     actor=actor)["id"]
+            skipped = False
+        except Exception as exc:  # noqa: BLE001 —— 归档主流程不可被副作用阻断
+            return {"skipped": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+    from core import tasks  # noqa: PLC0415
+    task = tasks.enqueue(
+        state, task_type="经验提取", agent_id=agent_id, dedup_key=report_id,
+        payload={"report_id": report_id, "agent_id": agent_id},
+        is_deferrable=True, priority=8, resource_class="llm-heavy", actor=actor)
+    return {"skipped": skipped, "report_id": report_id,
+            "task_id": task["id"], "task_created": task["created"]}
 
 
 def _row(r) -> dict:

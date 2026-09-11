@@ -23,6 +23,7 @@ from core.config import Settings, settings_from_override
 from core.db import Connections, migrate
 from core.exit_tracking_routes import router as exit_tracking_router
 from core.kb_routes import router as kb_router
+from core.tasks_routes import router as tasks_router
 from core.analytics_routes import router as analytics_router
 from core.report_routes import router as report_router
 from core.security import InstanceLock
@@ -108,6 +109,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(report_router)
     app.include_router(approval_router)
     app.include_router(kb_router)
+    app.include_router(tasks_router)
     app.include_router(analytics_router)
     app.include_router(strategy_profile_router)
     app.include_router(exit_tracking_router)

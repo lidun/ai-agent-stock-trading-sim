@@ -1102,6 +1102,42 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON retro_reports(agent_id, created_ts DESC);
         """,
     ),
+    (
+        32,
+        """
+        -- spec-04 §2.1 调度任务表（P1 最小实现）+ §2.5 可延迟无时效任务组。
+        -- 幂等键 UNIQUE(agent_id, task_type, trade_date, task_slot, dedup_key)：
+        -- 补跑/重跑不重复生成；v0.6 事件触发任务以业务子键（归档事件 id 等）区分同日多事件。
+        -- 本切片实现「入队 + 到期认领 + 处理器执行」最小闭环（tick 循环/资源闸门后续补）。
+        CREATE TABLE IF NOT EXISTS task_schedule (
+            id               TEXT PRIMARY KEY,
+            agent_id         TEXT NOT NULL DEFAULT '',
+            task_type        TEXT NOT NULL,
+            task_slot        TEXT NOT NULL DEFAULT '',
+            trade_date       TEXT NOT NULL DEFAULT '',
+            status           TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'running', 'done',
+                                               'failed', 'skipped', 'expired', 'partial')),
+            scheduled_ts     TEXT NOT NULL DEFAULT '',
+            started_ts       TEXT NOT NULL DEFAULT '',
+            ended_ts         TEXT NOT NULL DEFAULT '',
+            attempt_count    INTEGER NOT NULL DEFAULT 0,
+            last_error       TEXT NOT NULL DEFAULT '',
+            resource_class   TEXT NOT NULL DEFAULT 'light'
+                             CHECK (resource_class IN ('scan', 'llm-heavy', 'light')),
+            is_deferrable    INTEGER NOT NULL DEFAULT 0,
+            priority         INTEGER NOT NULL DEFAULT 5,
+            dedup_key        TEXT NOT NULL DEFAULT '',
+            payload          TEXT NOT NULL DEFAULT '{}',
+            created_ts       TEXT NOT NULL,
+            UNIQUE (agent_id, task_type, trade_date, task_slot, dedup_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_schedule_status
+            ON task_schedule(status, is_deferrable, priority);
+        CREATE INDEX IF NOT EXISTS idx_task_schedule_agent
+            ON task_schedule(agent_id, created_ts DESC);
+        """,
+    ),
 ]
 
 
