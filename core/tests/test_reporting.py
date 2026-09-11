@@ -346,3 +346,47 @@ def test_push_settings_switch_gates_report_direct(authed_client):
         "SELECT COUNT(*) FROM audit_logs WHERE action='report.push_setting'"
     ).fetchone()[0]
     assert n == 3
+
+
+def test_monthly_report_advice_llm_wired(authed_client, monkeypatch):
+    """§5.5⑤ 下一步建议由管理 Agent LLM 撰写：入正文、费用留痕、已推送短路不重复调用。"""
+    from core import llm
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    calls = {"n": 0}
+
+    def fake_chat(state, messages, *, timeout_s):
+        calls["n"] += 1
+        return {"content": "## 下一步建议\n- 关注回撤，暂缓高耗试验",
+                "model": "m1", "provider": "p",
+                "usage": {"prompt_tokens": 200, "completion_tokens": 40}}
+
+    monkeypatch.setattr(llm, "chat", fake_chat)
+    body = reporting.build_monthly_report_body(
+        st, 2026, 9, advice="## 下一步建议\n- 关注回撤，暂缓高耗试验")
+    assert "⑤下一步建议（管理 Agent LLM）" in body and "关注回撤" in body
+    msg = reporting.push_monthly_report(st, 2026, 9)
+    assert msg is not None and "关注回撤" in msg["body"]
+    assert calls["n"] == 1
+    assert reporting.push_monthly_report(st, 2026, 9) is None   # 幂等短路
+    assert calls["n"] == 1
+    row = state_conn(st).execute(
+        "SELECT COUNT(*) c FROM performance_records WHERE task_type='monthly_advice'"
+    ).fetchone()
+    assert row["c"] == 1                                        # 费用留痕
+    assert state_conn(st).execute(
+        "SELECT COUNT(*) c FROM audit_logs WHERE action='report.monthly_advice'"
+        " AND result='ok'").fetchone()["c"] == 1
+
+
+def test_monthly_report_advice_not_configured_falls_back(authed_client):
+    """§9.1 确定性降级：未配置模型服务 → ⑤占位兜底，报告仍推送且留审计。"""
+    st = authed_client.app.state
+    _buy(st, day="2026-09-04")
+    msg = reporting.push_monthly_report(st, 2026, 9)
+    assert msg is not None and msg["msg_type"] == "monthly_report"
+    assert "⑤下一步建议：待管理 Agent LLM 撰写" in msg["body"]
+    row = state_conn(st).execute(
+        "SELECT result FROM audit_logs WHERE action='report.monthly_advice'"
+    ).fetchone()
+    assert row is not None and row["result"] == "not_configured"

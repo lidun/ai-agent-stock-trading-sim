@@ -724,9 +724,13 @@ def build_daily_summary_body(state, trade_date: str) -> str | None:
     return "\n".join(lines)
 
 
-def build_monthly_report_body(state, year: int, month: int) -> str | None:
+def build_monthly_report_body(state, year: int, month: int,
+                              *, advice: str | None = None) -> str | None:
     """§5.5 月度《策略体检报告》（确定性 ①净值/回撤 ②验证进度 ③健康度 ④费用；⑤ LLM
-    点评占位）。month=自然月；月内无 main 账户日报 → None。"""
+    建议）。month=自然月；月内无 main 账户日报 → None。
+
+    advice 由管理 Agent LLM 撰写（narrative.generate_monthly_advice 供给）；未接入/
+    失败时 ⑤ 以占位说明兜底，不静默缺失（spec-04 §9.1 确定性降级）。"""
     mkey = f"{year:04d}-{month:02d}"
     conn = state_conn(state)
     rows = _latest_rows_by_account(conn, month=mkey)
@@ -736,8 +740,8 @@ def build_monthly_report_body(state, year: int, month: int) -> str | None:
         f"# 月度《策略体检报告》· {mkey}",
         "",
         "> 确定性生成（spec-04 §5.5：①-④零 token 直接拼装；②概念验证进度由 spec-05"
-        " evidence_eta 供给、④费用月报由 spec-02 §11 留痕聚合、⑤下一步建议待管理 Agent"
-        " LLM）。",
+        " evidence_eta 供给、④费用月报由 spec-02 §11 留痕聚合、⑤下一步建议由管理 Agent"
+        " LLM 撰写）。",
         "",
     ]
     per_acc: dict[str, list[dict]] = {}
@@ -785,9 +789,13 @@ def build_monthly_report_body(state, year: int, month: int) -> str | None:
         lines.append("- 结算/数据异常审计：本月无。")
     lines += _render_evidence_progress(state)
     lines += _render_cost_month(state, mkey)
-    lines += [
-        "- ⑤下一步建议：待管理 Agent LLM 撰写（P1 占位）。",
-    ]
+    text = (advice or "").strip()
+    if text:
+        lines += ["- ⑤下一步建议（管理 Agent LLM）：", ""]
+        lines += ["  " + ln if ln.strip() else "" for ln in text.splitlines()]
+    else:
+        lines += ["- ⑤下一步建议：待管理 Agent LLM 撰写（未接入/失败时占位，"
+                  "不静默缺失）。"]
     return "\n".join(lines)
 
 
@@ -879,13 +887,40 @@ def push_daily_summary(state, trade_date: str) -> dict | None:
         detail=f"{trade_date} 每日总汇报（确定性拼接版）→ 管理 Agent 会话")
 
 
-def push_monthly_report(state, year: int, month: int) -> dict | None:
-    """§5.5 月度策略体检报告（次月首交易日 20:00 与总汇报同批，简化：次日滚动夜间重试）；幂等。"""
+def _manager_push_exists(state, kind: str, scope_key: str) -> bool:
+    """管理 Agent 会话中同 kind+scope 是否已推（幂等短路，避免重复烧 LLM）。"""
+    from core import chatstore  # noqa: PLC0415
+    try:
+        conv = chatstore.ensure_user_chat(state, _MANAGER_AGENT)
+    except LookupError:
+        return False
+    payload = json.dumps({"kind": kind, "scope": scope_key},
+                         ensure_ascii=False, sort_keys=True)
+    return state_conn(state).execute(
+        "SELECT 1 FROM messages WHERE conv_id=? AND payload_ref=? LIMIT 1",
+        (conv["id"], payload)).fetchone() is not None
+
+
+def push_monthly_report(state, year: int, month: int, *,
+                        use_llm: bool = True) -> dict | None:
+    """§5.5 月度策略体检报告（次月首交易日 20:00 与总汇报同批，简化：次日滚动夜间重试）；幂等。
+
+    ⑤下一步建议由管理 Agent LLM 撰写（spec-04 §5.5⑤）：已推送则短路不重复调用；
+    未配置/失败时退回占位（§9.1 确定性降级，不阻塞报告推送）。"""
     mkey = f"{year:04d}-{month:02d}"
+    if _manager_push_exists(state, "monthly_report", mkey):
+        return None
+    advice = None
+    if use_llm:
+        from core import narrative  # noqa: PLC0415
+        res = narrative.generate_monthly_advice(state, year, month)
+        if res.get("ok"):
+            advice = res.get("advice")
     return _push_to_manager(
         state, kind="monthly_report", scope_key=mkey, msg_type="monthly_report",
-        body=build_monthly_report_body(state, year, month),
-        detail=f"{mkey} 月度策略体检报告（确定性版）→ 管理 Agent 会话")
+        body=build_monthly_report_body(state, year, month, advice=advice),
+        detail=f"{mkey} 月度策略体检报告（①-④确定性 + ⑤管理 Agent LLM）"
+               "→ 管理 Agent 会话")
 
 
 # ---------------- 日报直达推送开关（spec-04 §6.2 notify_rules P1 最小化） ----------------

@@ -18,6 +18,7 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import time as _time
 from datetime import timedelta as _td
+from datetime import timezone as _timezone
 
 from core import llm, perf_records, reporting
 from core.db import state_conn, write_txn
@@ -211,6 +212,91 @@ def _audit(state, report: dict, result: str, detail: str,
             (ts, "strategy_agent", "report.narrative_generate", "daily_reports",
              report["id"], result, json.dumps(meta, ensure_ascii=False), ""),
         )
+
+
+_MANAGER_AGENT = "agent-manager"
+
+_PROMPT_MONTHLY_ADVICE = """你是量化团队管理 Agent，正在为月度《策略体检报告》撰写「⑤下一步建议」。
+仅依据下方【确定性体检数据】（①净值/回撤 ②概念验证进度 ③健康度 ④费用月报），给出可执行的下一步建议。
+
+要求：
+- 输出 Markdown（不加代码围栏），总长 ≤600 字；建议可验证、可落地、有数据指向；
+- 覆盖：回撤/净值风险、概念验证推进或暂缓（含预计达门槛时间）、高耗任务与费用控制、标签归并与探索占比等；
+- 不得编造数据、不得引用外部资讯；数据不足时明确写「数据不足，暂不建议调整」。
+
+【确定性体检数据】
+{body}
+"""
+
+
+def _audit_advice(state, month_key: str, result: str, detail: str,
+                  usage: dict | None, model: str = "") -> None:
+    ts = _datetime.now(_timezone.utc).isoformat(timespec="seconds")
+    meta = {"detail": detail}
+    if usage:
+        meta["usage"] = {k: v for k, v in usage.items() if v is not None}
+    if model:
+        meta["model"] = model
+    with write_txn(state_conn(state)) as tx:
+        tx.execute(
+            "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+            " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (ts, _MANAGER_AGENT, "report.monthly_advice", "monthly_report",
+             month_key, result, json.dumps(meta, ensure_ascii=False), ""),
+        )
+
+
+def generate_monthly_advice(state, year: int, month: int, *,
+                            timeout_s: float = 90.0) -> dict:
+    """月报 ⑤下一步建议（管理 Agent LLM 撰写，spec-04 §5.5⑤/§8）。
+
+    以①-④确定性正文为唯一事实来源；未配置/失败/空输出 → 确定性降级（不阻塞报告），
+    返回状态码由 push_monthly_report 决定是否退回占位。费用入 performance_records
+    （task_type=monthly_advice，spec-02 §11）。
+    """
+    body = reporting.build_monthly_report_body(state, year, month)
+    if body is None:
+        return {"ok": False, "code": "no_report", "detail": "该月无 main 账户日报"}
+    mkey = f"{year:04d}-{month:02d}"
+    task_id = f"report.monthly_advice:{mkey}"
+    started_mono = _tm.monotonic()
+    user = _PROMPT_MONTHLY_ADVICE.format(body=body)
+    try:
+        out = llm.chat(state, [
+            {"role": "system", "content": "你是严谨的量化团队管理 Agent；只依据给定数据提出可执行、可验证的建议，不虚构。"},
+            {"role": "user", "content": user},
+        ], timeout_s=timeout_s)
+    except llm.LLMNotConfigured as exc:
+        _audit_advice(state, mkey, "not_configured", str(exc), None)
+        return {"ok": False, "code": "not_configured", "detail": str(exc)}
+    except llm.LLMProviderError as exc:
+        perf_records.record_chat_usage(
+            state, agent_id=_MANAGER_AGENT, task_id=task_id,
+            task_type="monthly_advice", provider="", model="", usage=None,
+            ok=False, started_mono=started_mono, detail=str(exc)[:400])
+        _audit_advice(state, mkey, "failed", str(exc), None)
+        return {"ok": False, "code": "llm_failed", "detail": str(exc)}
+
+    advice = (out.get("content") or "").strip()
+    if not advice:
+        perf_records.record_chat_usage(
+            state, agent_id=_MANAGER_AGENT, task_id=task_id,
+            task_type="monthly_advice", provider=out.get("provider", ""),
+            model=out.get("model", ""), usage=out.get("usage"), ok=False,
+            started_mono=started_mono, detail="模型返回空建议")
+        _audit_advice(state, mkey, "failed", "模型返回空建议", out.get("usage"),
+                      out.get("model", ""))
+        return {"ok": False, "code": "empty_output", "detail": "模型返回空建议"}
+    perf = perf_records.record_chat_usage(
+        state, agent_id=_MANAGER_AGENT, task_id=task_id,
+        task_type="monthly_advice", provider=out.get("provider", ""),
+        model=out.get("model", ""), usage=out.get("usage"), ok=True,
+        started_mono=started_mono, detail=f"advice_len={len(advice)}")
+    _audit_advice(state, mkey, "ok", f"advice_len={len(advice)}", out.get("usage"),
+                  out.get("model", ""))
+    return {"ok": True, "code": "generated", "advice": advice,
+            "model": out.get("model"), "usage": out.get("usage"),
+            "perf_id": perf["id"], "cost_yuan": perf["cost_yuan"]}
 
 
 _NARR_START = _time(18, 31)
