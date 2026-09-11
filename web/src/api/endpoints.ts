@@ -1592,6 +1592,7 @@ export interface SchedulerStatus {
   pending_tasks: number;
   pending_deferrable: number;
   pending_approvals: number;
+  pending_interrupts: number;
   running_tasks: number;
   idle: boolean;
   idle_reason: string;
@@ -1601,6 +1602,7 @@ export interface SchedulerStatus {
 export interface SchedulerTick {
   ts: string;
   expired_approvals: number;
+  interrupt_timed_out: number;
   idle: boolean;
   window: { idle: boolean; trading_hours: boolean; running: number; reason: string };
   capacity: SchedulerCapacity;

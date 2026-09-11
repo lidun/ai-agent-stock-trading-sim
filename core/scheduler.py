@@ -3,9 +3,10 @@
 本切片实现 §2.2 清单中不依赖引擎回调的确定性项：
 1. 可延迟任务组窗口判定（§2.5）：非交易时段 ∧ 无 running 任务 ∧ 本地资源余量 ≥30% 余量线；
 2. 审批单过期扫描（§4.4）；
-3. 空闲窗口满足时按优先级执行到期可延迟任务。
+3. interrupt 超时扫描（§3.3）：挂起超阈值 → 保守拒绝恢复 + 联动关单（§4.4）；
+4. 空闲窗口满足时按优先级执行到期可延迟任务。
 
-引擎结算/跟踪回调（§2.2 第 2-4 项）与 interrupt 扫描（§3.3）仍由各自模块驱动，待补。
+引擎结算/跟踪回调（§2.2 第 2-4 项）仍由各自模块驱动，待补。
 tick 由外部（常驻循环/手动路由）调用，保持幂等：可重复调用不产生重复副作用。
 """
 from __future__ import annotations
@@ -71,13 +72,15 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
     """执行一次 tick：过期清扫 + 空闲窗口可延迟任务执行（幂等）。"""
     now_utc = now or datetime.now(timezone.utc)
     expired = approval.expire_overdue(state, now_utc)
+    timed_out = tasks.scan_interrupt_timeouts(state, now=now_utc, actor=actor)
     window = idle_window(state, now=now_utc, capacity=capacity)
     ran = {"claimed": 0, "done": 0, "failed": 0, "skipped": 0, "items": []}
     if window["idle"]:
         ran = tasks.run_deferrable(state, limit=deferrable_limit, actor=actor)
     result = {
         "ts": now_utc.astimezone(_BJ).isoformat(timespec="seconds"),
-        "expired_approvals": expired, "idle": window["idle"],
+        "expired_approvals": expired, "interrupt_timed_out": len(timed_out),
+        "interrupts": timed_out, "idle": window["idle"],
         "window": {k: v for k, v in window.items() if k != "capacity"},
         "capacity": window["capacity"], "deferrable": ran,
     }
@@ -86,8 +89,8 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
             "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
             " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
             (_now_iso(), actor, "scheduler.tick", "task_schedule", "", "ok",
-             f"过期审批 {expired}，空闲={window['idle']}，"
-             f"可延迟执行 {ran['done']}/{ran['claimed']}", ""),
+             f"过期审批 {expired}，interrupt 超时 {len(timed_out)}，"
+             f"空闲={window['idle']}，可延迟执行 {ran['done']}/{ran['claimed']}", ""),
         )
     return result
 
@@ -103,10 +106,14 @@ def status(state, *, now: datetime | None = None,
         " AND is_deferrable=1").fetchone()["n"]
     pend_appr = c.execute(
         "SELECT COUNT(*) AS n FROM approval_requests WHERE status='pending'").fetchone()["n"]
+    pend_intr = c.execute(
+        "SELECT COUNT(*) AS n FROM task_schedule WHERE status='running'"
+        " AND interrupt_entered_ts!=''").fetchone()["n"]
     window = idle_window(state, now=now, capacity=capacity)
     return {
         "pending_tasks": pend, "pending_deferrable": pend_def,
-        "pending_approvals": pend_appr, "running_tasks": window["running"],
+        "pending_approvals": pend_appr, "pending_interrupts": pend_intr,
+        "running_tasks": window["running"],
         "idle": window["idle"], "idle_reason": window["reason"],
         "capacity": window["capacity"],
     }

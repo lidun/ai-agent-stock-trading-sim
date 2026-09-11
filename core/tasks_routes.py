@@ -57,3 +57,17 @@ def task_run(request: Request, session: SessionDep,
     return tasks.run_deferrable(
         request.app.state, task_type=body.get("task_type", ""),
         limit=int(body.get("limit", 10)), actor=actor)
+
+
+@router.post("/tasks/{task_id}/interrupt")
+def task_interrupt(task_id: str, request: Request, session: SessionDep,
+                   payload: dict | None = Body(default=None)):
+    """标记任务进入 interrupt 挂起（§3.3 节点包装器在桩环境的模拟入口）。"""
+    actor = session["session"]["username"]
+    body = payload or {}
+    task = tasks.enter_interrupt(
+        request.app.state, task_id, approval_id=body.get("approval_id", ""),
+        note=body.get("note", ""), actor=actor)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"task": task}

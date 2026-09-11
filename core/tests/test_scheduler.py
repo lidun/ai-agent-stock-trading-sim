@@ -73,6 +73,47 @@ def test_tick_skips_when_not_idle(authed_client):
     assert tasks.get_task(st, t["id"])["status"] == "pending"
 
 
+def test_interrupt_timeout_closes_approval(authed_client):
+    st = authed_client.app.state
+    from datetime import timedelta
+
+    from core import approval
+
+    ap = approval.submit_approval(
+        st, type_="exemption", agent_id=DEMO, payload={"tokens": ["ST"]},
+        reason="测试豁免", expires_seconds=10 ** 9)
+    assert ap["ok"] is True
+    aid = ap["approval"]["id"]
+
+    t = tasks.enqueue(st, task_type="备份", agent_id=DEMO, dedup_key="intr1",
+                      is_deferrable=False)
+    tasks.claim_due(st)
+    assert tasks.get_task(st, t["id"])["status"] == "running"
+
+    entered = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    tasks.enter_interrupt(st, t["id"], approval_id=aid, note="等待豁免审批",
+                          now=entered.isoformat(timespec="seconds"))
+    row = tasks.get_task(st, t["id"])
+    assert row["interrupt_entered_ts"] == entered.isoformat(timespec="seconds")
+
+    early = tasks.scan_interrupt_timeouts(
+        st, timeout_minutes=30, now=entered + timedelta(minutes=10))
+    assert early == [] and tasks.get_task(st, t["id"])["status"] == "running"
+
+    timed = tasks.scan_interrupt_timeouts(
+        st, timeout_minutes=30, now=entered + timedelta(minutes=31))
+    assert len(timed) == 1 and timed[0]["approval_closed"] is True
+    done = tasks.get_task(st, t["id"])
+    assert done["status"] == "partial" and done["interrupt_entered_ts"] == ""
+
+    ap_row = approval.get_approval(st, aid)
+    assert ap_row["status"] == "expired"
+    assert ap_row["close_note"] == "图分支已超时拒绝"
+
+    late = approval.decide_approval(st, aid, decision="approved")
+    assert late["ok"] is False and late["reason"] == "already"
+
+
 def test_engine_run_once(authed_client):
     st = authed_client.app.state
     t = tasks.enqueue(st, task_type="kb_stats刷新", agent_id=DEMO, dedup_key="eng1")

@@ -166,6 +166,7 @@ export default function PerformanceMonitorPage() {
       const ran = r.deferrable;
       message.success(
         `tick 完成：清扫过期审批 ${r.expired_approvals} 项，` +
+          `interrupt 超时 ${r.interrupt_timed_out} 项，` +
           `可延迟任务 认领 ${ran.claimed} / 完成 ${ran.done} / 失败 ${ran.failed} / 跳过 ${ran.skipped}`,
       );
       await reload();
@@ -352,6 +353,12 @@ export default function PerformanceMonitorPage() {
               </Card>
               <Card size="small" style={{ flex: "1 1 160px" }}>
                 <Statistic title="待决审批" value={scheduler.pending_approvals} />
+              </Card>
+              <Card size="small" style={{ flex: "1 1 160px" }}>
+                <Statistic title="interrupt 挂起" value={scheduler.pending_interrupts}
+                  suffix={scheduler.pending_interrupts > 0
+                    ? <Tag color="orange" style={{ marginLeft: 4 }}>30min 超时保守拒绝</Tag>
+                    : null} />
               </Card>
               <Card size="small" style={{ flex: "1.4 1 240px" }}>
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>

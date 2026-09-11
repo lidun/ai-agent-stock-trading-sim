@@ -1138,6 +1138,17 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON task_schedule(agent_id, created_ts DESC);
         """,
     ),
+    (
+        33,
+        """
+        -- spec-04 §2.1/§3.3 interrupt 审批节点：任务行记录挂起时刻与来源审批单。
+        ALTER TABLE task_schedule ADD COLUMN interrupt_entered_ts TEXT NOT NULL DEFAULT '';
+        ALTER TABLE task_schedule ADD COLUMN approval_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE task_schedule ADD COLUMN interrupt_note TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_task_schedule_interrupt
+            ON task_schedule(status, interrupt_entered_ts);
+        """,
+    ),
 ]
 
 

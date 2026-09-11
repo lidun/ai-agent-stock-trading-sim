@@ -433,6 +433,35 @@ def expire_overdue(state, now=None) -> int:
     return len(overdue)
 
 
+def close_for_interrupt(state, approval_id: str, *,
+                        note: str = "图分支已超时拒绝",
+                        actor: str = "scheduler") -> bool:
+    """§3.3/§4.4 interrupt 超时联动关闭：pending 单 → expired + close_note。
+
+    返回是否实际关闭（非 pending 或不存在则 False，幂等）。此后到达的决定由
+    decide_approval 走「非 pending 仅留痕」路径（不让迟到决定生效）。
+    """
+    now_iso = _now_iso()
+    c = state_conn(state)
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?",
+                    (approval_id,)).fetchone()
+    if row is None or row["status"] != "pending":
+        return False
+    with write_txn(c) as cw:
+        cw.execute(
+            "UPDATE approval_requests SET status='expired', close_note=?"
+            " WHERE id=? AND status='pending'",
+            (note[:400], approval_id),
+        )
+        cw.execute(
+            "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+            " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (now_iso, actor, "approval.close_interrupt", "approval_requests",
+             approval_id, "expired", note[:400], ""),
+        )
+    return True
+
+
 def list_approvals(state, *, agent_id: str | None = None, status: str | None = None,
                    limit: int = 100, conn=None) -> list[dict]:
     """审批单列表（审批中心数据源），新→旧。"""

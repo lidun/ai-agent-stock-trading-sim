@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import json
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from core.db import state_conn, write_txn
 
 TASK_STATUS = ("pending", "running", "done", "failed", "skipped", "expired", "partial")
 RESOURCE_CLASSES = ("scan", "llm-heavy", "light")
+
+# spec-04 §3.3：interrupt 挂起超时（默认 30 分钟，可配）→ 保守拒绝恢复
+INTERRUPT_TIMEOUT_MINUTES = 30
 
 # spec-04 §2.1 task_type 枚举（含可延迟组 §2.5 成员：经验提取/kb_stats刷新/分层摘要补跑…）
 TASK_TYPES = (
@@ -96,6 +99,8 @@ def _row(r) -> dict:
         "resource_class": r["resource_class"],
         "is_deferrable": bool(r["is_deferrable"]), "priority": r["priority"],
         "dedup_key": r["dedup_key"], "payload": _loads(r["payload"]),
+        "interrupt_entered_ts": r["interrupt_entered_ts"],
+        "approval_id": r["approval_id"], "interrupt_note": r["interrupt_note"],
         "created_ts": r["created_ts"],
     }
 
@@ -170,6 +175,78 @@ def finish(state, task_id: str, *, ok: bool = True, status: str = "",
     _audit(state, action="task.finish", result=final, object_id=task_id,
            actor=actor, detail=detail[:400] or "ok")
     return get_task(state, task_id)
+
+
+def enter_interrupt(state, task_id: str, *, approval_id: str = "",
+                    note: str = "", now: str = "",
+                    actor: str = "scheduler") -> dict | None:
+    """标记任务进入 interrupt 审批挂起（spec-04 §3.3 节点包装器调用点）。
+
+    图执行已返回但任务行保持 running；写 interrupt_entered_ts，供 tick 超时扫描。
+    重复进入（已挂起）保持首次时刻不变，幂等。
+    """
+    ts = now or _now_iso()
+    with write_txn(state_conn(state)) as c:
+        c.execute(
+            "UPDATE task_schedule SET interrupt_entered_ts=?, approval_id=?,"
+            " interrupt_note=? WHERE id=? AND interrupt_entered_ts=''",
+            (ts, approval_id, note[:400], task_id),
+        )
+    _audit(state, action="task.interrupt", result="suspended", object_id=task_id,
+           actor=actor,
+           detail=f"approval={approval_id or '-'} note={note[:200] or '-'}")
+    return get_task(state, task_id)
+
+
+def scan_interrupt_timeouts(state, *, timeout_minutes: int = INTERRUPT_TIMEOUT_MINUTES,
+                            now: datetime | None = None,
+                            actor: str = "scheduler") -> list[dict]:
+    """扫描 interrupt 超时任务（spec-04 §2.2 第 6 项 / §3.3）。
+
+    对 running 且 interrupt_entered_ts 超过阈值的任务执行「保守拒绝」恢复：
+    ① 联动关闭来源审批单（pending → expired，close_note 标注超时拒绝，§4.4）；
+    ② 清空 interrupt_entered_ts 防重复扫描；
+    ③ 无引擎可 resume 的桩环境下任务收尾为 partial（该分支跳过、不阻塞空闲窗口）。
+    接入真实图后由节点包装器在 resume 后自行 finish，扫描仅作超时兜底。
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    cutoff = (now_utc - timedelta(minutes=max(1, int(timeout_minutes)))
+              ).isoformat(timespec="seconds")
+    c = state_conn(state)
+    rows = c.execute(
+        "SELECT * FROM task_schedule WHERE status='running'"
+        " AND interrupt_entered_ts!='' AND interrupt_entered_ts<=?",
+        (cutoff,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        task = _row(r)
+        note = "审批超时未处理，维持原状（保守拒绝）"
+        approval_id = task["approval_id"]
+        closed = False
+        if approval_id:
+            try:
+                from core import approval  # noqa: PLC0415
+                closed = approval.close_for_interrupt(
+                    state, approval_id, note="图分支已超时拒绝", actor=actor)
+            except Exception:  # noqa: BLE001 - 关单失败不阻断扫描
+                closed = False
+        ts = now_utc.isoformat(timespec="seconds")
+        with write_txn(state_conn(state)) as cw:
+            cw.execute(
+                "UPDATE task_schedule SET status='partial', interrupt_entered_ts='',"
+                " interrupt_note=?, ended_ts=?, last_error=?"
+                " WHERE id=? AND status='running' AND interrupt_entered_ts!=''",
+                (note, ts, note, task["id"]),
+            )
+        _audit(state, action="task.interrupt_timeout", result="partial",
+               object_id=task["id"], actor=actor,
+               detail=f"挂起 {timeout_minutes} 分钟超时 → 保守拒绝；"
+                      f"审批单 {approval_id or '-'} 关闭={closed}")
+        out.append({"id": task["id"], "task_type": task["task_type"],
+                    "approval_id": approval_id, "approval_closed": closed,
+                    "note": note})
+    return out
 
 
 def _run_retro_extraction(state, task: dict) -> str:
