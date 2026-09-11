@@ -1179,6 +1179,29 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON task_schedule(status, heartbeat_ts);
         """,
     ),
+    (
+        36,
+        """
+        -- spec-02 §3.1/§4 分层摘要索引（日→周→月，可延迟无时效任务）。
+        -- 幂等 UNIQUE(agent_id, period, period_key)：补跑覆盖重算（UPSERT）留痕。
+        -- record_ids 继承/回指原文 memory_entries（周=本周原文；月=本周各周摘要 record_ids 并集）。
+        CREATE TABLE IF NOT EXISTS memory_summaries (
+            id           TEXT PRIMARY KEY,
+            agent_id     TEXT NOT NULL REFERENCES agents(id),
+            period       TEXT NOT NULL CHECK (period IN ('day', 'week', 'month')),
+            period_key   TEXT NOT NULL,
+            body         TEXT NOT NULL,
+            record_ids   TEXT NOT NULL DEFAULT '[]',
+            source_count INTEGER NOT NULL DEFAULT 0,
+            model        TEXT NOT NULL DEFAULT '',
+            created_ts   TEXT NOT NULL,
+            updated_ts   TEXT NOT NULL,
+            UNIQUE (agent_id, period, period_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_summaries_agent_period
+            ON memory_summaries(agent_id, period, period_key);
+        """,
+    ),
 ]
 
 

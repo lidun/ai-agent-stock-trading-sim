@@ -91,7 +91,14 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
         log.exception("时效任务现实时间判定失败（下个 tick 重试）")
     window = idle_window(state, now=now_utc, capacity=capacity)
     ran = {"claimed": 0, "done": 0, "failed": 0, "skipped": 0, "items": []}
+    summary_queued: list[dict] = []
     if window["idle"]:
+        try:  # spec-02 §4.1：空闲窗口扫描分层摘要缺口并入可延迟队列
+            from core import summaries  # noqa: PLC0415
+            summary_queued = summaries.enqueue_pending(
+                state, today=bj.date(), now_bj=bj.replace(tzinfo=None), actor=actor)
+        except Exception:  # noqa: BLE001 - 摘要扫描失败不阻断 tick
+            log.exception("分层摘要缺口扫描失败（下个 tick 重试）")
         ran = tasks.run_deferrable(state, limit=deferrable_limit, actor=actor)
     mgr = None
     try:  # §2.2 第 7 项：按 30 分钟桶入队健康检查（降级期间 light 仍执行以探测恢复）
@@ -108,6 +115,7 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
         "expired_decisions": expired_decisions["skipped"],
         "absent_reports": expired_decisions["absent_reports"],
         "remedy_startups": remedy, "idle": window["idle"],
+        "summary_queued": summary_queued,
         "window": {k: v for k, v in window.items() if k != "capacity"},
         "capacity": window["capacity"], "deferrable": ran,
         "manager_mode": (mgr or {}).get("mode", ""),
@@ -120,7 +128,7 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
              f"崩溃恢复 {len(recovered)}，过期审批 {expired}，"
              f"interrupt 超时 {len(timed_out)}，"
              f"过期决策 {len(expired_decisions['skipped'])}，"
-             f"补救启动 {len(remedy)}，"
+             f"补救启动 {len(remedy)}，摘要入队 {len(summary_queued)}，"
              f"空闲={window['idle']}，可延迟执行 {ran['done']}/{ran['claimed']}", ""),
         )
     return result
