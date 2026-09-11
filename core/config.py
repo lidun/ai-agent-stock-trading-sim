@@ -74,6 +74,10 @@ class Settings:
     # spec-02 §7.3 装配预算（估算 token 上限，超出仅提示并标高耗）
     context_budget_tokens: int = 8000
 
+    # spec-02 §10 备份：每日在线备份 + 最近 N 份轮换
+    backup_retention: int = 7
+    backups_subdir: str = "backups"
+
     log_level: str = "INFO"
     env: str = "dev"                       # dev | prod（prod 强制 Secure Cookie）
 
@@ -123,6 +127,8 @@ def load_settings() -> Settings:
         recent_fallback_days=_as_int("CORE_RECENT_FALLBACK_DAYS", 5),
         card_backlog_hours=_as_int("CORE_CARD_BACKLOG_HOURS", 24),
         context_budget_tokens=_as_int("CORE_CONTEXT_BUDGET_TOKENS", 8000),
+        backup_retention=_as_int("CORE_BACKUP_RETENTION", 7),
+        backups_subdir=os.getenv("CORE_BACKUPS_SUBDIR", "backups"),
         log_level=os.getenv("CORE_LOG_LEVEL", "INFO").upper(),
         env=os.getenv("CORE_ENV", "dev"),
     )

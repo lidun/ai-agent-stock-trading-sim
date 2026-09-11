@@ -28,6 +28,7 @@ from core.scheduler_routes import router as scheduler_router
 from core.output_guard_routes import router as output_guard_router
 from core.memory_routes import router as memory_router
 from core.context_routes import router as context_router
+from core.backup_routes import router as backup_router
 from core.analytics_routes import router as analytics_router
 from core.report_routes import router as report_router
 from core.security import InstanceLock
@@ -117,6 +118,13 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
                          len(r["skipped"]), len(r["absent_reports"]))
         except Exception:  # noqa: BLE001 - 判定失败不阻断启动
             log.exception("启动时效任务判定失败")
+        try:  # §10 长时停机后启动即补每日备份（最高优先级，不等待空闲窗口）
+            from core import backup
+            r = backup.maybe_daily_backup(app.state, actor="startup")
+            if r.get("status") == "done":
+                log.info("启动补备份：%s", r.get("name"))
+        except Exception:  # noqa: BLE001 - 备份失败不阻断启动
+            log.exception("启动每日备份失败")
 
     # 中间件注册（后注册先执行：CSRF 校验在安全头外层之前）
     app.add_middleware(SecurityHeadersMiddleware)
@@ -142,6 +150,7 @@ def create_app(settings_override: dict | None = None) -> FastAPI:
     app.include_router(output_guard_router)
     app.include_router(memory_router)
     app.include_router(context_router)
+    app.include_router(backup_router)
     app.include_router(analytics_router)
     app.include_router(strategy_profile_router)
     app.include_router(exit_tracking_router)

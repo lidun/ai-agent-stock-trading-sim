@@ -72,6 +72,13 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
     """执行一次 tick：过期清扫 + 空闲窗口可延迟任务执行（幂等）。"""
     now_utc = now or datetime.now(timezone.utc)
     recovered = tasks.recover_crashed(state, now=now_utc, actor=actor)
+    # §10 每日备份最高优先级：启动即补、不等待空闲窗口；结算中推迟重试
+    try:
+        from core import backup  # noqa: PLC0415
+        backup_result = backup.maybe_daily_backup(state, now=now_utc, actor=actor)
+    except Exception:  # noqa: BLE001 - 备份失败不阻断 tick
+        log.exception("每日备份失败（下个 tick 重试）")
+        backup_result = {"status": "error"}
     expired = approval.expire_overdue(state, now_utc)
     timed_out = tasks.scan_interrupt_timeouts(state, now=now_utc, actor=actor)
     # §2.4 时效分级：过期决策任务 skipped / 缺勤日报；盘中无单账户补救启动
@@ -117,7 +124,7 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
         "ts": now_utc.astimezone(_BJ).isoformat(timespec="seconds"),
         "expired_approvals": expired, "interrupt_timed_out": len(timed_out),
         "interrupts": timed_out, "recovered_tasks": len(recovered),
-        "recovered": recovered,
+        "recovered": recovered, "backup": backup_result,
         "expired_decisions": expired_decisions["skipped"],
         "absent_reports": expired_decisions["absent_reports"],
         "remedy_startups": remedy, "idle": window["idle"],
@@ -131,7 +138,8 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
             "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
             " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
             (_now_iso(), actor, "scheduler.tick", "task_schedule", "", "ok",
-             f"崩溃恢复 {len(recovered)}，过期审批 {expired}，"
+             f"崩溃恢复 {len(recovered)}，备份={backup_result.get('status', '-')}，"
+             f"过期审批 {expired}，"
              f"interrupt 超时 {len(timed_out)}，"
              f"过期决策 {len(expired_decisions['skipped'])}，"
              f"补救启动 {len(remedy)}，摘要入队 {len(summary_queued)}，"

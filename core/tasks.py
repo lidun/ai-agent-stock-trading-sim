@@ -373,6 +373,12 @@ def _run_card(state, task: dict) -> str:
     return memory_cards._run_card_task(state, task)
 
 
+def _run_backup(state, task: dict) -> str:
+    from core import backup  # noqa: PLC0415
+    r = backup.create_backup(state, actor="scheduler")
+    return f"备份 {r['name']}（{r['size']} bytes，轮换删除 {len(r['pruned'])}）"
+
+
 _HANDLERS: dict[str, Callable[[object, dict], str]] = {
     "经验提取": _run_retro_extraction,
     "kb_stats刷新": _run_kb_stats_refresh,
@@ -380,6 +386,7 @@ _HANDLERS: dict[str, Callable[[object, dict], str]] = {
     "补救启动": _run_remedy_startup,
     "摘要补跑": _run_summary,
     "卡片生成": _run_card,
+    "备份": _run_backup,
 }
 
 

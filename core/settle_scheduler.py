@@ -274,7 +274,9 @@ class EodSettleTrigger:
 
     def settle_once(self, now: datetime | None = None) -> dict:
         """单次判定+触发（含当日缺口账户记账，供 close_day_gaps 窗口关闭后补缺勤）。"""
-        outcome = self._settle_once(now or bjt_now())
+        from core import runtime_flags  # noqa: PLC0415
+        with runtime_flags.settling():  # §10 安全点：结算期间备份推迟
+            outcome = self._settle_once(now or bjt_now())
         self._record_gap_outcome(outcome)
         return outcome
 
