@@ -349,3 +349,31 @@ async def send_message(conv_id: str, payload: MessageSendIn, request: Request,
     # 异步处理（P1 桩引擎；后续替换为调度器按任务投递 LangGraph）
     engine.schedule(request.app.state, msg, conv)
     return {"message": msg}
+
+
+class MessageReviewIn(BaseModel):
+    approve: bool = True
+    reason: str = Field(default="", max_length=400)
+
+
+@router.get("/messages/pending-review")
+def pending_reviews(request: Request, session: SessionDep, limit: int = 100):
+    """待管理 Agent 审阅队列（spec-02 §6.2 白名单拦截落点）。"""
+    limit = max(1, min(limit, 200))
+    return {"items": chatstore.list_pending_reviews(request.app.state, limit=limit)}
+
+
+@router.post("/messages/{message_id}/review")
+def review_message(message_id: str, payload: MessageReviewIn, request: Request,
+                   session: SessionDep):
+    try:
+        out = chatstore.review_message(
+            request.app.state, message_id, approve=payload.approve,
+            reviewer=session["session"]["username"], reason=payload.reason)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    audit(request.app.state, session["session"]["username"],
+          "chat.message_review", object_type="message", object_id=message_id,
+          result="ok" if out.get("changed") else "noop",
+          ctx=get_request_context(request))
+    return out

@@ -224,3 +224,72 @@ def mark_conversation_read(state, conv_id: str) -> int:
         )
         updated = cur.rowcount
     return updated
+
+
+# ---------- 消息白名单与审阅（spec-02 §6.2 / §10.4） ----------
+
+# 子 Agent → 用户的消息白名单（不可闲聊）；非白名单落 pending_review 等管理 Agent 审阅
+AGENT_MSG_WHITELIST = ("日报", "异常上报", "审批回执", "提问回复", "总汇报", "系统事件")
+
+
+def _audit(state, *, action: str, result: str, object_id: str, actor: str,
+           detail: str) -> None:
+    with write_txn(state_conn(state)) as c:
+        c.execute(
+            "INSERT INTO audit_logs (ts, actor, action, object_type, object_id,"
+            " result, detail, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (_now_iso(), actor, action, "message", object_id, result,
+             detail[:400], ""))
+
+
+def deliver_agent_message(state, *, conv_id: str, agent_id: str, msg_type: str,
+                          body: str, payload_ref: str = "",
+                          delivered_via: str = "web",
+                          actor: str = "engine") -> dict:
+    """子 Agent → 用户投递入口：白名单强制校验，非白名单转 pending_review。"""
+    if msg_type not in AGENT_MSG_WHITELIST:
+        msg = insert_message(
+            state, conv_id=conv_id, agent_id=agent_id, direction="agent",
+            msg_type=msg_type, body=body, payload_ref=payload_ref,
+            status="pending_review", delivered_via="")
+        _audit(state, action="message.pending_review", result="pending_review",
+               object_id=msg["id"], actor=actor,
+               detail=f"非白名单 msg_type={msg_type}，转管理 Agent 审阅")
+        return {"message": msg, "delivered": False, "pending_review": True}
+    msg = insert_message(
+        state, conv_id=conv_id, agent_id=agent_id, direction="agent",
+        msg_type=msg_type, body=body, payload_ref=payload_ref,
+        status="delivered", delivered_via=delivered_via)
+    return {"message": msg, "delivered": True, "pending_review": False}
+
+
+def list_pending_reviews(state, *, limit: int = 100) -> list[dict]:
+    conn = state_conn(state)
+    with read_txn(conn) as c:
+        rows = c.execute(
+            "SELECT * FROM messages WHERE status='pending_review'"
+            " ORDER BY ts ASC LIMIT ?", (int(limit),)).fetchall()
+    return [_serialize_message(dict(r)) for r in rows]
+
+
+def review_message(state, message_id: str, *, approve: bool,
+                   reviewer: str = "manager", reason: str = "") -> dict:
+    """管理 Agent 审阅：放行转 delivered，拒绝转 failed（审阅留痕）。"""
+    msg = get_message(state, message_id)
+    if msg is None:
+        raise LookupError(f"消息不存在：{message_id}")
+    if msg["status"] != "pending_review":
+        return {"message": msg, "changed": False,
+                "reason": f"非待审阅状态：{msg['status']}"}
+    if approve:
+        updated = set_message_status(state, message_id, "delivered")
+        _audit(state, action="message.review_release", result="delivered",
+               object_id=message_id, actor=reviewer,
+               detail=reason or "审阅放行转 delivered")
+        return {"message": updated, "changed": True, "approved": True}
+    updated = set_message_status(state, message_id, "failed",
+                                 last_error=reason or "管理 Agent 审阅拒绝")
+    _audit(state, action="message.review_reject", result="failed",
+           object_id=message_id, actor=reviewer,
+           detail=reason or "管理 Agent 审阅拒绝")
+    return {"message": updated, "changed": True, "approved": False}
