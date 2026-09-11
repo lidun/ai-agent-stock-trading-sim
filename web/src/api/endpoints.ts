@@ -813,6 +813,165 @@ export function upsertKbStats(
   return apiPost(`/api/kb/${encodeURIComponent(kbId)}/stats`, body);
 }
 
+// ---------- 知识库概念治理（spec-05 §3.2/§3.11，spec-06 §6.7） ----------
+
+export interface KbCandidate {
+  kb_id: string;
+  name: string;
+  type: KbType;
+  status: KbStatus;
+  env_bucket: string;
+  action: "promote_valid" | "invalidate";
+  orientation: "forward" | "avoid";
+  reason: string;
+  sample_n: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  expectancy: number | null;
+  stale_n: number;
+  intercept_n: number;
+  exception_n: number;
+  rolling_n: number;
+  rolling_expectancy: number | null;
+}
+
+export interface KbCandidatesResult {
+  min_n: number;
+  rolling_days: number;
+  n_days: number;
+  as_of: string;
+  window_cutoff: string;
+  insufficient_buckets: number;
+  candidates: KbCandidate[];
+}
+
+export function listKbCandidates(params?: {
+  min_n?: number;
+  rolling_days?: number;
+}): Promise<KbCandidatesResult> {
+  const q = new URLSearchParams();
+  if (params?.min_n != null) q.set("min_n", String(params.min_n));
+  if (params?.rolling_days != null) q.set("rolling_days", String(params.rolling_days));
+  const s = q.toString();
+  return apiGet(`/api/kb/candidates${s ? `?${s}` : ""}`);
+}
+
+export interface KbEvidenceBucket {
+  kb_id: string;
+  name: string;
+  type: KbType;
+  status: KbStatus;
+  env_bucket: string;
+  orientation: "forward" | "avoid";
+  sample_n: number;
+  min_n: number;
+  recent_n: number;
+  freq: number;
+  eta_days: number | null;
+  reason: string;
+}
+
+export interface KbEvidenceEtaResult {
+  as_of: string;
+  window_days: number;
+  window_len: number;
+  window_cutoff: string;
+  min_n: number;
+  buckets: KbEvidenceBucket[];
+}
+
+export function fetchKbEvidenceEta(params?: {
+  min_n?: number;
+  window_days?: number;
+}): Promise<KbEvidenceEtaResult> {
+  const q = new URLSearchParams();
+  if (params?.min_n != null) q.set("min_n", String(params.min_n));
+  if (params?.window_days != null) q.set("window_days", String(params.window_days));
+  const s = q.toString();
+  return apiGet(`/api/kb/evidence-eta${s ? `?${s}` : ""}`);
+}
+
+export interface KbTagAlias {
+  alias: string;
+  canonical_kb_id: string;
+  merged_by: string;
+  merged_ts: string;
+  reason: string;
+}
+
+export interface KbFreeTag {
+  concept_tag: string;
+  signals: number;
+  buckets: Record<string, number>;
+}
+
+export interface KbTagProposal {
+  alias: string;
+  suggested_kb_id: string;
+  suggested_name: string;
+  score: number;
+  signals: number;
+}
+
+export function listKbTagAliases(
+  canonicalKbId?: string,
+): Promise<{ aliases: KbTagAlias[] }> {
+  const q = canonicalKbId ? `?canonical_kb_id=${encodeURIComponent(canonicalKbId)}` : "";
+  return apiGet(`/api/kb/tag-aliases${q}`);
+}
+
+export function listKbFreeTags(params?: {
+  min_signals?: number;
+  limit?: number;
+}): Promise<{ free_tags: KbFreeTag[]; proposals: KbTagProposal[] }> {
+  const q = new URLSearchParams();
+  if (params?.min_signals != null) q.set("min_signals", String(params.min_signals));
+  if (params?.limit != null) q.set("limit", String(params.limit));
+  const s = q.toString();
+  return apiGet(`/api/kb/free-tags${s ? `?${s}` : ""}`);
+}
+
+export function mergeKbTag(body: {
+  alias: string;
+  canonical_kb_id: string;
+  reason?: string;
+}): Promise<{ alias: string; canonical_kb_id: string; created: boolean }> {
+  return apiPost("/api/kb/tag-aliases", body);
+}
+
+export interface KbReferenceCard {
+  kb_id: string;
+  name: string;
+  type: KbType;
+  type_label: string;
+  status: KbStatus;
+  status_label: string;
+  env_bucket: string;
+  source: string;
+  sample_n: number;
+  win_rate: number | null;
+  expectancy: number | null;
+  stale_n: number;
+  dispatch_n: number;
+  score: number | null;
+  note: string;
+}
+
+export function dispatchKbReferenceCards(body?: {
+  env_bucket?: string;
+  limit?: number;
+  c?: number;
+}): Promise<{
+  env_bucket: string;
+  c: number;
+  limit: number;
+  total_dispatch_n: number;
+  cards: KbReferenceCard[];
+}> {
+  return apiPost("/api/kb/reference-cards", body ?? {});
+}
+
 // ---------- 策略分析（spec-06 §6.4 P2：资金曲线/指标卡/策略演进） ----------
 
 export type CurveRange = "all" | "1m" | "3m";

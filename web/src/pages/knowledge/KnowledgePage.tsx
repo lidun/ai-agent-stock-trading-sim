@@ -44,6 +44,7 @@ import {
   type KbType,
 } from "../../api/endpoints";
 import { fmtBeijingTime } from "../../utils/time";
+import ConceptGovernance from "./ConceptGovernance";
 
 const STATUS_META: Record<KbStatus, { color: string; text: string }> = {
   observing: { color: "default", text: "观察中" },
@@ -468,6 +469,8 @@ export default function KnowledgePage() {
           <Statistic title="反向避坑" value={pitfallCount} style={{ minWidth: 90 }} />
         </Flex>
       </Card>
+
+      <ConceptGovernance onChanged={() => void reload()} />
 
       <Card size="small" title="条目列表">
         <Flex gap={8} wrap style={{ marginBottom: 12 }}>
