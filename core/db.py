@@ -1149,6 +1149,27 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON task_schedule(status, interrupt_entered_ts);
         """,
     ),
+    (
+        34,
+        """
+        -- spec-04 §9.1 管理 Agent 安全自治模式：全局状态落库（单行，无进程内存依赖）。
+        CREATE TABLE IF NOT EXISTS manager_state (
+            id                          TEXT PRIMARY KEY,
+            mode                        TEXT NOT NULL DEFAULT 'active'
+                                        CHECK (mode IN ('active', 'autonomous')),
+            consecutive_health_failures  INTEGER NOT NULL DEFAULT 0,
+            consecutive_health_successes INTEGER NOT NULL DEFAULT 0,
+            consecutive_resume_failures  INTEGER NOT NULL DEFAULT 0,
+            last_health_ts              TEXT NOT NULL DEFAULT '',
+            last_health_ok              INTEGER NOT NULL DEFAULT 1,
+            last_reason                 TEXT NOT NULL DEFAULT '',
+            degraded_since              TEXT NOT NULL DEFAULT '',
+            recovered_ts                TEXT NOT NULL DEFAULT '',
+            updated_ts                  TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO manager_state (id, updated_ts) VALUES ('manager', '');
+        """,
+    ),
 ]
 
 

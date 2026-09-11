@@ -167,7 +167,8 @@ export default function PerformanceMonitorPage() {
       message.success(
         `tick 完成：清扫过期审批 ${r.expired_approvals} 项，` +
           `interrupt 超时 ${r.interrupt_timed_out} 项，` +
-          `可延迟任务 认领 ${ran.claimed} / 完成 ${ran.done} / 失败 ${ran.failed} / 跳过 ${ran.skipped}`,
+          `可延迟任务 认领 ${ran.claimed} / 完成 ${ran.done} / 失败 ${ran.failed} / 跳过 ${ran.skipped}` +
+          (ran.deferred ? ` / 降级延后 ${ran.deferred}` : ""),
       );
       await reload();
     } catch (e) {
@@ -318,6 +319,11 @@ export default function PerformanceMonitorPage() {
         style={{ marginTop: 12 }}
         extra={
           <Space size={4}>
+            {scheduler ? (
+              <Tag color={scheduler.manager_mode === "autonomous" ? "red" : "green"}>
+                {scheduler.manager_mode === "autonomous" ? "管理 Agent 安全自治" : "管理 Agent 正常"}
+              </Tag>
+            ) : null}
             <Tag color={slackOk ? "green" : "default"}>
               {slackOk ? "空闲可跑" : "非空闲"}
             </Tag>

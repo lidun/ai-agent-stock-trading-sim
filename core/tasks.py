@@ -162,6 +162,21 @@ def claim_due(state, *, task_type: str = "", deferrable_only: bool = False,
     return claimed
 
 
+def requeue(state, task_id: str, *, reason: str = "",
+            actor: str = "scheduler") -> dict | None:
+    """把已认领的任务退回 pending（用于降级期让路 llm-heavy 可延迟任务）。
+
+    attempt_count 回退 1（未真正执行），清 started_ts；不写审计避免噪声。
+    """
+    with write_txn(state_conn(state)) as c:
+        c.execute(
+            "UPDATE task_schedule SET status='pending', started_ts='',"
+            " attempt_count=MAX(attempt_count-1, 0) WHERE id=? AND status='running'",
+            (task_id,),
+        )
+    return get_task(state, task_id)
+
+
 def finish(state, task_id: str, *, ok: bool = True, status: str = "",
            detail: str = "", actor: str = "scheduler") -> dict | None:
     """收尾任务：ok=True→done，ok=False→failed（或显式 status）。"""
@@ -224,6 +239,7 @@ def scan_interrupt_timeouts(state, *, timeout_minutes: int = INTERRUPT_TIMEOUT_M
         note = "审批超时未处理，维持原状（保守拒绝）"
         approval_id = task["approval_id"]
         closed = False
+        resume_ok = True
         if approval_id:
             try:
                 from core import approval  # noqa: PLC0415
@@ -231,6 +247,13 @@ def scan_interrupt_timeouts(state, *, timeout_minutes: int = INTERRUPT_TIMEOUT_M
                     state, approval_id, note="图分支已超时拒绝", actor=actor)
             except Exception:  # noqa: BLE001 - 关单失败不阻断扫描
                 closed = False
+                resume_ok = False
+        try:  # §9.1：恢复调用连续失败计入降级判定
+            from core import manager  # noqa: PLC0415
+            manager.record_resume_call(state, resume_ok, actor=actor,
+                                       detail=f"interrupt 恢复 {task['id']}")
+        except Exception:  # noqa: BLE001
+            pass
         ts = now_utc.isoformat(timespec="seconds")
         with write_txn(state_conn(state)) as cw:
             cw.execute(
@@ -265,9 +288,17 @@ def _run_kb_stats_refresh(state, task: dict) -> str:
     return f"重算 {r['entries']} 条目 / {r['buckets']} 桶"
 
 
+def _run_health_check(state, task: dict) -> str:
+    """管理 Agent 健康检查任务（§9.1）：轻量 LLM ping + 进程内自检 → 降级判定。"""
+    from core import manager  # noqa: PLC0415
+    r = manager.health_check(state)
+    return f"db/llm 自检 ok={r['ok']}，模式={r['mode']}（{r['detail']}）"
+
+
 _HANDLERS: dict[str, Callable[[object, dict], str]] = {
     "经验提取": _run_retro_extraction,
     "kb_stats刷新": _run_kb_stats_refresh,
+    "健康检查": _run_health_check,
 }
 
 
@@ -279,6 +310,24 @@ def run_deferrable(state, *, task_type: str = "", limit: int = 10,
     """
     claimed = claim_due(state, task_type=task_type, deferrable_only=True, limit=limit)
     items: list[dict] = []
+    deferred = 0
+    try:
+        from core import manager  # noqa: PLC0415
+        degraded = manager.is_degraded(state)
+    except Exception:  # noqa: BLE001
+        degraded = False
+    if degraded:
+        kept: list[dict] = []
+        for task in claimed:
+            if task["resource_class"] == "llm-heavy":
+                requeue(state, task["id"], reason="manager autonomous")
+                items.append({"id": task["id"], "task_type": task["task_type"],
+                              "status": "deferred",
+                              "detail": "管理 Agent 安全自治，LLM 职责延迟补跑"})
+                deferred += 1
+            else:
+                kept.append(task)
+        claimed = kept
     for task in claimed:
         handler = _HANDLERS.get(task["task_type"])
         if handler is None:
@@ -298,7 +347,7 @@ def run_deferrable(state, *, task_type: str = "", limit: int = 10,
             items.append({"id": task["id"], "task_type": task["task_type"],
                           "status": "failed", "detail": msg})
     done = sum(1 for i in items if i["status"] == "done")
-    return {"claimed": len(claimed), "done": done,
+    return {"claimed": len(claimed) + deferred, "done": done,
             "failed": sum(1 for i in items if i["status"] == "failed"),
             "skipped": sum(1 for i in items if i["status"] == "skipped"),
-            "items": items}
+            "deferred": deferred, "items": items}

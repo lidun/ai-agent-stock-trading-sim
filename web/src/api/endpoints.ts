@@ -1596,6 +1596,7 @@ export interface SchedulerStatus {
   running_tasks: number;
   idle: boolean;
   idle_reason: string;
+  manager_mode: string;
   capacity: SchedulerCapacity;
 }
 
@@ -1604,9 +1605,10 @@ export interface SchedulerTick {
   expired_approvals: number;
   interrupt_timed_out: number;
   idle: boolean;
+  manager_mode: string;
   window: { idle: boolean; trading_hours: boolean; running: number; reason: string };
   capacity: SchedulerCapacity;
-  deferrable: { claimed: number; done: number; failed: number; skipped: number };
+  deferrable: { claimed: number; done: number; failed: number; skipped: number; deferred?: number };
 }
 
 export function fetchSchedulerStatus(): Promise<SchedulerStatus> {

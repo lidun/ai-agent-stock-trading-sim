@@ -77,12 +77,20 @@ def tick(state, *, now: datetime | None = None, capacity: dict | None = None,
     ran = {"claimed": 0, "done": 0, "failed": 0, "skipped": 0, "items": []}
     if window["idle"]:
         ran = tasks.run_deferrable(state, limit=deferrable_limit, actor=actor)
+    mgr = None
+    try:  # §2.2 第 7 项：按 30 分钟桶入队健康检查（降级期间 light 仍执行以探测恢复）
+        from core import manager  # noqa: PLC0415
+        manager.ensure_health_task(state, now=now_utc, actor=actor)
+        mgr = manager.status(state)
+    except Exception:  # noqa: BLE001
+        log.exception("管理 Agent 健康判定失败（下个 tick 重试）")
     result = {
         "ts": now_utc.astimezone(_BJ).isoformat(timespec="seconds"),
         "expired_approvals": expired, "interrupt_timed_out": len(timed_out),
         "interrupts": timed_out, "idle": window["idle"],
         "window": {k: v for k, v in window.items() if k != "capacity"},
         "capacity": window["capacity"], "deferrable": ran,
+        "manager_mode": (mgr or {}).get("mode", ""),
     }
     with write_txn(state_conn(state)) as c:
         c.execute(
@@ -110,12 +118,18 @@ def status(state, *, now: datetime | None = None,
         "SELECT COUNT(*) AS n FROM task_schedule WHERE status='running'"
         " AND interrupt_entered_ts!=''").fetchone()["n"]
     window = idle_window(state, now=now, capacity=capacity)
+    mgr_mode = ""
+    try:
+        from core import manager  # noqa: PLC0415
+        mgr_mode = manager.status(state)["mode"]
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "pending_tasks": pend, "pending_deferrable": pend_def,
         "pending_approvals": pend_appr, "pending_interrupts": pend_intr,
         "running_tasks": window["running"],
         "idle": window["idle"], "idle_reason": window["reason"],
-        "capacity": window["capacity"],
+        "capacity": window["capacity"], "manager_mode": mgr_mode,
     }
 
 

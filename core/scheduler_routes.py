@@ -18,6 +18,13 @@ def scheduler_status(request: Request, session: SessionDep):
     return scheduler.status(request.app.state)
 
 
+@router.get("/scheduler/manager")
+def manager_status(request: Request, session: SessionDep):
+    """管理 Agent 安全自治状态（spec-04 §9.1）。"""
+    from core import manager
+    return manager.status(request.app.state)
+
+
 @router.post("/scheduler/tick")
 def scheduler_tick(request: Request, session: SessionDep,
                     payload: dict | None = Body(default=None)):
