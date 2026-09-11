@@ -1202,6 +1202,25 @@ _SCHEMA_MIGRATIONS: list[tuple[int, str]] = [
             ON memory_summaries(agent_id, period, period_key);
         """,
     ),
+    (
+        37,
+        """
+        -- spec-02 §3.1/§3.2 调用卡片（原文一对一精炼，token 预算 200-500）。
+        -- PRIMARY KEY(memory_id) 一对一；更新原地 upsert（card_version+1）。
+        -- 卡片仅用于导航，事实引用须 get_full 回原文核对。
+        CREATE TABLE IF NOT EXISTS memory_cards (
+            memory_id    TEXT PRIMARY KEY REFERENCES memory_entries(id),
+            agent_id     TEXT NOT NULL REFERENCES agents(id),
+            card         TEXT NOT NULL,
+            card_version INTEGER NOT NULL DEFAULT 1,
+            model        TEXT NOT NULL DEFAULT '',
+            created_ts   TEXT NOT NULL,
+            updated_ts   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_cards_agent
+            ON memory_cards(agent_id, updated_ts);
+        """,
+    ),
 ]
 
 

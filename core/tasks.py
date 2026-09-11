@@ -29,7 +29,7 @@ CRASH_STALE_MINUTES = 30
 TASK_TYPES = (
     "选股", "挂单", "结算", "日报", "总汇报", "复盘", "摘要补跑", "备份",
     "L0清理", "体检报告", "补救启动", "健康检查", "试运行回放", "验证评估",
-    "经验提取", "kb_stats刷新",
+    "经验提取", "kb_stats刷新", "卡片生成",
 )
 
 
@@ -368,12 +368,18 @@ def _run_summary(state, task: dict) -> str:
     return summaries._run_summary_task(state, task)
 
 
+def _run_card(state, task: dict) -> str:
+    from core import memory_cards  # noqa: PLC0415
+    return memory_cards._run_card_task(state, task)
+
+
 _HANDLERS: dict[str, Callable[[object, dict], str]] = {
     "经验提取": _run_retro_extraction,
     "kb_stats刷新": _run_kb_stats_refresh,
     "健康检查": _run_health_check,
     "补救启动": _run_remedy_startup,
     "摘要补跑": _run_summary,
+    "卡片生成": _run_card,
 }
 
 
